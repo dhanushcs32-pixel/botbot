@@ -4,35 +4,43 @@ Connects to the local OpenVINO NPU inference server (npu_server.py) running
 the 'botbot' model. No Ollama anywhere in this stack.
 """
 
-from fastapi import FastAPI, UploadFile, File, Form, Header, HTTPException, Depends, WebSocket, WebSocketDisconnect, Query
+from fastapi import FastAPI, UploadFile, File, Form, Header, HTTPException, Depends, WebSocket, WebSocketDisconnect, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
-from collections import defaultdict
+from collections import defaultdict, deque
 import asyncio
 import time
 import re
+import os
+import secrets
+import json
+from datetime import datetime, timezone
 import logging
 from logging.handlers import RotatingFileHandler
 import httpx
 
+# Offline-first for HuggingFace loads: MiniLM (rag.py embeddings) and BLIP
+# (media.py captions) are cached locally, but their loaders still ping
+# huggingface.co at load time. On DNS failure that poisoned the HTTP client
+# and retrieval failed open silently (see PROJECT_STATE / the hybrid-search
+# test that hit this). Forcing offline mode makes both load from cache with
+# zero network dependency at startup.
+# NOTE for a FRESH machine (model not yet cached): this blocks the one-time
+# download — set HF_HUB_OFFLINE=0 in the environment before first launch,
+# then remove it once the cache is populated.
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+
 from mode_router import detect_mode, get_system_prompt, get_retrieval_policy
-from memory import save_turn, get_recent_history, get_recent_summaries, get_all_session_ids, get_summary_for_session, get_important_links, maybe_rollup_session, is_test_session
-from rag import search_personal_data, get_style_profile, keyword_search, search_reference_data, is_trivial_message
-from semantic_style_check import check_semantic_violations
+from memory import save_turn, get_recent_history, get_recent_summaries, get_all_session_ids, get_summary_for_session, get_important_links, maybe_rollup_session, is_test_session, session_has_summary, get_sessions_with_last_activity, count_turns
+from rag import search_personal_data, get_style_profile, keyword_search, search_reference_data, is_trivial_message, get_known_people
+from semantic_style_check import strip_semantic_violations
 from summarizer import summarize_session, summarize_turns_batch
 from media import process_uploaded_file, decode_app_attachment
-from secret_key import API_KEY
+from secret_key import API_KEYS
 from followup import check_and_send_followups
 
 # --- Persistent debug logging --------------------------------------------
-# The [DEBUG prompt sizes] and [style_check] lines used to only go to
-# stdout/PowerShell scrollback — fine until the terminal closes or scrolls
-# past its buffer, at which point that diagnostic history is just gone
-# (this happened — see PROJECT_STATE.txt). Mirrors the same messages to a
-# rotating file on disk instead, so past sessions stay inspectable.
-# 5 x 5MB files (~2-3 weeks of typical debug volume) before oldest rotates
-# out; adjust maxBytes/backupCount if that's not enough runway.
 debug_logger = logging.getLogger("botbot.debug")
 debug_logger.setLevel(logging.INFO)
 _file_handler = RotatingFileHandler(
@@ -40,29 +48,47 @@ _file_handler = RotatingFileHandler(
 )
 _file_handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
 debug_logger.addHandler(_file_handler)
-debug_logger.propagate = False  # avoid double-printing via root logger
+debug_logger.propagate = False
 
 
 def debug_log(msg: str):
-    """Prints to console (unchanged behavior) AND persists to
-    botbot_debug.log so terminal-buffer loss can't erase it again."""
+    """Prints to console AND persists to botbot_debug.log."""
     print(msg)
     debug_logger.info(msg)
 
+
+# --- Context-sufficiency field observation ---------------------------------
+sufficiency_logger = logging.getLogger("botbot.sufficiency")
+sufficiency_logger.setLevel(logging.INFO)
+_sufficiency_file_handler = RotatingFileHandler(
+    "context_sufficiency_log.jsonl", maxBytes=5 * 1024 * 1024, backupCount=5, encoding="utf-8"
+)
+_sufficiency_file_handler.setFormatter(logging.Formatter("%(message)s"))
+sufficiency_logger.addHandler(_sufficiency_file_handler)
+sufficiency_logger.propagate = False
+
+UNCERTAINTY_HEDGE_PHRASES = [
+    "i don't have that", "i don't have specific", "i don't have any",
+    "i don't know", "i'm not sure", "i'm not certain", "not sure about that",
+    "don't have that information", "don't have that detail",
+    "don't have details on", "no information about", "no record of",
+    "can't recall", "don't recall", "not something i have", "unsure about",
+    "haven't come across", "don't actually know", "can't say for sure",
+]
+
+
+def _reply_reads_as_uncertain(text: str) -> bool:
+    lowered = text.lower()
+    return any(p in lowered for p in UNCERTAINTY_HEDGE_PHRASES)
+
+
 # --- Style safety net ---------------------------------------------------
-# get_system_prompt()/my_style_template.txt already instruct the model not
-# to use emojis or AI-tell stock phrases, and that instruction is placed
-# last in the prompt (see mode_router.py) for maximum positional weight on
-# this small quantized model. This filter is a backstop, not the primary
-# fix — it guarantees the two most visible symptoms (emojis, stock AI
-# phrasing) never reach the user even on the turns where the model doesn't
-# fully follow the prompt instruction.
 EMOJI_PATTERN = re.compile(
     "["
-    "\U0001F300-\U0001FAFF"  # symbols & pictographs, supplemental symbols
-    "\U00002600-\U000027BF"  # misc symbols, dingbats
-    "\U0001F1E6-\U0001F1FF"  # regional indicator (flags)
-    "\U00002190-\U000021FF"  # arrows (catches some emoji-adjacent symbols)
+    "\U0001F300-\U0001FAFF"
+    "\U00002600-\U000027BF"
+    "\U0001F1E6-\U0001F1FF"
+    "\U00002190-\U000021FF"
     "]+",
     flags=re.UNICODE,
 )
@@ -76,53 +102,6 @@ AI_TELL_PHRASES = [
     "good luck with", "remember, it's okay",
 ]
 
-# Option 2 (validate-and-retry): which violations are worth paying for a
-# full NPU regeneration versus which are already safely handled by
-# scrub_reply()'s deterministic regex fixes.
-#
-# emoji / ai_tell_phrase: scrub_reply already removes these cleanly and
-# safely (a stray emoji or a stock phrase can just be deleted without
-# damaging the surrounding sentence) — not worth a ~25-100s+ regeneration.
-#
-# bullet_list / header / bold_pseudo_header / template_divider: these are
-# STRUCTURAL — the underlying answer is shaped like a list/template, and
-# stripping the markdown characters (scrub_reply's current fix) leaves the
-# same list-shaped structure behind with the formatting just uglier, not
-# actually fixed. Confirmed via real logs (PROJECT_STATE.txt) that these
-# specifically correlate with advice-style prompts ("how do i", "tips on")
-# regardless of prompt size — a genuine instruction-following gap, which a
-# regenerate-with-correction pass can actually fix, unlike post-hoc regex.
-#
-# bracket_placeholder / salutation_closing intentionally excluded — rare,
-# log_only edge cases where a regex fix already carries lower risk and a
-# full retry isn't clearly justified yet.
-RETRY_TRIGGER_VIOLATIONS = {"bullet_list", "header", "bold_pseudo_header", "template_divider"}
-
-# Hard cap on regenerations per reply. 1 retry = at most 2 total NPU calls
-# for a violating turn. Kept low deliberately: each retry costs a full
-# generation (observed 22-112s on this hardware), and retry isn't
-# guaranteed to succeed — after MAX_STYLE_RETRIES failed attempts, fall
-# back to scrub_reply()'s regex-cleaned version of the last attempt rather
-# than retrying indefinitely.
-MAX_STYLE_RETRIES = 1
-
-# --- Structural violation rule table --------------------------------------
-# Single source of truth for both detection (check_style_violations) and
-# fixing (scrub_reply) — replaces separate hardcoded patterns that
-# previously had to be edited in two places and could drift out of sync
-# (this happened once: BOLD_LABEL_PATTERN existed in detection before its
-# matching fix line was added). Add a rule here and it's automatically
-# detected AND handled per its action, no other code changes needed.
-#
-# action values:
-#   "strip"       - remove the matched text entirely (e.g. a bullet marker)
-#   "replace"     - re.sub with `repl` (e.g. "**Label:**" -> "Label: ")
-#   "remove_line" - delete the whole matched line (e.g. a "---" divider —
-#                   pure noise, no content to preserve)
-#   "log_only"    - flagged in violations/logs but NOT auto-fixed, where a
-#                   safe deterministic fix risks mangled/nonsensical text
-#                   (e.g. stripping "[Recipient's Name]" out of "Dear
-#                   [Recipient's Name]," would leave "Dear ," behind).
 STRUCTURE_RULES = [
     {
         "name": "bullet_list",
@@ -136,56 +115,38 @@ STRUCTURE_RULES = [
     },
     {
         "name": "bold_pseudo_header",
-        # bold markdown used as a label, e.g. "**Research Thoroughly:**
-        # Make sure..." — model reaches for this on "tips"-style advice
-        # even when told not to use bullets/headers, since it's neither.
-        # Trailing `:?\s*` handles both "**Label:**" and "**Label**:"
-        # forms so neither leaves a stray/doubled colon behind.
         "pattern": re.compile(r"\*{1,2}([^*\n]{2,40}?):?\*{1,2}\s*:?\s*"),
         "action": "replace",
         "repl": r"\1: ",
     },
     {
         "name": "template_divider",
-        # a line that's ONLY dashes/equals/underscores/asterisks (3+) —
-        # markdown horizontal rule / doc-template section break. Pure
-        # formatting noise, safe to delete outright.
         "pattern": re.compile(r"^[ \t]*[-=*_]{3,}[ \t]*\n?", re.MULTILINE),
         "action": "remove_line",
     },
     {
         "name": "bracket_placeholder",
-        # unfilled template slots like "[Your Name]", "[Recipient]" — a
-        # strong signal the model has slipped into generic-template/
-        # ghostwriting mode rather than actually texting as itself.
         "pattern": re.compile(r"\[[A-Z][a-zA-Z' \-]{1,30}\]"),
         "action": "log_only",
     },
     {
         "name": "salutation_closing",
-        # letter/email-style sign-offs: "Best regards,", "Sincerely,",
-        # etc., optionally followed by a bracketed or bare name.
         "pattern": re.compile(
             r"(?im)^\s*(best regards|best|sincerely|warm(?:ly)? regards|"
             r"kind regards|regards|cheers)\s*,\s*$"
         ),
         "action": "log_only",
     },
+    {
+        "name": "persona_break",
+        "pattern": re.compile(r"([a-zA-Z])\1{2,}"),
+        "action": "log_only",
+        "min_matches": 2,
+    },
 ]
 
 
 def check_style_violations(text: str) -> list[str]:
-    """
-    Checkpoint run on the raw model output before any fixing happens.
-    Returns a list of violation labels found, purely for logging/
-    visibility — this is what lets you see in the server logs whether
-    the model is actually drifting from style over time, rather than
-    silently trusting that scrub_reply() catching things means
-    everything's fine upstream. Structural/template-harness rules are
-    driven by STRUCTURE_RULES; emoji and AI-tell phrases stay as their
-    own explicit checks since they use different matching logic
-    (character-class scan vs. substring list).
-    """
     violations = []
     if EMOJI_PATTERN.search(text):
         violations.append("emoji")
@@ -193,28 +154,17 @@ def check_style_violations(text: str) -> list[str]:
     if any(p in lowered for p in AI_TELL_PHRASES):
         violations.append("ai_tell_phrase")
     for rule in STRUCTURE_RULES:
-        if rule["pattern"].search(text):
-            violations.append(rule["name"])
+        min_matches = rule.get("min_matches", 1)
+        if min_matches == 1:
+            if rule["pattern"].search(text):
+                violations.append(rule["name"])
+        else:
+            if len(rule["pattern"].findall(text)) >= min_matches:
+                violations.append(rule["name"])
     return violations
 
 
 def scrub_reply(text: str, session_id: str = "") -> str:
-    """
-    Style enforcement checkpoint run on every reply right before it's
-    saved to history or sent to the client.
-      1. check_style_violations() flags what's wrong (logged).
-      2. Deterministic fixes applied per STRUCTURE_RULES action
-         (strip/replace/remove_line auto-fixed; log_only left as-is).
-      3. Tier 2 semantic style check (log-only) — catches AI-esque
-         paraphrases exact-match AI_TELL_PHRASES can't, via embedding
-         similarity. See semantic_style_check.py for full rationale.
-         Does NOT alter the returned text, findings are logged only,
-         pending threshold tuning against real traffic.
-    Anything NOT fixable this way (e.g. a reply that's grammatically
-    correct/formal throughout with no single fixable trigger) won't be
-    caught here — that's a prompt/model-side problem, not something a
-    post-hoc filter can safely rewrite without risking mangled text.
-    """
     if not text:
         return text
 
@@ -228,14 +178,6 @@ def scrub_reply(text: str, session_id: str = "") -> str:
     lowered = text.lower()
     for phrase in AI_TELL_PHRASES:
         if phrase in lowered:
-            # [^.\n!?] (not just [^.!?]) — critical for this style profile:
-            # texting-voice replies are often fragmented lines with no
-            # period/exclamation/question mark, so without the \n boundary
-            # too, one flagged phrase could greedily eat everything back to
-            # the start of the whole reply (confirmed by testing — a phrase
-            # on line 3 wiped lines 1-2 entirely). Newline is now also a
-            # hard boundary, so removal stays confined to the line/sentence
-            # the phrase actually appeared in.
             text = re.sub(
                 rf"[^.\n!?]*{re.escape(phrase)}[^.\n!?]*[.!?\n]?",
                 "",
@@ -249,83 +191,64 @@ def scrub_reply(text: str, session_id: str = "") -> str:
             text = rule["pattern"].sub("", text)
         elif rule["action"] == "replace":
             text = rule["pattern"].sub(rule["repl"], text)
-        # "log_only" rules intentionally do nothing here — already
-        # recorded in the violations log above.
 
     text = re.sub(r"[ \t]{2,}", " ", text).strip()
 
-    # --- Tier 2: semantic style check (log-only) --------------------
-    # Runs AFTER the deterministic fixes above, so it's scoring the
-    # already-cleaned text. Deliberately does NOT alter `text` — see
-    # module docstring in semantic_style_check.py and PROJECT_STATE.txt
-    # for why this stays log-only until thresholds are tuned against
-    # real traffic.
     try:
-        semantic_findings = check_semantic_violations(text, session_id=session_id)
+        text, semantic_findings = strip_semantic_violations(text, session_id=session_id)
         if semantic_findings:
-            summary = [f"{f['category']}:{f['score']}" for f in semantic_findings]
-            print(f"[semantic_style_check] session '{session_id}': {summary}")
+            summary = [
+                f"{f['category']}:{f['score']}{'*' if f['enforce'] else ''}"
+                for f in semantic_findings
+            ]
+            print(f"[semantic_style_check] session '{session_id}': {summary} (* = stripped)")
             debug_logger.info(
                 f"[semantic_style_check] session '{session_id}': {semantic_findings}"
             )
     except Exception as e:
-        # Never let a diagnostic-only feature break the actual reply path.
         print(f"[semantic_style_check] error, skipping: {e}")
 
     return text
 
+
 app = FastAPI(title="Bot Bot Backend")
 
-# Allows the browser-based test UI (chat.html, opened via file://) and the
-# future Android app to call this API. Safe here since this server only
-# ever runs on the local network, never exposed to the internet.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    # Honest origin allowlist for browser-based clients (e.g. chat.html
+    # served from localhost) AND the Capacitor app's WebView origins
+    # (capacitor://localhost on Android, https://localhost on iOS) — added
+    # 2026-09-01 after a preflight probe showed /chat/cot (custom
+    # X-CoT-Activate header) failing CORS for every app origin. Native app
+    # traffic over Tailscale doesn't use CORS; X-API-Key remains the gate.
+    # Extend this list if a browser client moves to a different origin.
+    allow_origins=[
+        "http://localhost:8000",
+        "http://127.0.0.1:8000",
+        "capacitor://localhost",
+        "https://localhost",
+        "http://localhost",
+    ],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 NPU_SERVER_URL = "http://127.0.0.1:11435/api/chat"
-
-# Option 2 correction addendum, appended to the system prompt ONLY on a
-# retry attempt (never saved, never part of the normal prompt). Kept short
-# and deliberately does NOT quote the previous bad reply back — including
-# the full violating text would grow the prompt by up to ~num_predict
-# tokens right when we're already near the trim budget on some turns, and
-# risks the model anchoring on / partially copying its own bad structure.
-# Naming the violation types by label is enough context for the model to
-# self-correct without re-reading what it did wrong.
-def _build_retry_addendum(violations: list[str]) -> str:
-    readable = {
-        "bullet_list": "bullet points or numbered lists",
-        "header": "markdown headers (#, ##, etc.)",
-        "bold_pseudo_header": "bold text used as a label/header",
-        "template_divider": "horizontal rule / section divider lines",
-    }
-    named = [readable.get(v, v) for v in violations if v in readable]
-    violation_text = ", ".join(named) if named else "forbidden formatting"
-    return (
-        f"\n\nCRITICAL — your last answer used {violation_text}. Do not do "
-        "that. Answer the same question again, but write it as plain, "
-        "natural conversational prose — like texting a close friend, not "
-        "writing a guide or document. No lists, no headers, no bold labels, "
-        "no dividers. Just talk normally, in flowing sentences.\n"
-    )
+MODEL_NAME = "botbot"
 
 
-async def _call_npu_once(messages: list) -> str:
-    """
-    Single NPU generation call — shared by the first attempt and any
-    style-violation retries in generate_reply(), so the payload shape /
-    options / error handling only exist in one place. Returns the raw
-    (unscrubbed) reply text. Raises HTTPException(503) on backend failure,
-    same behavior as the original inline call this replaces.
-    """
+async def _call_npu_once(messages: list, num_predict: int = 300) -> str:
+    # num_predict defaults to 300 — the normal chat path's value. The CoT
+    # diagnostic endpoint passes a larger budget; with the default, the
+    # request body is byte-for-byte what the normal path has always sent.
+    # HTTP timeout scales with the output budget: 240s covers the 300-token
+    # normal path (observed worst ~130s); large budgets get 900s (700
+    # tokens at the observed ~1 tok/s ≈ 700s worst case).
+    timeout_s = 240 if num_predict <= 300 else 900
     try:
         async with npu_lock:
-            async with httpx.AsyncClient(timeout=240) as client:
+            async with httpx.AsyncClient(timeout=timeout_s) as client:
                 response = await client.post(
                     NPU_SERVER_URL,
                     json={
@@ -333,7 +256,7 @@ async def _call_npu_once(messages: list) -> str:
                         "messages": messages,
                         "stream": False,
                         "options": {
-                            "num_predict": 300,
+                            "num_predict": num_predict,
                             "temperature": 0.85,
                             "top_p": 0.9,
                             "repeat_penalty": 1.15
@@ -349,25 +272,8 @@ async def _call_npu_once(messages: list) -> str:
             status_code=503,
             detail="The model backend is temporarily unavailable or overloaded. Please try again in a moment."
         )
-MODEL_NAME = "botbot"
 
-# Serializes every npu_server.py call across the whole app — the live
-# /chat path AND the background proactive follow-up loop (followup.py)
-# both go through this. Root cause confirmed: this machine has genuinely
-# tight RAM (~15.4GB) for an 8B model + full stack, and concurrent
-# npu_server.py requests (e.g. a live chat landing at the same moment the
-# follow-up loop is generating for several sessions) were pushing
-# memory pressure past the point of a crash.
-#
-# A plain asyncio.Lock() was tried first (one generation at a time)
-# but crashes persisted even fully serialized — back-to-back calls
-# were landing before the previous call's memory was actually released
-# back to the OS. NPUThrottle below adds an enforced cooldown on
-# top of the lock: after a call finishes, the NEXT caller must wait at
-# least NPU_MIN_GAP_SECONDS before it's allowed to start, giving
-# Windows time to actually reclaim memory. Used identically to a plain
-# lock (`async with npu_lock:`), so no other call site needs to
-# change.
+
 NPU_MIN_GAP_SECONDS = 5.0
 
 
@@ -395,36 +301,191 @@ class NPUThrottle:
 
 npu_lock = NPUThrottle()
 
-# Live WebSocket connections, keyed by session_id, and messages queued
-# for delivery to a session that isn't currently connected.
 active_connections: Dict[str, WebSocket] = {}
-pending_messages: Dict[str, List[str]] = defaultdict(list)
+pending_messages: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+PENDING_MSG_CAP = 200  # per-session cap; oldest pushed messages are dropped past this
 
-FOLLOWUP_CHECK_INTERVAL_SECONDS = 30 * 60  # check for follow-ups every 30 minutes
+WS_TICKET_TTL_SECONDS = 30
+ws_tickets: Dict[str, Dict[str, Any]] = {}
+
+# --- Duplicate chat_message protection -----------------------------------
+# A resent message (e.g. client retried after a slow/lost ack while the
+# socket was still open) must not be reprocessed — same id twice would mean
+# two generate_reply()/save_turn() calls for one user turn.
+PROCESSED_MSG_ID_CAP = 200
+processed_message_ids: Dict[str, deque] = defaultdict(lambda: deque(maxlen=PROCESSED_MSG_ID_CAP))
+processed_message_id_sets: Dict[str, set] = defaultdict(set)
 
 
-async def push_message_to_session(session_id: str, message: str):
-    """
-    Delivers a proactive message to a session — live over its
-    WebSocket if currently connected, otherwise queued for delivery
-    the next time that session connects.
-    """
+def _mark_message_processed(session_id: str, msg_id: str) -> bool:
+    """Returns True if this id is new for the session (safe to process),
+    False if it's already been seen (duplicate — ack again, don't reprocess)."""
+    ids_set = processed_message_id_sets[session_id]
+    if msg_id in ids_set:
+        return False
+    dq = processed_message_ids[session_id]
+    if len(dq) == dq.maxlen:
+        oldest = dq[0]
+        ids_set.discard(oldest)
+    dq.append(msg_id)
+    ids_set.add(msg_id)
+    return True
+
+
+def _push_pending(session_id: str, payload: Dict[str, Any]) -> None:
+    """Append to a session's pending (offline) queue, evicting the oldest
+    entries once PENDING_MSG_CAP is exceeded. Without this, a session that
+    stays offline while messages keep getting pushed to it (e.g. from
+    followups) grows this list unbounded."""
+    queue = pending_messages[session_id]
+    queue.append(payload)
+    if len(queue) > PENDING_MSG_CAP:
+        dropped = len(queue) - PENDING_MSG_CAP
+        del queue[:dropped]
+        print(f"[ws] pending_messages for session '{session_id}' exceeded cap, dropped {dropped} oldest")
+
+def _purge_expired_ws_tickets() -> None:
+    """Removes expired, never-consumed tickets from ws_tickets. Without
+    this, a ticket that's issued but never used to open a socket (e.g.
+    client requested a ticket, then the page closed before connecting)
+    sits in ws_tickets forever — _consume_ws_ticket only ever removes an
+    entry when it's actually consumed, and checks expiry after popping,
+    not proactively. Same class of unbounded-growth issue pending_messages
+    had before PENDING_MSG_CAP — swept lazily here, on each new ticket
+    issuance, rather than via a separate background task, matching the
+    lazy-cleanup style already used elsewhere in this file."""
+    now = time.monotonic()
+    expired = [t for t, entry in ws_tickets.items() if now > entry["expires"]]
+    for t in expired:
+        del ws_tickets[t]
+    if expired:
+        print(f"[ws] purged {len(expired)} expired, unconsumed ws_tickets")
+
+
+def _issue_ws_ticket(session_id: str) -> str:
+    _purge_expired_ws_tickets()
+    ticket = secrets.token_urlsafe(32)
+    ws_tickets[ticket] = {
+        "session_id": session_id,
+        "expires": time.monotonic() + WS_TICKET_TTL_SECONDS,
+    }
+    return ticket
+
+
+def _consume_ws_ticket(ticket: str, session_id: str) -> bool:
+    entry = ws_tickets.pop(ticket, None)
+    if entry is None:
+        return False
+    if time.monotonic() > entry["expires"]:
+        return False
+    if entry["session_id"] != session_id:
+        return False
+    return True
+
+
+# Must stay well under followup.py's ACTIVE_RECENCY_THRESHOLD_SECONDS (5min)
+# and ACTIVE_FIRST_DELAY_SECONDS (15min) — otherwise a session's first
+# message is never noticed while still "fresh," and every session gets
+# misclassified as not-active. 1 minute gives comfortable margin on both
+# without polling excessively.
+FOLLOWUP_CHECK_INTERVAL_SECONDS = 60
+
+# --- Prompt budget (real-token based) --------------------------------------
+# npu_server's compiled MAX_PROMPT_LEN is 6144 tokens. The old char-based
+# budget assumed 1.5 chars/token (~2.7x pessimistic vs ~4 chars/token for
+# English), which silently wasted most of the context window and caused
+# unnecessary history trimming (see the confabulation investigation,
+# PROJECT_STATE-style report 2026-08-23). The budget is now measured with
+# the model's REAL tokenizer via npu_server /api/estimate_tokens
+# (tokenize-only, no NPU inference), targeting 5500 tokens — headroom
+# below 6144 for chat-template boundary differences, matching
+# npu_server's own NPU_SAFE_PROMPT_TOKENS.
+NPU_BASE_URL = "http://127.0.0.1:11435"
+PROMPT_TARGET_TOKENS = 5500   # default/cap; the LIVE target is derived from
+                              # npu_server's reported effective ceiling
+PROMPT_CEILING_MARGIN = 644   # 6144 -> 5500 headroom policy (matches
+                              # npu_server's NPU_SAFE_PROMPT_TOKENS)
+
+_prompt_target_cache = {"ts": 0.0, "target": None}
+
+
+def _get_prompt_target_tokens():
+    """Live prompt target, derived from npu_server's REPORTED effective
+    ceiling (/api/health) rather than an independently guessed constant —
+    so if npu_server ever loads without MAX_PROMPT_LEN (the silent retry
+    path) or on a fallback device, main.py budgets against the ceiling
+    that actually exists. Cached 60s. Returns None when the ceiling is
+    unknown (health unreachable, or loaded without MAX_PROMPT_LEN) —
+    callers then fall back to the conservative char-based budget."""
+    now = time.time()
+    if now - _prompt_target_cache["ts"] < 60:
+        return _prompt_target_cache["target"]
+    try:
+        with httpx.Client(timeout=3.0) as client:
+            h = client.get(f"{NPU_BASE_URL}/api/health").json()
+        eff = h.get("effective_max_prompt_len")
+        target = (max(3000, min(PROMPT_TARGET_TOKENS, eff - PROMPT_CEILING_MARGIN))
+                  if eff else None)
+        _prompt_target_cache["ts"] = now
+        _prompt_target_cache["target"] = target
+        if target != PROMPT_TARGET_TOKENS:
+            print(f"[prompt_budget] effective ceiling from npu_server: "
+                  f"max_prompt_len={eff} -> target={target} tokens")
+    except Exception as e:
+        # Keep the previously cached target (or None) rather than hammering
+        # a down server every call.
+        _prompt_target_cache["ts"] = now
+        print(f"[prompt_budget] health unavailable ({e}); "
+              f"target={_prompt_target_cache['target']}")
+    return _prompt_target_cache["target"]
+
+
+def _measure_prompt_tokens_sync(messages: list):
+    """Real tokenizer token count via npu_server (tokenize-only — no model
+    inference). Sync HTTP: called from _prepare_prompt_sync's worker thread.
+    Returns None on any failure; the budget then falls back to the old
+    conservative char-based cap instead of breaking prompt assembly."""
+    try:
+        with httpx.Client(timeout=3.0) as client:
+            resp = client.post(
+                f"{NPU_BASE_URL}/api/estimate_tokens",
+                json={"messages": messages},
+            )
+            resp.raise_for_status()
+            return int(resp.json()["prompt_tokens"])
+    except Exception as e:
+        print(f"[prompt_budget] real token count unavailable ({e}); "
+              f"falling back to char-based budget")
+        return None
+
+
+async def push_message_to_session(session_id: str, message: str, mode: str = "proactive"):
+    payload = {
+        "id": secrets.token_urlsafe(8),
+        "type": "message",
+        "reply": message,
+        "mode": mode,
+        "created_at": int(time.time() * 1000)
+    }
+    # Retain in pending queue until client explicitly acks
+    _push_pending(session_id, payload)
+
     ws = active_connections.get(session_id)
     if ws:
         try:
-            await ws.send_json({"type": "message", "reply": message, "mode": "proactive"})
-            return
-        except Exception:
-            pass  # connection may have just dropped — fall through to queueing
-    pending_messages[session_id].append(message)
+            await ws.send_json(payload)
+            print(f"[ws] delivered payload {payload['id']} to live session '{session_id}'")
+        except Exception as e:
+            print(f"[ws] live send failed for session '{session_id}': {e}")
 
 
 async def _followup_loop():
-    """Background task: periodically checks whether any session warrants a proactive follow-up."""
     while True:
         await asyncio.sleep(FOLLOWUP_CHECK_INTERVAL_SECONDS)
         try:
-            await check_and_send_followups(push_message_to_session, npu_lock)
+            await check_and_send_followups(
+                push_message_to_session, active_connections, _call_npu_once, scrub_reply
+            )
         except Exception as e:
             print(f"[followup loop] error: {e}")
 
@@ -434,14 +495,54 @@ async def start_followup_loop():
     asyncio.create_task(_followup_loop())
 
 
+# --- Automatic end-of-session summarization --------------------------------
+# Trace finding (2026-08-23): session_summaries had ZERO rows ever —
+# summarize_session() was only reachable via the manual /summarize endpoint
+# or the backfill script. Nothing ever triggered it automatically: a missing
+# feature, not a broken one. This loop adds the trigger, following the same
+# background-idle-scan pattern as _followup_loop: every SUMMARY_CHECK_INTERVAL
+# it queues summarization for non-test sessions that (a) have been idle past
+# SUMMARY_IDLE_THRESHOLD_SECONDS (session effectively over — covers both
+# websocket disconnects and abandoned sessions), (b) have no summary yet,
+# and (c) have enough turns to be worth summarizing. Runs via the existing
+# _background_summarize task (which carries the _summarize_jobs in-flight
+# guard) so it never blocks a live /chat response; NPU locking stays inside
+# summarizer._call_npu — no outer npu_lock acquisition here (PROJECT_STATE
+# §7A deadlock class).
+SUMMARY_CHECK_INTERVAL_SECONDS = 600        # scan every 10 minutes
+SUMMARY_IDLE_THRESHOLD_SECONDS = 2 * 3600   # session idle >= 2h before summarizing
+SUMMARY_MIN_TURNS = 6                       # skip trivial sessions
+
+
+async def _summary_loop():
+    while True:
+        await asyncio.sleep(SUMMARY_CHECK_INTERVAL_SECONDS)
+        try:
+            now = time.time()
+            for sid, last_active in get_sessions_with_last_activity():
+                if is_test_session(sid):
+                    continue  # test sessions are excluded from summaries by design
+                if now - last_active < SUMMARY_IDLE_THRESHOLD_SECONDS:
+                    continue
+                if sid in _summarize_jobs or session_has_summary(sid):
+                    continue
+                if count_turns(sid) < SUMMARY_MIN_TURNS:
+                    continue
+                idle_h = int((now - last_active) / 3600)
+                print(f"[summary_loop] session '{sid}' idle {idle_h}h with no "
+                      f"summary — queuing summarization")
+                asyncio.create_task(_background_summarize(sid, force=False,
+                                                          known_people=get_known_people()))
+        except Exception as e:
+            print(f"[summary loop] error: {e}")
+
+
+@app.on_event("startup")
+async def start_summary_loop():
+    asyncio.create_task(_summary_loop())
+
+
 def detect_mentioned_session(message: str, known_sessions: list[str], current_session_id: str) -> str | None:
-    """
-    Checks if the user's message explicitly names a past session by its
-    session_id (e.g. "what did we talk about in therapytest"). Skips the
-    current session itself (nothing to "look up" there — it's just the
-    live conversation), and requires a reasonably specific id (4+ chars)
-    to avoid accidental matches on very short/common ids.
-    """
     msg = message.lower()
     for sid in known_sessions:
         if sid == current_session_id:
@@ -452,31 +553,28 @@ def detect_mentioned_session(message: str, known_sessions: list[str], current_se
 
 
 async def _background_rollup(session_id: str):
-    """
-    Fire-and-forget wrapper around memory.maybe_rollup_session(), scheduled
-    via asyncio.create_task() right after save_turn() in generate_reply() —
-    same pattern already used for the follow-up loop. Runs after the reply
-    has already been returned to the caller, so a slow or failed rollup
-    never delays or breaks the live /chat response.
-
-    maybe_rollup_session() itself is a cheap no-op unless the session has
-    crossed ROLLUP_TRIGGER_TURNS un-folded turns (see memory.py), so most
-    calls here return immediately without touching npu_server.py at all.
-    Uses the same module-scope npu_lock as the live /chat path and the
-    follow-up loop, so a rollup call never races a live generation.
-    """
     try:
         await maybe_rollup_session(session_id, summarize_turns_batch, npu_lock)
     except Exception as e:
         print(f"[background_rollup] error for session '{session_id}': {e}")
 
 
+_summarize_jobs: dict[str, str] = {}
+
+
+async def _background_summarize(session_id: str, force: bool, known_people: set):
+    _summarize_jobs[session_id] = "in_progress"
+    try:
+        await summarize_session(session_id, force=force, npu_lock=npu_lock, known_people=known_people)
+        _summarize_jobs.pop(session_id, None)
+    except Exception as e:
+        _summarize_jobs[session_id] = f"error: {e}"
+        print(f"[background_summarize] error for session '{session_id}': {e}")
+
+
 class ChatRequest(BaseModel):
     message: str
     session_id: str = "default"
-    # Matches the Android app's payload shape: a list of dicts with at
-    # least "name", "type", and "base64" fields. Optional — chat.html
-    # and plain PowerShell requests won't send this at all.
     attachments: Optional[List[Dict[str, Any]]] = None
 
 
@@ -496,15 +594,70 @@ class SearchRequest(BaseModel):
     context_lines: int = 8
 
 
-async def verify_api_key(x_api_key: str = Header(None)):
-    """
-    Guards every sensitive endpoint. The caller must send the shared
-    secret in an "X-API-Key" header. This keeps the API usable only by
-    devices that actually have the key (you) — important since this
-    server is reachable over Tailscale/LAN and has no other auth layer.
-    """
-    if x_api_key != API_KEY:
+class TicketRequest(BaseModel):
+    session_id: str = "default"
+
+
+# --- Multi-key auth (named, revocable, session-scoped) ----------------------
+# verify_api_key authenticates against secret_key.API_KEYS and RETURNS the
+# matched entry so endpoints can enforce session scoping server-side.
+# Generic 401 for both "unknown key" and "disabled key" — no distinction
+# leaks to the client. Session mismatch is a separate 403.
+#
+# Immediate disable without restart: main re-checks key_state.json (next to
+# this file) whenever its mtime changes — {"disabled": {"guest-1": true}}
+# rejects that label on the very next request. Key MATERIAL rotation still
+# requires a restart (imported once).
+KEY_STATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "key_state.json")
+_key_state_cache = {"mtime": None, "disabled": frozenset()}
+
+
+def _disabled_key_labels() -> frozenset:
+    try:
+        mtime = os.stat(KEY_STATE_PATH).st_mtime
+    except OSError:
+        if _key_state_cache["mtime"] is not None:
+            _key_state_cache["mtime"] = None
+            _key_state_cache["disabled"] = frozenset()
+        return _key_state_cache["disabled"]
+    if mtime != _key_state_cache["mtime"]:
+        try:
+            with open(KEY_STATE_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            disabled = frozenset(
+                label for label, off in data.get("disabled", {}).items() if off)
+        except Exception as e:
+            print(f"[auth] key_state.json unreadable, ignoring: {e}")
+            disabled = _key_state_cache["disabled"]
+        _key_state_cache["mtime"] = mtime
+        _key_state_cache["disabled"] = disabled
+    return _key_state_cache["disabled"]
+
+
+async def verify_api_key(x_api_key: str = Header(None)) -> dict:
+    """Authenticate the presented key against secret_key.API_KEYS and return
+    the matched entry. Disabled keys are skipped before comparison, so a
+    disabled key and an unknown key produce the identical generic 401."""
+    disabled = _disabled_key_labels()
+    matched = None
+    for entry in API_KEYS:
+        if not entry.get("enabled", False) or entry["label"] in disabled:
+            continue
+        if secrets.compare_digest(x_api_key or "", entry["key"]):
+            matched = entry
+            break
+    if matched is None:
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
+    return matched
+
+
+def _enforce_session_scope(key_info: dict, session_id: str) -> None:
+    """Server-enforced session scoping: a scoped (non-primary) key may only
+    touch its one allowed session_id, regardless of what the client sends.
+    The primary key (session_id None) is unrestricted."""
+    allowed = key_info.get("session_id")
+    if allowed is not None and session_id != allowed:
+        raise HTTPException(status_code=403, detail="Session not permitted for this key")
 
 
 @app.get("/")
@@ -512,55 +665,46 @@ async def root():
     return {"status": "Bot Bot backend is running"}
 
 
+NPU_HEALTH_URL = "http://127.0.0.1:11435/api/health"
+
+
 @app.get("/api/health")
 async def health():
-    """
-    Health check endpoint used by the Android app's 'Test Connection'
-    feature. Keep this lightweight — no DB or model calls, just confirms
-    the server process is alive and reachable.
-    """
-    return {"status": "ok"}
+    """Aggregated stack health: this API plus the NPU backend's real model
+    state (proxied with a short timeout so /api/health stays fast even when
+    npu_server is down). Previously reported a static ok regardless of
+    whether inference could actually serve anything."""
+    try:
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            resp = await client.get(NPU_HEALTH_URL)
+            resp.raise_for_status()
+            data = resp.json()
+        npu_backend = {
+            "reachable": True,
+            "model_loaded": bool(data.get("model_loaded")),
+            "loaded_model": data.get("loaded_model"),
+        }
+    except Exception as e:
+        npu_backend = {"reachable": False, "error": str(e)}
+
+    return {
+        "status": "ok",
+        "npu_backend": npu_backend,
+        "can_generate": npu_backend.get("reachable", False)
+        and bool(npu_backend.get("model_loaded")),
+    }
 
 
-async def generate_reply(session_id: str, prompt_message: str, history_message: str = None) -> tuple[str, str]:
-    """
-    Core reply pipeline — mode detection, RAG, history, style, and the
-    npu_server.py call. Shared by both /chat (plain text) and /chat/upload
-    (file/image attachments), so both paths behave identically.
-
-    prompt_message   - the full text actually sent to the model this
-                        turn (may include extracted file/image content)
-    history_message  - what gets SAVED to conversation history instead,
-                        if different from prompt_message. Keeps large
-                        extracted file/OCR text out of future prompts —
-                        otherwise every subsequent message in the
-                        session would keep re-paying for that content
-                        via get_recent_history(). Defaults to
-                        prompt_message when not given (plain text case).
-    """
-    if history_message is None:
-        history_message = prompt_message
-
-    # Part 4 — behavioral mode detection
+def _prepare_prompt_sync(session_id: str, prompt_message: str, measure_tokens=None,
+                         history_override=None):
     mode = detect_mode(prompt_message)
-
-    # Strict, explicit retrieval partitioning — see RETRIEVAL_POLICY in
-    # mode_router.py for the full reasoning. Each mode states exactly
-    # what it's allowed to retrieve and how much; nothing here silently
-    # cascades into a more expensive path just because a keyword matched.
     policy = get_retrieval_policy(mode)
 
-    # Part 6/7 — retrieve relevant personal context via RAG
-    # Skip entirely for trivial messages (hi, ok, lol) — no useful
-    # context to find, and saves real time on the most common messages.
-    # Even when not trivial, top_k is mode-gated: casual/conversational
-    # messages get a real "bare minimum" pull (policy["personal_top_k"]
-    # is small), supportive/guidance get the fuller tier — see policy
-    # comments in mode_router.py for why this is safe even at the
-    # fuller tier now.
+    context_lookup_attempted = not is_trivial_message(prompt_message)
+
     personal_context = ""
     reference_context = ""
-    if not is_trivial_message(prompt_message):
+    if context_lookup_attempted:
         personal_context = search_personal_data(
             prompt_message,
             top_k=policy["personal_top_k"],
@@ -569,52 +713,28 @@ async def generate_reply(session_id: str, prompt_message: str, history_message: 
         if policy["reference"]:
             reference_context = search_reference_data(prompt_message, top_k=policy["reference_top_k"])
 
-    # --- DIRECT FILE INJECTION: Important links.txt ---
     important_links = get_important_links()
     if important_links:
         if personal_context:
             personal_context = f"{personal_context}\n\n{important_links}"
         else:
             personal_context = important_links
-    # ----------------------------------------------------
 
-    # Part 8 — pull recent summaries of OTHER past sessions
-    # limit is also mode-gated now (policy["summaries_limit"]) — casual
-    # chat doesn't need the full ambient summary list every turn.
-    #
-    # Test-session isolation: if THIS session is a test session (e.g.
-    # "testtest"), skip pulling other sessions' summaries entirely — a
-    # test sandbox shouldn't see real conversation history at all, not
-    # just avoid leaking its own content elsewhere. get_recent_summaries()
-    # already excludes test sessions from the pool other (real) sessions
-    # see; this is the other direction of the same isolation guarantee.
     if is_test_session(session_id):
         session_summaries_text = ""
     else:
-        summaries = get_recent_summaries(exclude_session_id=session_id, limit=policy["summaries_limit"])
+        summaries = get_recent_summaries(
+            exclude_session_id=session_id, limit=policy["summaries_limit"], query=prompt_message
+        )
         session_summaries_text = "\n".join(f"- {s}" for s in summaries) if summaries else ""
 
-    # If the user explicitly named a past session by its session_id
-    # (e.g. "what did we talk about in therapytest"), fetch that
-    # session's real content directly rather than relying on it to
-    # show up in the general ambient summaries pool above.
-    #
-    # Test-session isolation: known_sessions is filtered to exclude test
-    # sessions before matching, so no session — test or real — can ever
-    # trigger a lookup into a test session's actual content just by
-    # typing its name (e.g. "testtest") in a message. Without this,
-    # detect_mentioned_session() would happily fetch and inject a test
-    # session's real turns into a completely unrelated conversation,
-    # which is a live leak, not just a theoretical one.
     referenced_session_context = ""
     if is_test_session(session_id):
-        # Full isolation: a test session also can't look up any OTHER
-        # session by name — keeps it a clean, self-contained sandbox in
-        # both directions rather than only protecting its own privacy.
         mentioned_session = None
     else:
         known_sessions = [sid for sid in get_all_session_ids() if not is_test_session(sid)]
         mentioned_session = detect_mentioned_session(prompt_message, known_sessions, session_id)
+
     if mentioned_session:
         summary = get_summary_for_session(mentioned_session)
         if summary:
@@ -627,7 +747,6 @@ async def generate_reply(session_id: str, prompt_message: str, history_message: 
                     f"Session '{mentioned_session}' (not yet summarized, recent turns):\n{turns_text}"
                 )
 
-    # Part 13 — user's style profile, always injected in full
     style_profile = get_style_profile()
 
     system_prompt = get_system_prompt(
@@ -639,29 +758,13 @@ async def generate_reply(session_id: str, prompt_message: str, history_message: 
         referenced_session_context=referenced_session_context
     )
 
-    # Part 5 — pull recent conversation history for THIS session
-    # No longer capped at a fixed turn count — get_recent_history() now
-    # caps by token budget (max_tokens, default 2200) instead, so this
-    # naturally shrinks/grows the prompt to leave headroom for the rest
-    # of the system prompt (RAG chunks, summaries, style profile).
-    history = get_recent_history(session_id)
+    # history_override (CoT replay mode): an explicitly provided historical
+    # turn list replaces the CURRENT-session history fetch, so a replayed
+    # old turn sees the context it would have had at the time. Default None
+    # = normal path, byte-for-byte unchanged.
+    history = (history_override if history_override is not None
+               else get_recent_history(session_id))
 
-    # --- TEMPORARY DEBUG LOGGING ---
-    # Prints the character length of every component that goes into the
-    # prompt, so we can see exactly which piece is unexpectedly large on
-    # any given turn instead of guessing from npu_server.py's token count
-    # alone.
-    # ~4 chars/token is a rough estimate, consistent with the heuristic
-    # used in memory.py's get_recent_history().
-    # ~4 chars/token was the original estimate, but a real npu_server.py
-    # failure confirmed this significantly UNDERCOUNTS against Qwen's
-    # actual tokenizer: a prompt estimated here at ~2736 tokens was
-    # actually 4519 tokens once really tokenized (~1.65x higher) —
-    # likely chat-template overhead (role markers/special tokens per
-    # turn) that a flat chars/4 count on raw content doesn't capture.
-    # Using ~2.5 chars/token as a more honest (still approximate, but
-    # far less dangerously optimistic) estimate for prompt-budget/
-    # debug-logging purposes going forward.
     CHARS_PER_TOKEN_ESTIMATE = 2.5
 
     def _est_tokens(s: str) -> int:
@@ -679,52 +782,13 @@ async def generate_reply(session_id: str, prompt_message: str, history_message: 
         f"system_prompt_total={len(system_prompt)} chars (~{_est_tokens(system_prompt)} tok) | "
         f"prompt_message={len(prompt_message)} chars (~{_est_tokens(prompt_message)} tok)"
     )
-    # --- END TEMPORARY DEBUG LOGGING ---
 
-    # --- HARD TRIM-TO-FIT SAFETY NET ---
-    # The estimate above is just for debugging/visibility — it has now been
-    # wrong twice in production, in two different directions of severity
-    # (observed ~1.16x and ~1.65x undercounts vs. the real tokenizer), so it
-    # cannot be trusted to gate whether a request is safe to send. This is
-    # confirmed by a real crash: a prompt estimated here at ~5678 tokens was
-    # actually 6590 once tokenized by npu_server.py, over its hard
-    # MAX_PROMPT_LEN ceiling of 6144 — GPU fallback failed first (OpenCL
-    # ProgramBuilder error on this integrated-GPU hardware), then NPU itself
-    # rejected the oversized prompt outright, surfacing as an unhandled 500.
-    #
-    # Rather than trying to out-guess the tokenizer, this hard-caps the
-    # actual character budget using a deliberately pessimistic chars/token
-    # ratio (worse than the worst undercount seen so far) and physically
-    # trims content until the prompt is guaranteed to fit.
-    #
-    # FIX 3 — reordered from the original least-to-most-damaging list.
-    # The original order trimmed conversation history FIRST, via an
-    # unbounded while-loop that could empty it completely — meaning the
-    # thing most valuable to the user (what was actually just said) was
-    # the first thing sacrificed, while static instructional padding
-    # (reference/technique context, other-session summaries) and RAG
-    # personal_context — which the user never sees as "missing" the way
-    # they'd notice the bot forgetting the last few turns — survived
-    # longer. New order, least valuable to lose first:
-    #   1. reference/technique context + other-session summaries (static
-    #      padding, mode-gated, least conversationally relevant)
-    #   2. personal RAG context (search_personal_data results — relevant,
-    #      but a re-query next turn can recover it; recent history can't
-    #      be recovered once dropped)
-    #   3. conversation history — LAST resort, and only down to a
-    #      protected floor (HISTORY_PROTECTED_FLOOR_TURNS) rather than to
-    #      zero. Only if the prompt still doesn't fit with nothing left
-    #      but the floor does it dip below the floor, as a genuine last
-    #      resort to avoid a hard 500.
     NPU_HARD_TOKEN_LIMIT = 6144
     HARD_CAP_SAFETY_MARGIN_TOKENS = 600
-    HARD_CAP_CHARS_PER_TOKEN = 1.5  # pessimistic on purpose
+    HARD_CAP_CHARS_PER_TOKEN = 1.5
     HARD_CAP_TARGET_CHARS = int(
         (NPU_HARD_TOKEN_LIMIT - HARD_CAP_SAFETY_MARGIN_TOKENS) * HARD_CAP_CHARS_PER_TOKEN
     )
-    # Minimum number of history dict entries (user+assistant messages, not
-    # "turns" in the save_turn sense) to preserve before history trimming
-    # is allowed to proceed past this floor. 4 entries = last ~2 exchanges.
     HISTORY_PROTECTED_FLOOR_TURNS = 4
 
     def _total_prompt_chars(sp: str, hist: list, pm: str) -> int:
@@ -732,12 +796,46 @@ async def generate_reply(session_id: str, prompt_message: str, history_message: 
 
     total_chars = _total_prompt_chars(system_prompt, history, prompt_message)
     trimmed = False
+    trim_details = []
 
-    # Step 1: reference/technique context + other-session summaries first —
-    # static padding, least damaging to lose. Trims reference_context down
-    # to nothing first, then session_summaries_text if still over budget.
-    if total_chars > HARD_CAP_TARGET_CHARS and (reference_context or session_summaries_text):
+    # --- Budget ceiling: real tokens when measurable, chars otherwise ------
+    # The trim CASCADE below is unchanged (same section priority order);
+    # only the ceiling it measures against changed: from the pessimistic
+    # 8,316-char cap to a real-token target DERIVED from npu_server's
+    # reported effective ceiling (single-sourced there). When the ceiling
+    # is unknown (npu down, or loaded without MAX_PROMPT_LEN), the old
+    # conservative char budget is used and no measurement runs.
+    target_tokens = _get_prompt_target_tokens()
+    budget_chars = HARD_CAP_TARGET_CHARS
+    measured_tokens = None
+    if (measure_tokens is not None and target_tokens is not None
+            and (total_chars > HARD_CAP_TARGET_CHARS
+                 or target_tokens < PROMPT_TARGET_TOKENS)):
+        probe = (
+            [{"role": "system", "content": system_prompt}]
+            + history
+            + [{"role": "user", "content": prompt_message}]
+        )
+        measured_tokens = measure_tokens(probe)
+        if measured_tokens is not None:
+            # Derive this prompt's real chars-per-token ratio (clamped for
+            # safety against degenerate content) and scale the char budget
+            # so the cascade targets target_tokens real tokens.
+            ratio = total_chars / max(measured_tokens, 1)
+            ratio = max(2.0, min(6.0, ratio))
+            budget_chars = int(target_tokens * ratio)
+            trim_details.append({
+                "stage": "measurement",
+                "real_tokens": measured_tokens,
+                "target_tokens": target_tokens,
+                "chars_per_token_ratio": round(ratio, 2),
+                "char_budget": budget_chars,
+            })
+
+    if total_chars > budget_chars and (reference_context or session_summaries_text):
         overflow = total_chars - HARD_CAP_TARGET_CHARS
+        ref_before = len(reference_context)
+        sum_before = len(session_summaries_text)
         if reference_context:
             keep = max(0, len(reference_context) - overflow)
             overflow -= (len(reference_context) - keep)
@@ -753,11 +851,16 @@ async def generate_reply(session_id: str, prompt_message: str, history_message: 
             referenced_session_context=referenced_session_context
         )
         trimmed = True
+        trim_details.append({
+            "stage": "reference_then_summaries",
+            "reference_chars_removed": ref_before - len(reference_context),
+            "summaries_chars_removed": sum_before - len(session_summaries_text),
+        })
         total_chars = _total_prompt_chars(system_prompt, history, prompt_message)
 
-    # Step 2: still too big — truncate personal RAG context next.
-    if total_chars > HARD_CAP_TARGET_CHARS and personal_context:
+    if total_chars > budget_chars and personal_context:
         overflow = total_chars - HARD_CAP_TARGET_CHARS
+        personal_before = len(personal_context)
         personal_context = personal_context[: max(0, len(personal_context) - overflow)]
         system_prompt = get_system_prompt(
             mode,
@@ -768,110 +871,160 @@ async def generate_reply(session_id: str, prompt_message: str, history_message: 
             referenced_session_context=referenced_session_context
         )
         trimmed = True
+        trim_details.append({
+            "stage": "personal_context",
+            "personal_chars_removed": personal_before - len(personal_context),
+        })
         total_chars = _total_prompt_chars(system_prompt, history, prompt_message)
 
-    # Step 3: last resort — drop oldest history turns, but only down to
-    # HISTORY_PROTECTED_FLOOR_TURNS. Recent conversation history is the
-    # most user-visible thing to lose (it reads as the bot "forgetting"
-    # what was just said), so it's protected as long as possible.
-    while total_chars > HARD_CAP_TARGET_CHARS and len(history) > HISTORY_PROTECTED_FLOOR_TURNS:
+    history_turns_before = len(history)
+    while total_chars > budget_chars and len(history) > HISTORY_PROTECTED_FLOOR_TURNS:
         history.pop(0)
         trimmed = True
         total_chars = _total_prompt_chars(system_prompt, history, prompt_message)
 
-    # Step 4: genuine last resort — everything else is already trimmed to
-    # nothing and we're still over budget even at the protected floor.
-    # Better to dip below the floor here than to hard-fail the request
-    # with a 500, since npu_server.py will reject an oversized prompt
-    # outright rather than gracefully degrading.
-    while total_chars > HARD_CAP_TARGET_CHARS and history:
+    history_protected_pops = 0
+    while total_chars > budget_chars and history:
         history.pop(0)
+        history_protected_pops += 1
         trimmed = True
         total_chars = _total_prompt_chars(system_prompt, history, prompt_message)
+    if history_protected_pops:
+        trim_details.append({
+            "stage": "history_below_protected_floor",
+            "turns_removed": history_protected_pops,
+        })
+    if len(history) != history_turns_before:
+        trim_details.append({
+            "stage": "history",
+            "turns_removed": history_turns_before - len(history),
+        })
+
+    # --- Real-token drift check (only when measurement is available) -------
+    # The char cascade is ratio-guided, not exact; if the real count is
+    # still over target after the cascade, pop history turns in batches
+    # and re-measure (each measure is a ~ms tokenize call, no inference).
+    if measured_tokens is not None:
+        for _ in range(5):
+            probe = (
+                [{"role": "system", "content": system_prompt}]
+                + history
+                + [{"role": "user", "content": prompt_message}]
+            )
+            real_now = measure_tokens(probe)
+            if real_now is None:
+                break  # measurement lost — char cascade already bounded it
+            measured_tokens = real_now
+            if real_now <= target_tokens:
+                break
+            over = real_now - target_tokens
+            per_turn = max(1.0, real_now / max(len(history), 1))
+            pops = min(len(history), int(over / per_turn) + 1)
+            if pops <= 0:
+                break
+            history = history[pops:]
+            trimmed = True
+            trim_details.append({
+                "stage": "history_real_remeasure",
+                "turns_removed": pops,
+                "real_tokens_before": real_now,
+            })
 
     if trimmed:
         print(
             f"[prompt_trim] session '{session_id}' exceeded safety budget — "
             f"trimmed to fit. final size ~{total_chars} chars "
             f"(~{int(total_chars / HARD_CAP_CHARS_PER_TOKEN)} conservative tok est, "
-            f"target was {HARD_CAP_TARGET_CHARS} chars, {len(history)} history turns remaining)"
+            f"target was {budget_chars} chars, {len(history)} history turns remaining)"
         )
-    # --- END HARD TRIM-TO-FIT SAFETY NET ---
 
     messages = [{"role": "system", "content": system_prompt}] + \
         history + \
         [{"role": "user", "content": prompt_message}]
 
-    # --- Option 2: validate-and-retry loop ------------------------------
-    # Generate, check the RAW (pre-scrub) reply against
-    # check_style_violations(), and if it contains a STRUCTURAL violation
-    # (see RETRY_TRIGGER_VIOLATIONS above scrub_reply/check_style_violations
-    # near AI_TELL_PHRASES) — the underlying answer is list/template-shaped,
-    # not just missing a regex-fixable phrase — regenerate with a short
-    # correction appended to the system prompt. Up to MAX_STYLE_RETRIES
-    # extra attempts; scrub_reply() at the end is still the final backstop
-    # regardless of whether retry succeeded, same safety net as before.
-    #
-    # Wrapped in try/except: on this hardware, npu_server.py can
-    # occasionally die mid-request under memory pressure (observed as a
-    # genuine crash, not just a slow response). Rather than letting that
-    # surface as an unhandled 500 with a full traceback to the caller,
-    # catch it here and return a clean, friendly error — the underlying
-    # memory/resource issue still needs addressing (num_ctx, keep_alive,
-    # pagefile, closing other apps), but at least the app degrades
-    # gracefully instead of crashing the request. _call_npu_once() raises
-    # HTTPException(503) itself on backend failure, so a failure on any
-    # attempt (including a retry) propagates the same clean error as
-    # before rather than being silently swallowed.
-    raw_reply = await _call_npu_once(messages)
-    attempt = 0
-    while attempt < MAX_STYLE_RETRIES:
-        violations = check_style_violations(raw_reply)
-        if not (set(violations) & RETRY_TRIGGER_VIOLATIONS):
-            break
-        attempt += 1
-        print(
-            f"[style_retry] session '{session_id}': attempt {attempt}/"
-            f"{MAX_STYLE_RETRIES} — regenerating due to {violations}"
-        )
-        retry_system_prompt = system_prompt + _build_retry_addendum(violations)
-        retry_messages = [{"role": "system", "content": retry_system_prompt}] + \
-            history + \
-            [{"role": "user", "content": prompt_message}]
-        raw_reply = await _call_npu_once(retry_messages)
-    else:
-        # Loop exhausted MAX_STYLE_RETRIES without ever breaking clean —
-        # log the final outcome so it's visible whether retry actually
-        # helped or just cost time. (No action needed here; scrub_reply()
-        # below still runs as the regex-based backstop either way.)
-        final_violations = check_style_violations(raw_reply)
-        if set(final_violations) & RETRY_TRIGGER_VIOLATIONS:
-            print(
-                f"[style_retry] session '{session_id}': still violating "
-                f"after {MAX_STYLE_RETRIES} retr{'y' if MAX_STYLE_RETRIES == 1 else 'ies'} "
-                f"({final_violations}) — falling back to scrub_reply()"
-            )
+    return {
+        "mode": mode,
+        "messages": messages,
+        "context_lookup_attempted": context_lookup_attempted,
+        "personal_context": personal_context,
+        "reference_context": reference_context,
+        "session_summaries_text": session_summaries_text,
+        "referenced_session_context": referenced_session_context,
+        "style_profile": style_profile,
+        "trimmed": trimmed,
+        "trim_details": trim_details,
+        "final_total_chars": total_chars,
+        "measured_tokens": measured_tokens,
+        "budget_chars": budget_chars,
+    }
 
-    bot_reply = scrub_reply(raw_reply, session_id=session_id)
-    # --- END validate-and-retry loop ------------------------------------
 
-    # Part 5 — save this turn to memory (using history_message, which
-    # may be a shorter stand-in for large extracted file/image content)
-    save_turn(session_id, history_message, bot_reply, mode)
+async def generate_reply(session_id: str, prompt_message: str, history_message: str = None) -> tuple[str, str]:
+    if history_message is None:
+        history_message = prompt_message
 
-    # Rolling-summarization rollup — fire-and-forget, doesn't block the
-    # reply. Cheap no-op unless this session just crossed
-    # ROLLUP_TRIGGER_TURNS un-folded turns (see memory.py). This is what
-    # main.py was missing before: memory.py/summarizer.py's rollup
-    # machinery was fully implemented and unit-tested, but never actually
-    # called from the live /chat path until now.
+    prep = await asyncio.to_thread(
+        _prepare_prompt_sync, session_id, prompt_message,
+        _measure_prompt_tokens_sync)
+
+    mode = prep["mode"]
+    raw_reply = await _call_npu_once(prep["messages"])
+    bot_reply = await asyncio.to_thread(scrub_reply, raw_reply, session_id=session_id)
+
+    try:
+        context_present = bool(prep["personal_context"]) or bool(prep["reference_context"])
+        # Step-1 instrumentation (prompt-budget investigation): per-section
+        # char/token estimates + trim details. Pure arithmetic, no NPU cost.
+        # Token figures are the chars/2.5 estimate, not real tokenizer counts.
+        _cpe = 2.5
+        sys_chars = len(prep["messages"][0]["content"])
+        hist_chars = sum(len(m["content"]) for m in prep["messages"][1:-1])
+        user_chars = len(prep["messages"][-1]["content"])
+        section_chars = {
+            "system_prompt": sys_chars,
+            "history": hist_chars,
+            "prompt_message": user_chars,
+            "personal_context": len(prep["personal_context"]),
+            "reference_context": len(prep["reference_context"]),
+            "session_summaries": len(prep["session_summaries_text"]),
+            "referenced_session_context": len(prep.get("referenced_session_context", "")),
+            "style_profile": len(prep.get("style_profile", "")),
+        }
+        sufficiency_logger.info(json.dumps({
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "session_id": session_id,
+            "mode": mode,
+            "context_lookup_attempted": prep["context_lookup_attempted"],
+            "personal_context_chars": len(prep["personal_context"]),
+            "reference_context_chars": len(prep["reference_context"]),
+            "session_summaries_chars": len(prep["session_summaries_text"]),
+            "context_present": context_present,
+            "sufficiency_instruction_fired": context_present,
+            "trimmed": prep["trimmed"],
+            "real_prompt_tokens": prep.get("measured_tokens"),
+            "prompt_target_tokens": prep.get("target_tokens"),
+            "est_prompt_tokens": int((sys_chars + hist_chars + user_chars) / _cpe),
+            "section_chars": section_chars,
+            "section_token_estimates": {
+                k: int(v / _cpe) for k, v in section_chars.items()
+            },
+            "trim_details": prep.get("trim_details", []),
+            "prompt_message_preview": prompt_message[:200],
+            "reply_text": bot_reply,
+            "reply_flagged_uncertainty": _reply_reads_as_uncertain(bot_reply),
+        }))
+    except Exception as e:
+        print(f"[sufficiency_log] error, skipping: {e}")
+
+    await asyncio.to_thread(save_turn, session_id, history_message, bot_reply, mode)
     asyncio.create_task(_background_rollup(session_id))
 
     return bot_reply, mode
 
 
-@app.post("/chat", response_model=ChatResponse, dependencies=[Depends(verify_api_key)])
-async def chat(payload: ChatRequest):
+@app.post("/chat", response_model=ChatResponse)
+async def chat(payload: ChatRequest, key_info: dict = Depends(verify_api_key)):
+    _enforce_session_scope(key_info, payload.session_id)
     prompt_message = payload.message
     history_message = payload.message
 
@@ -881,29 +1034,20 @@ async def chat(payload: ChatRequest):
 
         extracted_text = "\n\n".join(extracted_parts)
         prompt_message = f"{payload.message}\n\n{extracted_text}".strip()
-
-        # Keep what's saved to history short, same reasoning as
-        # /chat/upload — don't re-pay for large OCR/caption text on
-        # every future turn in this session via get_recent_history().
         history_message = f"[Sent file(s): {', '.join(file_names)}] {payload.message}".strip()
 
     bot_reply, mode = await generate_reply(payload.session_id, prompt_message, history_message=history_message)
     return ChatResponse(reply=bot_reply, mode=mode)
 
 
-@app.post("/chat/upload", response_model=ChatResponse, dependencies=[Depends(verify_api_key)])
+@app.post("/chat/upload", response_model=ChatResponse)
 async def chat_upload(
+    key_info: dict = Depends(verify_api_key),
     file: UploadFile = File(...),
     message: str = Form(""),
     session_id: str = Form("default")
 ):
-    """
-    Accepts a file (image, PDF, DOCX, or TXT) alongside an optional
-    text message. The file is converted to plain text via media.py
-    (OCR/captioning for images, direct extraction for documents),
-    combined with any typed message, and sent through the exact same
-    pipeline as /chat — mode detection, RAG, history, npu_server.py.
-    """
+    _enforce_session_scope(key_info, session_id)
     file_bytes = await file.read()
     extracted = process_uploaded_file(file.filename, file_bytes)
 
@@ -912,8 +1056,6 @@ async def chat_upload(
     else:
         prompt_message = extracted
 
-    # Keep what's stored in history short — just a reference to the
-    # file plus any typed message, not the full extracted text.
     history_message = f"[Sent a file: {file.filename}]"
     if message.strip():
         history_message += f" {message.strip()}"
@@ -922,42 +1064,247 @@ async def chat_upload(
     return ChatResponse(reply=bot_reply, mode=mode)
 
 
-@app.get("/history/{session_id}", dependencies=[Depends(verify_api_key)])
-async def history(session_id: str, limit: int = 50):
-    """
-    Returns past turns for a session so the frontend (chat.html) can
-    repopulate the chat window on page load/refresh. Reuses the same
-    get_recent_history() function already used to build prompts, just
-    exposed here for the UI to call directly.
-    """
+@app.get("/history/{session_id}")
+async def history(session_id: str, limit: int = 50, key_info: dict = Depends(verify_api_key)):
+    _enforce_session_scope(key_info, session_id)
     turns = get_recent_history(session_id, limit=limit)
     return {"session_id": session_id, "messages": turns}
 
 
-@app.post("/summarize", dependencies=[Depends(verify_api_key)])
-async def summarize(payload: SummarizeRequest):
-    """
-    Part 8 — Call this when a session ends (e.g. app closed, or user
-    starts a new session) to generate and store a summary of it.
-    Safe to call multiple times — skips if already summarized unless
-    triggered again with force (not exposed here, use summarizer.py
-    directly with force=True if a re-summary is ever needed).
-    """
-    summary = await summarize_session(payload.session_id, force=payload.force, npu_lock=npu_lock)
-    if summary is None:
+@app.post("/summarize")
+async def summarize(payload: SummarizeRequest, key_info: dict = Depends(verify_api_key)):
+    session_id = payload.session_id
+    _enforce_session_scope(key_info, session_id)
+
+    if _summarize_jobs.get(session_id) == "in_progress":
+        return {"status": "already_in_progress", "session_id": session_id}
+
+    if not payload.force and session_has_summary(session_id):
         return {"status": "skipped", "reason": "no turns found or already summarized"}
-    return {"status": "summarized", "summary": summary}
+
+    asyncio.create_task(
+        _background_summarize(session_id, payload.force, get_known_people())
+    )
+    return {"status": "queued", "session_id": session_id}
 
 
-@app.post("/search", dependencies=[Depends(verify_api_key)])
-async def search(payload: SearchRequest):
-    """
-    Keyword/phrase search across all indexed personal data (raw
-    literal matching, not semantic). Returns raw matches with
-    surrounding context for the Android app to display directly —
-    does NOT go through the LLM, so it's fast and exact.
-    """
-    results = keyword_search(payload.query, context_lines=payload.context_lines, max_results=payload.max_results)
+@app.get("/summarize/status/{session_id}")
+async def summarize_status(session_id: str, key_info: dict = Depends(verify_api_key)):
+    _enforce_session_scope(key_info, session_id)
+    job_state = _summarize_jobs.get(session_id)
+
+    if job_state == "in_progress":
+        return {"session_id": session_id, "status": "in_progress"}
+
+    if job_state and job_state.startswith("error"):
+        return {"session_id": session_id, "status": "error", "detail": job_state}
+
+    if session_has_summary(session_id):
+        return {
+            "session_id": session_id,
+            "status": "done",
+            "summary": get_summary_for_session(session_id),
+        }
+
+    return {"session_id": session_id, "status": "not_started"}
+
+
+@app.post("/debug/trigger_followup")
+async def debug_trigger_followup(key_info: dict = Depends(verify_api_key)):
+    # No client-supplied session_id here (it targets the most-recently-active
+    # session), so session scoping can't apply — instead this endpoint is
+    # PRIMARY-ONLY: a scoped (guest) key must not be able to trigger pushes
+    # into someone else's session.
+    if key_info.get("session_id") is not None:
+        raise HTTPException(status_code=403, detail="Session not permitted for this key")
+    await check_and_send_followups(
+        push_message_to_session, active_connections, _call_npu_once, scrub_reply
+    )
+    return {"status": "triggered"}
+
+
+# --- CoT diagnostic endpoint (Stage: manually-triggered replay tool) --------
+# SINGLE-CALL chain-of-thought: the model emits <reasoning> + <reply> in one
+# generation (no second NPU call). ACTIVATION: POST /chat/cot WITH the
+# header "X-CoT-Activate: diagnostic-replay" — two explicit signals (the
+# dedicated URL and the header); existing clients never send either, so it
+# cannot fire accidentally. PRIMARY-ONLY (guest keys get 403, same pattern
+# as /debug/trigger_followup). Output budget is raised for this endpoint
+# ONLY: 700 tokens = the normal 300-token reply budget + ~400 tokens of
+# reasoning headroom; at the observed ~1 tok/s on this NPU that's a
+# multi-minute generation, which is explicitly acceptable for a diagnostic.
+# The self-narrated reasoning is NOT ground truth — it is returned with a
+# non-authoritative label (small models post-hoc rationalize; see the
+# feasibility report). Nothing here is persisted: no save_turn, no rollup,
+# no sufficiency-log record.
+COT_TRIGGER_HEADER = "X-CoT-Activate"
+COT_TRIGGER_VALUE = "diagnostic-replay"
+COT_NUM_PREDICT = 700
+COT_NOTE = ("model's self-reported reasoning — NOT verified to reflect its "
+            "actual internal process; diagnostic signal only")
+# Format rules live in the SYSTEM position (appended post-trim in chat_cot),
+# NOT the user turn: field testing showed a user-turn format demand got
+# ignored entirely (3/3 plain replies, zero tags), while a system-position
+# demand produced tag-compliant output. Also appended AFTER the assembled
+# system prompt so it never displaces the style profile's last-position
+# advantage and never eats RAG context via the trim cascade.
+COT_INSTRUCTION = (
+    "[DIAGNOSTIC REASONING MODE — this turn only]\n"
+    "Output STRICTLY two blocks and nothing else:\n"
+    "<reasoning>\n"
+    "brief analysis (2-4 sentences): what the user's message actually "
+    "means, which context above matters, what the reply should accomplish\n"
+    "</reasoning>\n"
+    "<reply>\n"
+    "your actual reply — in your normal chat voice exactly (casual, "
+    "contractions, same length and tone as a regular reply), as if the "
+    "reasoning above didn't exist\n"
+    "</reply>\n"
+    "IMPORTANT: the history above contains plain-text replies from earlier "
+    "normal-mode turns — that pattern does NOT apply to this turn. Your "
+    "output MUST begin with <reasoning> and the wrapper is MANDATORY even "
+    "for short casual replies: NEVER skip the tags, NEVER reply in plain "
+    "text, ALWAYS continue to the <reply> block after </reasoning>, and "
+    "your output MUST always END with the closing </reply> tag.")
+
+
+def _parse_cot_output(raw: str):
+    """Strict delimited-output parser. Returns (reasoning, reply) or
+    (None, failure_detail). The <reasoning> block MUST be present and
+    closed, and nothing may appear before it — a malformed/missing
+    reasoning block still hard-fails (no-leak guarantee). The ONE leniency
+    (added 2026-09): an unclosed <reply> that runs to end-of-generation is
+    accepted as the complete reply — the model empirically hits EOS right
+    after the reply content in ~80% of turns, the reply content itself is
+    unambiguous (nothing follows it), and <reasoning> is verified closed
+    first, so nothing can leak into it. Any text AFTER a properly closed
+    </reply>, or missing <reply>, is still a hard failure."""
+    r_open = raw.find("<reasoning>")
+    r_close = raw.find("</reasoning>")
+    if r_open == -1 or r_close == -1 or r_close < r_open:
+        return None, "missing or malformed <reasoning> block"
+    if raw[:r_open].strip():
+        return None, "unexpected text before <reasoning>"
+    p_open = raw.find("<reply>", r_close)
+    if p_open == -1:
+        return None, "missing <reply> block after reasoning"
+    reasoning = raw[r_open + len("<reasoning>"):r_close].strip()
+    p_close = raw.find("</reply>", p_open)
+    if p_close != -1:
+        reply = raw[p_open + len("<reply>"):p_close].strip()
+        post = raw[p_close + len("</reply>"):].strip()
+        if post:
+            return None, "unexpected text after </reply>"
+    else:
+        # EOS-closed reply: lenient accept (see docstring).
+        reply = raw[p_open + len("<reply>"):].strip()
+    if not reply:
+        return None, "empty <reply> block"
+    return reasoning, reply
+
+
+class CotRequest(BaseModel):
+    message: str = ""                      # live mode
+    session_id: str = "default"            # live mode
+    replay: Optional[dict] = None          # {"session_id": ..., "turn_rowid": int}
+
+
+@app.post("/chat/cot")
+async def chat_cot(payload: CotRequest, request: Request,
+                   key_info: dict = Depends(verify_api_key)):
+    # Primary-only (guest keys get 403), same pattern as
+    # /debug/trigger_followup.
+    if key_info.get("session_id") is not None:
+        raise HTTPException(status_code=403, detail="Session not permitted for this key")
+    # Explicit activation signal: the dedicated URL AND this header must
+    # both be present. Missing or wrong value -> 400 (not silent).
+    if request.headers.get(COT_TRIGGER_HEADER) != COT_TRIGGER_VALUE:
+        raise HTTPException(
+            status_code=400,
+            detail=f"CoT mode requires the {COT_TRIGGER_HEADER}: "
+                   f"{COT_TRIGGER_VALUE} header")
+
+    if payload.replay:
+        replay_sid = payload.replay.get("session_id")
+        turn_rowid = payload.replay.get("turn_rowid")
+        if not replay_sid or not isinstance(turn_rowid, int):
+            raise HTTPException(status_code=400, detail=
+                                "replay requires {session_id, turn_rowid}")
+        message, history_override = memory.get_replay_turn(replay_sid, turn_rowid)
+        if message is None:
+            raise HTTPException(status_code=404, detail=
+                                "replay turn not found (rowid must exist in "
+                                "that session and be a user-role row)")
+        session_id = replay_sid
+    else:
+        if not payload.message.strip():
+            raise HTTPException(status_code=400, detail="empty message")
+        session_id = payload.session_id
+        history_override = None
+        message = payload.message
+
+    # Same context assembly as the normal path — with the CoT format rules
+    # at the USER-TURN position (last thing the model reads). Approved
+    # placement revert after 0/6 compliance at system position (recency/
+    # positional issue, not wording). Known tradeoff: the instruction adds
+    # to prompt_message, so the trim cascade may displace some RAG personal
+    # context — actual displacement is measured and reported, not assumed.
+    cot_message = message + "\n\n" + COT_INSTRUCTION
+    prep = await asyncio.to_thread(
+        _prepare_prompt_sync, session_id, cot_message,
+        _measure_prompt_tokens_sync, history_override)
+
+    t0 = time.time()
+    raw = await _call_npu_once(prep["messages"], num_predict=COT_NUM_PREDICT)
+    duration_s = round(time.time() - t0, 1)
+
+    reasoning, reply = _parse_cot_output(raw)
+    if reasoning is None:
+        # Explicit failure mode: never guess-split, never emit anything
+        # labeled as a reply.
+        return {
+            "error": "cot_parse_failed",
+            "detail": reply,
+            "raw_output": raw,
+            "note": COT_NOTE,
+        }
+
+    # Tone parity with the normal path: the parsed reply goes through the
+    # SAME scrub pipeline as /chat (emoji removal, AI-tell phrases,
+    # structure rules, semantic style strip). Without this, CoT replies
+    # shipped unfiltered and read flattened/generic (style_check parity
+    # was unintentionally skipped along with persistence in the addon).
+    reply = await asyncio.to_thread(scrub_reply, reply, session_id=session_id)
+
+    return {
+        "mode": prep["mode"],
+        "reasoning": {"content": reasoning, "note": COT_NOTE},
+        "reply": {"content": reply},
+        "measured_tokens": prep.get("measured_tokens"),
+        "duration_s": duration_s,
+        "num_predict": COT_NUM_PREDICT,
+        "parse": "ok",
+    }
+
+# <!-- COT ENDPOINT -->
+
+@app.post("/search")
+async def search(payload: SearchRequest, key_info: dict = Depends(verify_api_key)):
+    # Primary-only: /search keyword-scans the personal_data corpus directly,
+    # so a scoped (guest) key must not be able to query it (flagged during
+    # the guest-access work).
+    if key_info.get("session_id") is not None:
+        raise HTTPException(status_code=403, detail="Session not permitted for this key")
+    # keyword_search() is a synchronous full scan of every .txt under
+    # personal_data/ — CPU+IO bound. Run it in a worker thread so the
+    # event loop stays responsive (websocket pings/acks, other requests)
+    # for the duration of the scan, same pattern as generate_reply().
+    results = await asyncio.to_thread(
+        keyword_search,
+        payload.query,
+        context_lines=payload.context_lines,
+        max_results=payload.max_results,
+    )
     if not results:
         return {"status": "no_matches", "results": []}
 
@@ -965,36 +1312,104 @@ async def search(payload: SearchRequest):
     return {"status": "ok", "count": len(matches), "results": matches}
 
 
+@app.post("/ws/ticket")
+async def issue_ws_ticket(payload: TicketRequest, key_info: dict = Depends(verify_api_key)):
+    # Scoping is enforced HERE, at ticket issuance: the ticket is then bound
+    # to payload.session_id and /ws/chat verifies ticket+session match on
+    # connect, so a guest ticket is unusable on any other session.
+    _enforce_session_scope(key_info, payload.session_id)
+    ticket = _issue_ws_ticket(payload.session_id)
+    return {"ticket": ticket, "expires_in": WS_TICKET_TTL_SECONDS}
+
+
+async def _process_ws_chat_message(session_id: str, prompt_message: str, history_message: str, msg_id: str = None):
+    try:
+        bot_reply, mode = await generate_reply(session_id, prompt_message, history_message=history_message)
+        # By the time generate_reply() has returned, save_turn() has already
+        # completed inside it — the user's turn (and the bot's reply) are
+        # durably persisted. Tell the client explicitly, separate from the
+        # earlier parse-time `ack`, so "delivered" and "durably stored" are
+        # two distinct, honest signals instead of one conflated one.
+        if msg_id:
+            ws = active_connections.get(session_id)
+            if ws:
+                try:
+                    await ws.send_json({"type": "stored", "id": msg_id})
+                except Exception as e:
+                    print(f"[ws] failed to send 'stored' confirmation for {msg_id} in session '{session_id}': {e}")
+        await push_message_to_session(session_id, bot_reply, mode=mode)
+    except Exception as e:
+        print(f"[ws] reply generation error in session '{session_id}': {e}")
+        await push_message_to_session(
+            session_id,
+            "⚠️ An error occurred processing your request.",
+            mode="error"
+        )
+
+
 @app.websocket("/ws/chat")
-async def websocket_chat(websocket: WebSocket, session_id: str = Query("default"), api_key: str = Query(None)):
-    """
-    Keeps a live connection open per session so the bot can push
-    proactive follow-up messages (see followup.py) without the app
-    needing to poll. Also handles the app's existing ping/pong
-    heartbeat. Auth is via ?api_key= since browsers/WebViews don't
-    support custom headers on WebSocket connections — not accepting
-    the connection here (rather than accepting then closing) makes
-    Starlette reject it with a 403, same behavior as before this
-    endpoint existed, for an invalid or missing key.
-    """
-    if api_key != API_KEY:
+async def websocket_chat(websocket: WebSocket, session_id: str = Query("default"), ticket: str = Query(None)):
+    if not ticket or not _consume_ws_ticket(ticket, session_id):
+        await websocket.close(code=4401)
         return
 
     await websocket.accept()
     active_connections[session_id] = websocket
     print(f"[ws] session '{session_id}' connected")
 
-    # Deliver anything that was queued while this session was offline
-    if pending_messages[session_id]:
-        for msg in pending_messages[session_id]:
-            await websocket.send_json({"type": "message", "reply": msg, "mode": "proactive"})
-        pending_messages[session_id].clear()
+    # 1. Drain pending queued messages
+    queue = list(pending_messages[session_id])
+    for payload in queue:
+        try:
+            await websocket.send_json(payload)
+            print(f"[ws] drained queued message {payload['id']} to session '{session_id}'")
+        except Exception:
+            break
 
+    # 2. Main incoming message loop
     try:
         while True:
             data = await websocket.receive_json()
-            if data.get("type") == "ping":
+            msg_type = data.get("type")
+
+            if msg_type == "ping":
                 await websocket.send_json({"type": "pong"})
+                continue
+
+            if msg_type == "ack":
+                ack_id = data.get("id")
+                if ack_id and session_id in pending_messages:
+                    pending_messages[session_id] = [
+                        m for m in pending_messages[session_id] if m.get("id") != ack_id
+                    ]
+                continue
+
+            if msg_type == "chat_message":
+                msg_id = data.get("id")
+                if msg_id:
+                    await websocket.send_json({"type": "ack", "id": msg_id})
+
+                    if not _mark_message_processed(session_id, msg_id):
+                        print(f"[ws] duplicate chat_message {msg_id} for session '{session_id}', skipping reprocess")
+                        continue
+
+                raw_message = data.get("message") or data.get("text", "")
+                attachments = data.get("attachments")
+
+                prompt_message = raw_message
+                history_message = raw_message
+
+                if attachments:
+                    extracted_parts = [decode_app_attachment(att) for att in attachments]
+                    file_names = [att.get("name", "file") for att in attachments]
+                    extracted_text = "\n\n".join(extracted_parts)
+                    prompt_message = f"{raw_message}\n\n{extracted_text}".strip()
+                    history_message = f"[Sent file(s): {', '.join(file_names)}] {raw_message}".strip()
+
+                asyncio.create_task(
+                    _process_ws_chat_message(session_id, prompt_message, history_message, msg_id=msg_id)
+                )
+
     except WebSocketDisconnect:
         print(f"[ws] session '{session_id}' disconnected")
     finally:
