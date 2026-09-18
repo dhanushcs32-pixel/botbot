@@ -18,6 +18,7 @@ Everything runs 100% locally — no cloud calls, no API keys.
 """
 
 import io
+import logging
 import base64
 from pathlib import Path
 
@@ -28,44 +29,210 @@ import pytesseract
 # directly at the installed binary so it can find it.
 pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
-_caption_pipeline = None  # lazy-loaded — only load the model if an image actually needs captioning
+# Persistent failure logging: same destination as main.py's debug_log
+# (botbot.debug logger -> botbot_debug.log). media.py can't import main
+# (circular), but logging loggers are process-global — main.py configures
+# the "botbot.debug" handler at import, and media is only ever imported
+# by main, so the handler exists by the time anything here logs. The
+# print() keeps standalone/test usage visible.
+_logger = logging.getLogger("botbot.debug")
+
+
+def _log(message: str) -> None:
+    """Console + persistent debug log under main.py; console-only otherwise."""
+    print(message)
+    if _logger.handlers:
+        _logger.info(message)
+
+# psutil is optional — only used for the BLIP memory guard below. If it's
+# not installed, the guard degrades to "always attempt captioning" (the
+# pre-existing behavior), same non-fatal-degrade pattern used elsewhere
+# in this codebase (e.g. npu_server.py's adapter loading).
+try:
+    import psutil
+    _HAS_PSUTIL = True
+except ImportError:
+    _HAS_PSUTIL = False
+
+# --- Resource-bounding constants (see PROJECT_STATE.txt: npu_server.py
+# crash incident) ---
+#
+# Largest dimension (px) an uploaded image is allowed to be before OCR/
+# captioning. Uploads are downscaled (never upscaled) to fit, preserving
+# aspect ratio. Bounds both Tesseract's and BLIP's memory/CPU cost against
+# unbounded upload size — a full-resolution photo costs meaningfully more
+# than a screenshot needs to for either OCR or captioning quality.
+MAX_IMAGE_DIMENSION_PX = 2000
+
+# Hard cap on how much OCR-extracted text gets injected into the prompt.
+# main.py's char-based prompt_trim is the last line of defense against an
+# oversized prompt, but that's defense-in-depth, not a guarantee at the
+# source — a single OCR result this large would already be an unusually
+# dense/long document photo, and truncating here means the trim logic
+# downstream never has to deal with a single field this disproportionate.
+OCR_TEXT_MAX_CHARS = 4000
+
+# Minimum available system RAM (MB) required before attempting to load/run
+# the BLIP captioning model. This machine has been observed to run with as
+# little as ~2.35 GB available while npu_server.py is resident (see
+# PROJECT_STATE.txt) — BLIP's model load is a genuine, uncoordinated
+# memory spike that happens in THIS process while a separate process
+# (npu_server.py) already holds a large model resident. Skipping
+# captioning under memory pressure trades "no caption for this image" for
+# "don't risk destabilizing the whole machine" — the same kind of
+# kill-switch reasoning applied to npu_server.py's GPU fallback after that
+# incident. If psutil isn't installed, this check is skipped entirely
+# (captioning always attempted, matching pre-existing behavior).
+MIN_AVAILABLE_MEMORY_MB_FOR_CAPTIONING = 2000
+
+_caption_processor = None  # lazy-loaded — only load the model if an image actually needs captioning
+_caption_model = None
+
+
+def _resize_if_oversized(image: Image.Image) -> Image.Image:
+    """Downscales an image so its longest side is at most
+    MAX_IMAGE_DIMENSION_PX, preserving aspect ratio. No-op if the image
+    is already within bounds — never upscales."""
+    if max(image.size) <= MAX_IMAGE_DIMENSION_PX:
+        return image
+    original_size = image.size
+    image = image.copy()
+    image.thumbnail((MAX_IMAGE_DIMENSION_PX, MAX_IMAGE_DIMENSION_PX), Image.LANCZOS)
+    print(f"[media] resized oversized image from {original_size} to {image.size} "
+          f"(cap: {MAX_IMAGE_DIMENSION_PX}px longest side)")
+    return image
+
+
+def _truncate_ocr_text(ocr_text: str) -> str:
+    """Caps OCR-extracted text at OCR_TEXT_MAX_CHARS, appending a marker
+    if truncated so it's visible in the prompt (and in logs) that this
+    happened rather than silently dropping content."""
+    if len(ocr_text) <= OCR_TEXT_MAX_CHARS:
+        return ocr_text
+    omitted = len(ocr_text) - OCR_TEXT_MAX_CHARS
+    print(f"[media] OCR text truncated: {len(ocr_text)} chars -> {OCR_TEXT_MAX_CHARS} chars ({omitted} omitted)")
+    return ocr_text[:OCR_TEXT_MAX_CHARS] + f"\n[...truncated, {omitted} characters omitted]"
+
+
+def _enough_memory_for_captioning() -> bool:
+    """Returns True if it's safe to attempt loading/running BLIP right
+    now. Always True if psutil isn't installed (can't check, so preserve
+    pre-existing behavior rather than blocking captioning outright)."""
+    if not _HAS_PSUTIL:
+        return True
+    available_mb = psutil.virtual_memory().available / (1024 * 1024)
+    if available_mb < MIN_AVAILABLE_MEMORY_MB_FOR_CAPTIONING:
+        print(f"[media] skipping captioning: only {available_mb:.0f} MB available, "
+              f"need >= {MIN_AVAILABLE_MEMORY_MB_FOR_CAPTIONING} MB "
+              f"(guards against contention with npu_server.py — see PROJECT_STATE.txt)")
+        return False
+    return True
 
 
 def _get_caption_pipeline():
     """
-    Loads the BLIP image-captioning model on first use only. This
-    avoids a slow, multi-second model load on every server startup
-    when most messages won't include a photo at all.
+    Loads BLIP's processor and model directly on first use only, rather
+    than going through transformers' generic pipeline("image-to-text", ...)
+    task-registry lookup. That task name was silently failing on the
+    installed transformers version ("Unknown task image-to-text" — the
+    registry has renamed/restructured its task names), which meant every
+    captioning attempt was failing and quietly falling through to the
+    "no clear description" message with no crash and no visible error.
+    Loading BlipProcessor/BlipForConditionalGeneration directly sidesteps
+    that task-name lookup entirely — this is also what BLIP's own model
+    card recommends over the generic pipeline() wrapper.
+
+    Same lazy-load-once, non-fatal-on-failure shape as before: avoids a
+    slow multi-second model load on every server startup when most
+    messages won't include a photo at all, and any load failure degrades
+    to "captioning unavailable" rather than crashing the caller.
     """
-    global _caption_pipeline
-    if _caption_pipeline is None:
-        from transformers import pipeline
-        _caption_pipeline = pipeline(
-            "image-to-text",
-            model="Salesforce/blip-image-captioning-base"
-        )
-    return _caption_pipeline
+    global _caption_processor, _caption_model
+    if _caption_model is None:
+        from transformers import BlipProcessor, BlipForConditionalGeneration
+        _caption_processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
+        _caption_model = BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-base")
+    return _caption_processor, _caption_model
 
 
-def _ocr_image(image: Image.Image) -> str:
-    """Extracts any printed/handwritten text found in the image."""
+# --- OCR quality gating (tuned against real samples, see PROJECT_STATE) ---
+# Mean word confidence (Tesseract's 0-100 scale) at which extracted text is
+# presented to the model as trustworthy. Below this but above the floor,
+# text is still shown but explicitly labeled low-confidence; below the
+# floor, it's treated as no text at all. Tuned on real screenshots: good
+# text measured 95, marginal-but-real sign text measured ~36, noise
+# measured 0.
+OCR_CONFIDENCE_THRESHOLD = 60.0
+OCR_LOW_CONFIDENCE_FLOOR = 30.0
+# If the image's smaller dimension is below this many pixels, also try an
+# upscaled+grayscale variant and keep whichever has higher confidence.
+# Real-sample evidence: a 567x892 image yielded ZERO words as-is but real
+# (if imperfect) text when 2x-upscaled; conversely a 412x137 logo read
+# perfectly as-is while upscaling DESTROYED it — hence confidence-driven
+# selection rather than always-upscale.
+OCR_UPSCALE_TRIGGER_PX = 800
+
+
+def _ocr_with_confidence(image: Image.Image) -> tuple[str, float]:
+    """Runs Tesseract once, returning (text, mean_word_confidence).
+    Text preserves line breaks; empty string + 0.0 when nothing is found
+    or OCR fails (failure logged via _log, not silent)."""
     try:
-        return pytesseract.image_to_string(image).strip()
+        data = pytesseract.image_to_data(image, output_type=pytesseract.Output.DICT)
     except Exception as e:
-        print(f"OCR failed: {e}")
-        return ""
+        _log(f"[media] OCR failed: {e}")
+        return "", 0.0
+
+    lines: dict = {}
+    confs = []
+    for i, word in enumerate(data["text"]):
+        if not word.strip():
+            continue
+        conf = float(data["conf"][i])
+        if conf < 0:  # -1 marks non-word placeholder rows
+            continue
+        key = (data["block_num"][i], data["par_num"][i], data["line_num"][i])
+        lines.setdefault(key, []).append(word)
+        confs.append(conf)
+
+    if not confs:
+        return "", 0.0
+    text = "\n".join(" ".join(ws) for _, ws in sorted(lines.items()))
+    return text.strip(), sum(confs) / len(confs)
+
+
+def _best_ocr(image: Image.Image) -> tuple[str, float]:
+    """OCRs the image as-is, plus an upscaled+grayscale variant for small
+    images, keeping whichever variant has higher mean word confidence."""
+    best_text, best_conf = _ocr_with_confidence(image)
+
+    min_dim = min(image.size)
+    if min_dim < OCR_UPSCALE_TRIGGER_PX:
+        factor = min(4, max(2, round(1600 / max(min_dim, 1))))
+        try:
+            upscaled = image.resize(
+                (image.width * factor, image.height * factor), Image.LANCZOS
+            ).convert("L")
+            up_text, up_conf = _ocr_with_confidence(upscaled)
+            if up_text and up_conf > best_conf:
+                _log(f"[media] upscale x{factor} won: conf {best_conf:.0f} -> {up_conf:.0f}")
+                best_text, best_conf = up_text, up_conf
+        except Exception as e:
+            _log(f"[media] upscaled OCR variant failed (using as-is result): {e}")
+
+    return best_text, best_conf
 
 
 def _caption_image(image: Image.Image) -> str:
     """Generates a natural-language description of what the image shows."""
     try:
-        pipe = _get_caption_pipeline()
-        result = pipe(image)
-        if result and isinstance(result, list):
-            return result[0].get("generated_text", "").strip()
-        return ""
+        processor, model = _get_caption_pipeline()
+        inputs = processor(image, return_tensors="pt")
+        output_ids = model.generate(**inputs, max_new_tokens=50)
+        caption = processor.decode(output_ids[0], skip_special_tokens=True)
+        return caption.strip()
     except Exception as e:
-        print(f"Captioning failed: {e}")
+        _log(f"[media] Captioning failed: {e}")
         return ""
 
 
@@ -73,29 +240,55 @@ def process_image(file_bytes: bytes) -> str:
     """
     Processes an uploaded image and returns a text description ready
     to inject into the chat message. OCR runs first since it's fast;
-    if it finds a meaningful amount of text, this is probably a
+    if it finds text with high enough confidence, this is probably a
     screenshot or photographed document, so captioning is skipped
-    entirely. If OCR finds little/no text, this is probably a real
-    photo, so a caption is generated instead to describe what's shown.
+    entirely. Low-confidence OCR (real but error-prone - e.g. small
+    or blurry text) is still shown but explicitly labeled so the model
+    doesn't treat garbled extraction as authoritative. If OCR finds
+    little/no trustworthy text, this is probably a real photo, so a
+    caption is generated instead to describe what's shown.
     """
     try:
         image = Image.open(io.BytesIO(file_bytes)).convert("RGB")
     except Exception as e:
         return f"[Could not open image: {e}]"
 
-    ocr_text = _ocr_image(image)
+    image = _resize_if_oversized(image)
 
-    if len(ocr_text) >= 15:
-        return f"[Image contains the following text, extracted via OCR:]\n{ocr_text}"
+    ocr_text, ocr_conf = _best_ocr(image)
 
-    caption = _caption_image(image)
+    ocr_confident = len(ocr_text) >= 15 and ocr_conf >= OCR_CONFIDENCE_THRESHOLD
+    ocr_low_conf = (
+        len(ocr_text) >= 15
+        and OCR_LOW_CONFIDENCE_FLOOR <= ocr_conf < OCR_CONFIDENCE_THRESHOLD
+    )
+    nl = chr(10)
+    if ocr_confident:
+        return f"[Image contains the following text, extracted via OCR:]{nl}{_truncate_ocr_text(ocr_text)}"
+
+    if ocr_low_conf:
+        # Real-looking text below the confidence bar: show it but say so -
+        # presenting low-confidence extraction as clean fact was how garbled
+        # OCR used to reach the model.
+        return (f"[Image may contain this partially legible text "
+                f"(low OCR confidence - words may be wrong):]"
+                f"{nl}{_truncate_ocr_text(ocr_text)}")
+
+
+    if _enough_memory_for_captioning():
+        caption = _caption_image(image)
+    else:
+        caption = ""
+
+    remnant = ""
+    if ocr_text and len(ocr_text) < 15 and ocr_conf >= OCR_CONFIDENCE_THRESHOLD:
+        remnant = f" Some additional text detected: {ocr_text}"
+
     if caption:
-        if ocr_text:
-            return f"[Image shows: {caption}. Some additional text detected: {ocr_text}]"
-        return f"[Image shows: {caption}]"
+        return f"[Image shows: {caption}.{remnant}]"
 
-    if ocr_text:
-        return f"[Image contains the following text, extracted via OCR:]\n{ocr_text}"
+    if ocr_text and ocr_conf >= OCR_CONFIDENCE_THRESHOLD:
+        return f"[Image contains the following text, extracted via OCR:]\n{_truncate_ocr_text(ocr_text)}"
 
     return "[An image was sent, but no readable text or clear description could be extracted from it.]"
 
