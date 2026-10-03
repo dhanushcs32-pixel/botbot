@@ -198,6 +198,30 @@ Do not invent or assume any prior shared history, events, or details that
 have not actually been mentioned to you.
 """
 
+# Distinct from NO_CONTEXT_INSTRUCTION: this covers the case where
+# retrieval DID return something (personal_context and/or
+# reference_context is non-empty) but the excerpts don't actually
+# contain the answer to what the user is asking. Left unaddressed,
+# the model tends to fill that gap by confabulating — inventing a
+# name, date, or detail that sounds plausible given the excerpts'
+# general subject matter but was never actually stated in them. The
+# ANTI_REPETITION_INSTRUCTION note that excerpts may be small/
+# disconnected fragments already gestures at this, but doesn't state
+# it as its own rule — this makes it explicit and repeats it right
+# next to whichever context block was actually included, rather than
+# only appearing once further up the prompt.
+CONTEXT_SUFFICIENCY_INSTRUCTION = """
+Before answering from the context above, check whether it actually contains
+the specific answer the user is asking for. Retrieved context existing is
+not the same as it answering the question. If the excerpts are about a
+related topic but don't state the specific name, date, fact, or detail
+being asked about, say plainly that you don't have that specific
+information rather than filling the gap with a plausible-sounding guess.
+Never invent a name, date, or detail that isn't actually present in the
+context — an honest "I don't know" is always better than a fabricated
+answer.
+"""
+
 MODE_INSTRUCTIONS = {
     "supportive": """
 Right now, the user needs to be heard. Respond with empathy, reflect their
@@ -218,6 +242,16 @@ without being preachy or giving a lecture.
 This is a regular conversation. Be warm, curious, and natural — like
 talking to a close friend. Keep it real, engage with genuine interest,
 and let the conversation breathe naturally.
+""",
+
+    "followup": """
+You're reaching out first, unprompted — the user hasn't said anything new
+since your last conversation. This is a brief, natural check-in, not a
+reply to a message. Base it on what you two were actually talking about
+last (see recent history below) — reference something real and specific,
+don't send a generic "hey, how's it going". Keep it short, one or two
+sentences. Don't ask more than one question. Don't act like time hasn't
+passed — it's okay to acknowledge you're just checking in.
 """
 }
 
@@ -299,6 +333,14 @@ def get_system_prompt(mode: str, personal_context: str = "", style_profile: str 
             "just let it inform how you respond):\n"
             f"{reference_context}\n"
         )
+
+    # Fires whenever ANY context was actually injected above (personal
+    # and/or reference) — the confabulation risk applies to both, not
+    # just personal_context. Placed right after both blocks so it's the
+    # most recent thing read about that context specifically, rather
+    # than competing for attention from further up the prompt.
+    if personal_context or reference_context:
+        parts.append(CONTEXT_SUFFICIENCY_INSTRUCTION)
 
     parts.append(MODE_INSTRUCTIONS.get(mode, MODE_INSTRUCTIONS["conversational"]))
     parts.append(GENERAL_RULES)
