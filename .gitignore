@@ -26,3 +26,8 @@ build_lora_dataset.py
 convert_adapter_to_fp32.py
 test_npu_lora_smoke.py
 conversation_export.py
+
+# files that carry live API keys — never commit
+chat.html
+chat-guest.html
+key_state.json

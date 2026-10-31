@@ -13,14 +13,29 @@ model — this stays essentially free relative to a 45-90s NPU generation
 call: embedding a handful of short sentences on CPU is single-digit-to-
 low-double-digit milliseconds once the model is warm.
 
-LOG-ONLY BY DELIBERATE DESIGN, at least initially (see PROJECT_STATE.txt):
-similarity thresholds need real tuning against actual traffic before it's
-safe to auto-strip anything. A same-precedent choice was made for
-bracket_placeholder/salutation_closing in main.py's STRUCTURE_RULES —
-shipping straight to auto-fix risks false-positive-deleting a perfectly
-fine sentence that just happens to sit near a seed phrase in embedding
-space. Run this logging what it WOULD flag and at what score first, then
-decide a real cutoff.
+TIERED ENFORCEMENT (updated 2026-08-08 — see PROJECT_STATE.txt):
+Every sentence above SIMILARITY_THRESHOLD is still logged, same as
+before. But only sentences that are BOTH in an ENFORCE_CATEGORIES
+category AND above the stricter ENFORCE_SIMILARITY_THRESHOLD are
+actually auto-stripped from the reply, via strip_semantic_violations().
+
+Enforcement is deliberately narrower than logging, not just stricter:
+"ai_tell" and "formal_signoff" are near-never a legitimate part of a
+good reply, so auto-removing them is low-risk. "unsolicited_advice" and
+"hedging" are a different story — their seed phrases ("take things one
+day at a time", "everyone's experience is different") sit close in
+embedding space to genuinely good supportive-mode replies that
+mode_router.py deliberately routes toward. Auto-stripping those risks
+deleting a correct, appropriate reply, not just an AI-tell. They stay
+log-only until real traffic shows a threshold that's actually safe.
+
+check_semantic_violations() is unchanged in shape — still returns every
+finding, still doesn't touch the text. strip_semantic_violations() is
+the new entry point main.py's scrub_reply() should call instead: it
+runs the same check, then removes only the enforce-eligible sentences
+and returns (cleaned_text, findings) so logging stays exactly as
+informative as before, including sentences that were flagged but NOT
+removed.
 """
 
 import re
@@ -59,11 +74,19 @@ SEED_PHRASES = {
     ],
 }
 
-# Cosine similarity threshold above which a sentence gets flagged.
-# Conservative (high) starting point on purpose — log-only mode means
-# false positives just add log noise, but it's still worth starting
-# strict and loosening only once real traffic shows it's too quiet.
+# Cosine similarity threshold above which a sentence gets flagged (and
+# logged). Conservative (high) starting point on purpose.
 SIMILARITY_THRESHOLD = 0.72
+
+# Enforcement is narrower than logging on two axes: fewer categories AND
+# a stricter score. Only "ai_tell" and "formal_signoff" are auto-strip
+# eligible — see module docstring for why "unsolicited_advice" and
+# "hedging" are excluded. The higher bar (vs. SIMILARITY_THRESHOLD) is a
+# second, independent safety margin on top of the category restriction:
+# even within an approved category, only strip when the match is close
+# to unambiguous.
+ENFORCE_CATEGORIES = {"ai_tell", "formal_signoff"}
+ENFORCE_SIMILARITY_THRESHOLD = 0.80
 
 _seed_embeddings_cache = {"data": None}  # {(category, phrase): embedding}
 
@@ -119,15 +142,16 @@ def check_semantic_violations(text: str, session_id: str = "") -> list[dict]:
     """
     Splits `text` into sentences, embeds them, and compares each against
     every seed phrase via cosine similarity. Returns a list of
-    {"sentence": ..., "category": ..., "matched_seed": ..., "score": ...}
-    for every sentence that crosses SIMILARITY_THRESHOLD against at least
-    one seed — its single best match.
+    {"sentence": ..., "category": ..., "matched_seed": ..., "score": ...,
+    "enforce": ...} for every sentence that crosses SIMILARITY_THRESHOLD
+    against at least one seed — its single best match. "enforce" is True
+    only when the match is also in ENFORCE_CATEGORIES and clears
+    ENFORCE_SIMILARITY_THRESHOLD — see module docstring.
 
-    LOG-ONLY: this function only detects and returns findings, it does NOT
-    modify `text`. Wiring it into main.py's scrub_reply() should call this
-    for its return value and log it, not use it to alter the reply, until
-    a real threshold is chosen from observed traffic (see module
-    docstring).
+    This function itself never modifies `text` — it only detects and
+    returns findings. Callers that want the auto-strip behavior should
+    call strip_semantic_violations() instead, which uses this function
+    internally and then removes the enforce-eligible sentences.
     """
     sentences = _split_sentences(text)
     if not sentences:
@@ -141,7 +165,7 @@ def check_semantic_violations(text: str, session_id: str = "") -> list[dict]:
     except Exception as e:
         # Embedding model unavailable/failed to load — fail open (no
         # findings) rather than breaking the reply pipeline over a
-        # log-only diagnostic feature.
+        # diagnostic/enforcement feature.
         print(f"[semantic_style_check] embedding failed, skipping: {e}")
         return []
 
@@ -163,6 +187,43 @@ def check_semantic_violations(text: str, session_id: str = "") -> list[dict]:
                 "category": best_category,
                 "matched_seed": best_seed,
                 "score": round(best_score, 3),
+                "enforce": (
+                    best_category in ENFORCE_CATEGORIES
+                    and best_score >= ENFORCE_SIMILARITY_THRESHOLD
+                ),
             })
 
     return findings
+
+
+def strip_semantic_violations(text: str, session_id: str = "") -> tuple[str, list[dict]]:
+    """
+    Runs check_semantic_violations(), then removes only the sentences
+    flagged with "enforce": True (see ENFORCE_CATEGORIES /
+    ENFORCE_SIMILARITY_THRESHOLD). Returns (cleaned_text, findings) —
+    findings includes every flagged sentence, enforced or not, so logging
+    stays exactly as informative as it was in log-only mode.
+
+    Removal is done via exact substring replacement (each sentence text
+    came from splitting the original string, so it's guaranteed to be a
+    literal substring of it) rather than rejoining the sentence list —
+    that preserves the original spacing/newlines around whatever's left,
+    which matters for fragmented, low-punctuation texting-voice replies.
+    """
+    findings = check_semantic_violations(text, session_id=session_id)
+    if not findings:
+        return text, findings
+
+    cleaned = text
+    for f in findings:
+        if f["enforce"]:
+            cleaned = cleaned.replace(f["sentence"], "", 1)
+
+    if cleaned != text:
+        # Collapse whitespace/blank lines left behind by removed
+        # sentences — same cleanup main.py already applies after its own
+        # AI_TELL_PHRASES removal.
+        cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+
+    return cleaned, findings
