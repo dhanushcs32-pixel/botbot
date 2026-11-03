@@ -18,6 +18,8 @@ from dateutil import parser as dateutil_parser
 import chromadb
 from chromadb.utils import embedding_functions
 from rank_bm25 import BM25Okapi
+from laya_engine import rerank_and_filter_chunks, LAYA_ENABLED, is_laya_available
+
 
 PERSONAL_DATA_DIR = Path(__file__).parent / "personal_data"
 CHROMA_STORE_DIR = Path(__file__).parent / "chroma_store"
@@ -818,6 +820,18 @@ def search_reference_data(query: str, top_k: int = 3) -> str:
         except Exception as e:
             print(f"[rag] hybrid fusion failed (reference), dense-only: {e}")
 
+    # Post-RRF Laya Typed-Decision Filtering: drop chunks classified as irrelevant
+    if LAYA_ENABLED and is_laya_available() and documents:
+        try:
+            cand_chunks = [{"text": d, "metadata": m} for d, m in zip(documents, metadatas)]
+            kept, diag = rerank_and_filter_chunks(query, cand_chunks, max_chars=MAX_REFERENCE_RESULT_CHARS)
+            if not kept:
+                return ""
+            documents = [c["text"] for c in kept]
+            metadatas = [c["metadata"] for c in kept]
+        except Exception as e:
+            print(f"[rag] Laya chunk filtering failed (reference): {e}")
+
     if not documents:
         return ""
 
@@ -896,12 +910,19 @@ KNOWN_PEOPLE_PAGE_SIZE = 1000  # ChromaDB's SQLite backend errors on unpaginated
                                 # through results instead of fetching all at once.
 
 
+_known_people_cache = {"count": -1, "people": set()}
+
+
 def get_known_people() -> set[str]:
+    global _known_people_cache
     try:
         collection = get_collection()
         count = collection.count()
         if count == 0:
             return set()
+
+        if _known_people_cache.get("count") == count:
+            return _known_people_cache["people"]
 
         people = set()
         offset = 0
@@ -916,6 +937,7 @@ def get_known_people() -> set[str]:
                 if meta and meta.get("person"):
                     people.add(meta["person"])
             offset += KNOWN_PEOPLE_PAGE_SIZE
+        _known_people_cache = {"count": count, "people": people}
         return people
     except Exception as e:
         # Fail-open, but never silently: an empty set here is
@@ -937,8 +959,39 @@ def is_trivial_message(message: str) -> bool:
     cleaned = message.strip().lower().rstrip("!?. ")
     if cleaned in TRIVIAL_MESSAGE_PATTERNS:
         return True
+    # Compound greetings (e.g. "hey good morning", "hi hello")
+    for pat in ("good morning", "good night", "what's up", "whats up", "thank you"):
+        if pat in cleaned:
+            remainder = cleaned.replace(pat, "").strip(" ,!?.")
+            if not remainder or remainder in TRIVIAL_MESSAGE_PATTERNS:
+                return True
     if len(cleaned) <= 4 and cleaned.isalpha():
         return True
+    return False
+
+
+def should_bypass_personal_retrieval(query: str, laya_routing: dict | None = None, known_people: set[str] | None = None) -> bool:
+    """
+    Checks whether personal RAG retrieval should be bypassed:
+    1. Standard trivial messages ("ok", "lol", "hey, good morning", etc.).
+    2. Laya classified as 'no_personal_context_needed' with confidence (>= 0.60)
+       AND no known person or date reference is detected in the query.
+    """
+    if is_trivial_message(query):
+        return True
+
+    if laya_routing and not laya_routing.get("used_fallback"):
+        ret_dec = laya_routing.get("retrieval_decision")
+        ret_conf = laya_routing.get("retrieval_confidence", 0.0)
+        if ret_dec == "no_personal_context_needed" and ret_conf >= 0.60:
+            if known_people is None:
+                try:
+                    known_people = get_known_people()
+                except Exception:
+                    known_people = set()
+            if detect_mentioned_person(query, known_people) is None and parse_date_reference(query) is None:
+                return True
+
     return False
 
 
@@ -1040,6 +1093,18 @@ def search_personal_data(query: str, top_k: int = 6, max_result_chars: int = MAX
             except Exception as e:
                 print(f"[rag] hybrid fusion failed (meta-memory), dense-only: {e}")
 
+        # Post-RRF Laya filtering for bot conversation matches
+        if LAYA_ENABLED and is_laya_available() and documents:
+            try:
+                cand_chunks = [{"text": d, "metadata": m} for d, m in zip(documents, metadatas)]
+                kept, diag = rerank_and_filter_chunks(query, cand_chunks, max_chars=max_result_chars)
+                if not kept:
+                    return ""
+                documents = [c["text"] for c in kept]
+                metadatas = [c["metadata"] for c in kept]
+            except Exception as e:
+                print(f"[rag] Laya chunk filtering failed (meta-memory): {e}")
+
         expanded = expand_bot_conversation_matches(documents, metadatas)
         tagged = [f"[{build_excerpt_label(meta)}]\n{text}" for text, meta in expanded]
         combined = "\n---\n".join(tagged)
@@ -1115,6 +1180,18 @@ def search_personal_data(query: str, top_k: int = 6, max_result_chars: int = MAX
                 predicates=_bm25_predicate_personal(mentioned_person, date_range))
         except Exception as e:
             print(f"[rag] hybrid fusion failed (personal), dense-only: {e}")
+
+    # Post-RRF Laya Typed-Decision Filtering: drop irrelevant chunks before assembly
+    if LAYA_ENABLED and is_laya_available() and documents:
+        try:
+            cand_chunks = [{"text": d, "metadata": m} for d, m in zip(documents, metadatas)]
+            kept, diag = rerank_and_filter_chunks(query, cand_chunks, max_chars=max_result_chars)
+            if not kept:
+                return ""
+            documents = [c["text"] for c in kept]
+            metadatas = [c["metadata"] for c in kept]
+        except Exception as e:
+            print(f"[rag] Laya chunk filtering failed (personal): {e}")
 
     tagged = []
     for doc, meta in zip(documents, metadatas):
