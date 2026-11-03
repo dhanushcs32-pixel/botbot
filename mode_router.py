@@ -4,6 +4,7 @@ Bot Bot — Mode Router (Part 4)
 Two-layer approach:
   Layer A — Behavioral mode (controls response SHAPE)
             supportive / guidance / conversational
+            (Classified via Laya typed-decision model with keyword heuristic fallback)
   Layer B — Emotional understanding (controls response TONE)
             Not a separate mode — baked into every system prompt
             as a standing instruction. The model reads emotional
@@ -14,6 +15,10 @@ Also includes an anti-repetition safeguard: personal context and
 past conversations (from RAG) must only inform STYLE, never be
 copied or repeated as actual response content.
 """
+
+from typing import Optional, List, Dict, Any
+from laya_engine import classify_mode_and_retrieval, LAYA_ENABLED, is_laya_available
+
 
 # ----------------------------------------------------------------
 # Behavioral mode keyword lists
@@ -35,11 +40,8 @@ GUIDANCE_KEYWORDS = [
 ]
 
 
-def detect_mode(message: str) -> str:
-    """
-    Returns one of: 'supportive', 'guidance', 'conversational'
-    This decides the SHAPE of the response — not its emotional tone.
-    """
+def _detect_mode_heuristic(message: str) -> str:
+    """Keyword-based heuristic fallback for behavioral mode detection."""
     msg = message.lower()
 
     if any(k in msg for k in SUPPORTIVE_KEYWORDS):
@@ -47,6 +49,54 @@ def detect_mode(message: str) -> str:
     elif any(k in msg for k in GUIDANCE_KEYWORDS):
         return "guidance"
     return "conversational"
+
+
+def detect_mode_detailed(
+    message: str,
+    recent_turns: Optional[List[Dict[str, str]]] = None
+) -> Dict[str, Any]:
+    """
+    Evaluates behavioral mode and personal RAG need via Laya typed decisions.
+    If Laya is disabled, unavailable, or confidence is below 0.55, falls back
+    to keyword heuristics. Returns a detailed dictionary with mode, confidence,
+    retrieval decision, and telemetry.
+    """
+    if LAYA_ENABLED:
+        try:
+            res = classify_mode_and_retrieval(message, recent_turns=recent_turns)
+            # Threshold: >= 0.55 confidence on Laya's mode choice
+            if not res.get("used_fallback") and res.get("mode_confidence", 0.0) >= 0.55:
+                return res
+            # Fall back to heuristic if confidence is low
+            heuristic_mode = _detect_mode_heuristic(message)
+            res["mode"] = heuristic_mode
+            res["used_fallback"] = True
+            return res
+        except Exception as e:
+            print(f"[mode_router] Laya classification error: {e}")
+
+    # Baseline heuristic fallback
+    h_mode = _detect_mode_heuristic(message)
+    return {
+        "mode": h_mode,
+        "mode_confidence": 1.0,
+        "mode_probabilities": {h_mode: 1.0},
+        "needs_personal_context": True,
+        "retrieval_decision": "needs_personal_context",
+        "retrieval_confidence": 1.0,
+        "retrieval_probabilities": {"needs_personal_context": 1.0, "no_personal_context_needed": 0.0},
+        "latency_ms": 0.0,
+        "used_fallback": True,
+    }
+
+
+def detect_mode(message: str) -> str:
+    """
+    Returns one of: 'supportive', 'guidance', 'conversational'
+    This decides the SHAPE of the response — not its emotional tone.
+    Maintains 100% backward compatibility by returning a string.
+    """
+    return detect_mode_detailed(message)["mode"]
 
 
 # ----------------------------------------------------------------
@@ -222,6 +272,22 @@ context — an honest "I don't know" is always better than a fabricated
 answer.
 """
 
+CONTEXT_INSUFFICIENT_ABSTAIN_INSTRUCTION = """
+CRITICAL EVALUATION ON CONTEXT: The retrieved context excerpts above were
+analyzed and determined NOT to contain the necessary facts, details, or answer
+to what the user is asking. Do NOT attempt to guess, extrapolate, or invent
+details from partial fragments. Explicitly, plainly, and honestly tell the
+user that you don't have that information.
+"""
+
+CONTEXT_PARTIAL_HEDGE_INSTRUCTION = """
+CRITICAL EVALUATION ON CONTEXT: The retrieved context excerpts above only
+partially cover what the user is asking. Answer ONLY the specific part directly
+supported by the context, and clearly and honestly acknowledge that you do not
+have details for the rest. Do not extrapolate, guess, or invent missing facts.
+"""
+
+
 MODE_INSTRUCTIONS = {
     "supportive": """
 Right now, the user needs to be heard. Respond with empathy, reflect their
@@ -274,7 +340,8 @@ Rules:
 
 def get_system_prompt(mode: str, personal_context: str = "", style_profile: str = "",
                        session_summaries: str = "", reference_context: str = "",
-                       referenced_session_context: str = "") -> str:
+                       referenced_session_context: str = "",
+                       sufficiency_state: str | None = None) -> str:
     """
     Builds the full system prompt sent to npu_server.py for a given turn.
 
@@ -287,6 +354,9 @@ def get_system_prompt(mode: str, personal_context: str = "", style_profile: str 
     referenced_session_context - real content (summary or raw turns) from
                          a SPECIFIC past session the user named directly
                          by its session_id, optional
+    sufficiency_state - Laya-assessed context sufficiency:
+                         'sufficient_to_answer', 'partial_context_hedge_needed',
+                         'insufficient_context_abstain', or None
     """
     parts = [BASE_PERSONA]
 
@@ -334,28 +404,23 @@ def get_system_prompt(mode: str, personal_context: str = "", style_profile: str 
             f"{reference_context}\n"
         )
 
-    # Fires whenever ANY context was actually injected above (personal
-    # and/or reference) — the confabulation risk applies to both, not
-    # just personal_context. Placed right after both blocks so it's the
-    # most recent thing read about that context specifically, rather
-    # than competing for attention from further up the prompt.
-    if personal_context or reference_context:
+    # Condition context sufficiency instruction based on Laya's assessment
+    if sufficiency_state == "insufficient_context_abstain":
+        parts.append(CONTEXT_INSUFFICIENT_ABSTAIN_INSTRUCTION)
+    elif sufficiency_state == "partial_context_hedge_needed":
+        parts.append(CONTEXT_PARTIAL_HEDGE_INSTRUCTION)
+    elif personal_context or reference_context:
         parts.append(CONTEXT_SUFFICIENCY_INSTRUCTION)
 
     parts.append(MODE_INSTRUCTIONS.get(mode, MODE_INSTRUCTIONS["conversational"]))
     parts.append(GENERAL_RULES)
 
     # style_profile deliberately goes LAST, immediately before generation.
-    # Confirmed via live test: the exact same "no emojis" rule was ignored
-    # when placed mid-prompt (between EMOTIONAL_UNDERSTANDING_INSTRUCTION
-    # and personal_context/NO_CONTEXT_INSTRUCTION) but was obeyed instantly
-    # the moment the user typed it as their own turn — i.e. the most recent
-    # thing the model read. Small quantized local models weight
-    # instructions closer to the end of the prompt more heavily; putting
-    # the user's style preferences last gives them that same positional
-    # advantage instead of competing for attention against
-    # MODE_INSTRUCTIONS/GENERAL_RULES that come after them.
+    # Confirmed via live test: small quantized local models weight instructions
+    # closer to the end of the prompt more heavily. Putting style preferences
+    # last gives them that positional advantage.
     if style_profile:
         parts.append(f"\nUser's preferred communication style (follow this closely):\n{style_profile}\n")
 
     return "\n".join(parts)
+

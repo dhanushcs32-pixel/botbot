@@ -31,9 +31,11 @@ import httpx
 # then remove it once the cache is populated.
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 
-from mode_router import detect_mode, get_system_prompt, get_retrieval_policy
+import memory
+from mode_router import detect_mode, detect_mode_detailed, get_system_prompt, get_retrieval_policy
 from memory import save_turn, get_recent_history, get_recent_summaries, get_all_session_ids, get_summary_for_session, get_important_links, maybe_rollup_session, is_test_session, session_has_summary, get_sessions_with_last_activity, count_turns
-from rag import search_personal_data, get_style_profile, keyword_search, search_reference_data, is_trivial_message, get_known_people
+from rag import search_personal_data, get_style_profile, keyword_search, search_reference_data, is_trivial_message, should_bypass_personal_retrieval, get_known_people
+from laya_engine import assess_context_sufficiency, LAYA_ENABLED, is_laya_available
 from semantic_style_check import strip_semantic_violations
 from summarizer import summarize_session, summarize_turns_batch
 from media import process_uploaded_file, decode_app_attachment
@@ -697,10 +699,18 @@ async def health():
 
 def _prepare_prompt_sync(session_id: str, prompt_message: str, measure_tokens=None,
                          history_override=None):
-    mode = detect_mode(prompt_message)
+    # Fetch recent history early so Laya routing has conversational context if needed
+    history = (history_override if history_override is not None
+               else get_recent_history(session_id))
+
+    # 1. Behavioral Mode & Personal Retrieval Need via Laya
+    laya_routing = detect_mode_detailed(prompt_message, recent_turns=history)
+    mode = laya_routing["mode"]
     policy = get_retrieval_policy(mode)
 
-    context_lookup_attempted = not is_trivial_message(prompt_message)
+    # 2. Check personal retrieval bypass (trivial phrases, or Laya high-confidence no-context)
+    bypass_retrieval = should_bypass_personal_retrieval(prompt_message, laya_routing=laya_routing)
+    context_lookup_attempted = not bypass_retrieval
 
     personal_context = ""
     reference_context = ""
@@ -749,21 +759,25 @@ def _prepare_prompt_sync(session_id: str, prompt_message: str, measure_tokens=No
 
     style_profile = get_style_profile()
 
+    # 3. Assess context sufficiency via Laya typed decisions
+    combined_rag_for_sufficiency = f"{personal_context}\n\n{reference_context}".strip()
+    sufficiency_res = assess_context_sufficiency(prompt_message, combined_rag_for_sufficiency)
+    sufficiency_state = sufficiency_res.get("decision") if combined_rag_for_sufficiency else "no_context"
+
     system_prompt = get_system_prompt(
         mode,
         personal_context=personal_context,
         style_profile=style_profile,
         session_summaries=session_summaries_text,
         reference_context=reference_context,
-        referenced_session_context=referenced_session_context
+        referenced_session_context=referenced_session_context,
+        sufficiency_state=sufficiency_state
     )
 
     # history_override (CoT replay mode): an explicitly provided historical
     # turn list replaces the CURRENT-session history fetch, so a replayed
     # old turn sees the context it would have had at the time. Default None
     # = normal path, byte-for-byte unchanged.
-    history = (history_override if history_override is not None
-               else get_recent_history(session_id))
 
     CHARS_PER_TOKEN_ESTIMATE = 2.5
 
@@ -848,7 +862,8 @@ def _prepare_prompt_sync(session_id: str, prompt_message: str, measure_tokens=No
             style_profile=style_profile,
             session_summaries=session_summaries_text,
             reference_context=reference_context,
-            referenced_session_context=referenced_session_context
+            referenced_session_context=referenced_session_context,
+            sufficiency_state=sufficiency_state
         )
         trimmed = True
         trim_details.append({
@@ -868,7 +883,8 @@ def _prepare_prompt_sync(session_id: str, prompt_message: str, measure_tokens=No
             style_profile=style_profile,
             session_summaries=session_summaries_text,
             reference_context=reference_context,
-            referenced_session_context=referenced_session_context
+            referenced_session_context=referenced_session_context,
+            sufficiency_state=sufficiency_state
         )
         trimmed = True
         trim_details.append({
@@ -956,6 +972,9 @@ def _prepare_prompt_sync(session_id: str, prompt_message: str, measure_tokens=No
         "final_total_chars": total_chars,
         "measured_tokens": measured_tokens,
         "budget_chars": budget_chars,
+        "laya_routing": laya_routing,
+        "laya_sufficiency": sufficiency_res,
+        "sufficiency_state": sufficiency_state,
     }
 
 
@@ -1012,6 +1031,20 @@ async def generate_reply(session_id: str, prompt_message: str, history_message: 
             "prompt_message_preview": prompt_message[:200],
             "reply_text": bot_reply,
             "reply_flagged_uncertainty": _reply_reads_as_uncertain(bot_reply),
+            # Laya typed-decision telemetry (backward compatible)
+            "laya_mode": {
+                "chosen_mode": prep.get("laya_routing", {}).get("mode", mode),
+                "confidence": prep.get("laya_routing", {}).get("mode_confidence", 1.0),
+                "used_fallback": prep.get("laya_routing", {}).get("used_fallback", True),
+            },
+            "laya_rag_filtered_count": prep.get("laya_rag_filtered_count", 0),
+            "laya_sufficiency_decision": prep.get("sufficiency_state", "no_context"),
+            "laya_sufficiency_confidence": prep.get("laya_sufficiency", {}).get("confidence", 0.0),
+            "laya_latency_ms": round(
+                prep.get("laya_routing", {}).get("latency_ms", 0.0)
+                + prep.get("laya_sufficiency", {}).get("latency_ms", 0.0),
+                2
+            ),
         }))
     except Exception as e:
         print(f"[sufficiency_log] error, skipping: {e}")
@@ -1179,16 +1212,24 @@ def _parse_cot_output(raw: str):
     unambiguous (nothing follows it), and <reasoning> is verified closed
     first, so nothing can leak into it. Any text AFTER a properly closed
     </reply>, or missing <reply>, is still a hard failure."""
+    # Allow <think>...</think> to map cleanly to <reasoning>...</reasoning>
+    if "<think>" in raw and "<reasoning>" not in raw:
+        raw = raw.replace("<think>", "<reasoning>", 1).replace("</think>", "</reasoning>", 1)
+
     r_open = raw.find("<reasoning>")
     r_close = raw.find("</reasoning>")
     if r_open == -1 or r_close == -1 or r_close < r_open:
         return None, "missing or malformed <reasoning> block"
     if raw[:r_open].strip():
         return None, "unexpected text before <reasoning>"
+    reasoning = raw[r_open + len("<reasoning>"):r_close].strip()
     p_open = raw.find("<reply>", r_close)
     if p_open == -1:
+        # If model did not wrap the subsequent text in <reply>, accept text after </reasoning>
+        post_reasoning = raw[r_close + len("</reasoning>"):].strip()
+        if post_reasoning:
+            return reasoning, post_reasoning
         return None, "missing <reply> block after reasoning"
-    reasoning = raw[r_open + len("<reasoning>"):r_close].strip()
     p_close = raw.find("</reply>", p_open)
     if p_close != -1:
         reply = raw[p_open + len("<reply>"):p_close].strip()

@@ -47,6 +47,9 @@ import json
 import sys
 from collections import defaultdict
 
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
 # A record with more than this many personal+reference context chars
 # counts as "well-resourced" for the false-abstention check (section 3).
 # Rough heuristic, not tuned against anything yet — adjust once you've
@@ -127,11 +130,11 @@ def main():
         rate_without = hedged_without / len(without_context)
         if rate_without <= rate_with:
             print(
-                "  ⚠ No-context turns are NOT hedging more than context turns — "
+                "  [!] No-context turns are NOT hedging more than context turns - "
                 "the instruction may not be doing much. Worth reading section 2."
             )
         else:
-            print("  ✓ No-context turns hedge more often, as expected if the instruction is working.")
+            print("  [OK] No-context turns hedge more often, as expected if the instruction is working.")
     print()
 
     candidates_confab = [
@@ -180,6 +183,29 @@ def main():
             by_mode[m]["hedged"] += 1
     for m, stats in sorted(by_mode.items()):
         print(f"  {m:15s} hedged {pct(stats['hedged'], stats['total'])}")
+
+    # Section 5: Laya Typed-Decision analysis (when telemetry is present)
+    laya_records = [r for r in attempted if "laya_sufficiency_decision" in r]
+    if laya_records:
+        print()
+        print(f"=== 5. Laya Typed-Decision Analysis ({len(laya_records)} turns with Laya telemetry) ===")
+        by_decision = defaultdict(lambda: {"total": 0, "hedged": 0})
+        total_latencies = []
+        for r in laya_records:
+            dec = r.get("laya_sufficiency_decision", "unknown")
+            by_decision[dec]["total"] += 1
+            if r.get("reply_flagged_uncertainty"):
+                by_decision[dec]["hedged"] += 1
+            if "laya_latency_ms" in r and isinstance(r["laya_latency_ms"], (int, float)):
+                total_latencies.append(r["laya_latency_ms"])
+
+        print("  Hedge rate by Laya sufficiency decision:")
+        for dec, stats in sorted(by_decision.items()):
+            print(f"    {dec:30s} : hedged {pct(stats['hedged'], stats['total'])}")
+
+        if total_latencies:
+            avg_lat = sum(total_latencies) / len(total_latencies)
+            print(f"  Average Laya CPU latency: {avg_lat:.1f}ms per turn")
 
 
 if __name__ == "__main__":

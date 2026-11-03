@@ -26,7 +26,11 @@ import memory
 import rag
 import main
 
-QWEN_DIR = r"c:\botbot\qwen2.5-7b-instruct-int4-ov"
+QWEN_DIR = (
+    r"c:\botbot\qwen-4b-int4-ov"
+    if os.path.isdir(r"c:\botbot\qwen-4b-int4-ov")
+    else r"c:\botbot\qwen2.5-7b-instruct-int4-ov"
+)
 
 ok = True
 def check(name, cond, detail=""):

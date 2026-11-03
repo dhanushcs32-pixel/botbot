@@ -29,6 +29,24 @@ def clean_reply_text(text: str) -> str:
     return cleaned.replace("</think>", "").strip()
 
 
+def count_tokens(tokenizer, text: str) -> int:
+    encoded = tokenizer.encode(text)
+    if hasattr(encoded, "input_ids"):
+        ids = encoded.input_ids
+        if hasattr(ids, "shape"):
+            return int(ids.shape[-1])
+        if hasattr(ids, "get_shape"):
+            return int(ids.get_shape()[-1])
+        try:
+            return len(ids)
+        except TypeError:
+            pass
+    try:
+        return len(encoded)
+    except TypeError:
+        return 0
+
+
 def run_benchmark():
     import openvino_genai as ov_genai
     import main
@@ -61,7 +79,8 @@ def run_benchmark():
     print("\n--- 2. Tokenizer Budget Check ---")
     test_msg = [{"role": "user", "content": "Hello, how are you today?"}]
     raw_prompt = tokenizer.apply_chat_template(test_msg, add_generation_prompt=True)
-    tokens = len(tokenizer.encode(raw_prompt))
+    encoded = tokenizer.encode(raw_prompt)
+    tokens = encoded.input_ids.shape[-1] if hasattr(encoded, "input_ids") and hasattr(encoded.input_ids, "shape") else (len(encoded.input_ids) if hasattr(encoded, "input_ids") else len(encoded))
     print(f"Test prompt: '{test_msg[0]['content']}' -> {tokens} tokens")
     assert tokens > 0, "Tokenizer produced 0 tokens"
     print("[PASS] 4B Tokenizer operates accurately.")
@@ -83,7 +102,7 @@ def run_benchmark():
         if not is_cot and prompt.endswith("<|im_start|>assistant\n"):
             prompt += "<think>\n\n</think>\n\n"
 
-        prompt_tokens = len(tokenizer.encode(prompt))
+        prompt_tokens = count_tokens(tokenizer, prompt)
 
         config = ov_genai.GenerationConfig()
         config.max_new_tokens = max_new_tokens

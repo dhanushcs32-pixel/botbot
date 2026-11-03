@@ -1,4 +1,5 @@
 import os
+import re
 import time
 import asyncio
 from collections import deque
@@ -72,34 +73,23 @@ def _log_free_ram(context: str) -> None:
     except Exception as e:
         print(f"[npu_server] could not read host memory state: {e}")
 
-# --- LoRA adapter (style + formatting fine-tune, see PROJECT_STATE.txt) ---
-# Points at the actual .safetensors file produced by the QLoRA training
-# run, not just the containing directory — matches the documented
-# ov_genai.Adapter() signature (adapter = ov_genai.Adapter("path/to/
-# lora_adapter.safetensors")) confirmed during earlier feasibility
-# research, rather than assuming a bare directory path works.
+# --- LoRA adapter (style + formatting fine-tune) ---
+# Disabled for 4B model: The existing lora_adapter/adapter_model.safetensors
+# was trained on Qwen2.5-7B (hidden_size=3584) and will crash a 4B model (hidden_size=2560).
 ADAPTER_DIR = "./lora_adapter"
 ADAPTER_PATH = os.path.join(ADAPTER_DIR, "adapter_model.safetensors")
-# Blend strength — this is OpenVINO GenAI's FINAL merged scaling factor,
-# NOT a direct carryover from the training-time lora_alpha/r ratio (r=16,
-# alpha=16 was the training config; 0.75 here is a separate runtime value
-# to start from). Sweep 0.5/0.75/1.0 if results are off once the
-# acceptance test (known violating prompts + style_check()) has been run —
-# don't assume 0.75 is correct without testing.
 ADAPTER_ALPHA = 0.4
+# Dynamic selection: 4B if present, else 7B
+MODEL_DIR = "./qwen-4b-int4-ov" if os.path.isdir("./qwen-4b-int4-ov") else "./qwen2.5-7b-instruct-int4-ov"
+# LoRA adapter was trained on Qwen2.5-7B (hidden_size=3584); disable on 4B (hidden_size=2560)
+LORA_ENABLED = (MODEL_DIR == "./qwen2.5-7b-instruct-int4-ov")
 
 
 def _load_adapter_config():
-    """
-    Loads the trained LoRA adapter if the weights are present at
-    ADAPTER_PATH, returning an AdapterConfig ready to attach to any
-    LLMPipeline construction. Returns None (adapter disabled, base model
-    behavior unchanged) if the file is missing or loading fails for any
-    reason — deliberately non-fatal. The adapter weights may not yet be
-    downloaded to this machine as of this update (see PROJECT_STATE.txt),
-    so the server must still start and serve the base model correctly in
-    that case rather than crashing on startup.
-    """
+    """Loads the trained LoRA adapter if enabled and present."""
+    if not LORA_ENABLED:
+        print("[npu_server] Running 4B base model without 7B LoRA adapter.")
+        return None
     if not os.path.isfile(ADAPTER_PATH):
         print(f"[LoRA] No adapter found at '{ADAPTER_PATH}' — running base model without style adapter.")
         return None
@@ -114,6 +104,16 @@ def _load_adapter_config():
 
 
 adapter_config = _load_adapter_config()
+
+
+def _clean_reply_text(text: str) -> str:
+    """Strips any stray <think>...</think> reasoning blocks from standard /api/chat replies."""
+    if not text:
+        return ""
+    cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+    if "<think>" in cleaned and "</think>" not in cleaned:
+        cleaned = cleaned.split("<think>")[0]
+    return cleaned.replace("</think>", "").strip()
 
 
 def _build_pipeline(path, device, **kwargs):
@@ -190,43 +190,23 @@ class ChatRequest(BaseModel):
 
 @app.on_event("startup")
 def startup_event():
-    global pipe, loaded_model_path
+    global pipe, loaded_model_path, effective_max_prompt_len
     
-    # Switched from the 8B Llama 3.1 (Ollama) model to the downloaded 7B
-    # Qwen2.5 OpenVINO IR model. Llama 3.1 8B NPU-OV entry removed from
-    # this list entirely (was previously first-priority) so it can never
-    # get silently picked even if that directory exists/gets downloaded
-    # later — Qwen 2.5 7B is now the explicit primary choice, with the
-    # 1.5B variant kept only as a last-resort fallback if 7B fails to load.
-    models_to_try = [
-        ("./qwen2.5-7b-instruct-int4-ov", "Qwen 2.5 7B"),
-        ("./qwen2.5-1.5b-instruct-int4-ov", "Qwen 2.5 1.5B")
-    ]
+    selected_path = MODEL_DIR
+    selected_name = "Qwen 4B INT4" if "4b" in selected_path.lower() else "Qwen 2.5 7B"
     
-    selected_path = None
-    selected_name = None
-    
-    for path, name in models_to_try:
-        # Check if the folder exists and has a .bin file larger than 100MB (complete download check)
-        if os.path.isdir(path):
-            try:
-                files = os.listdir(path)
-                has_bin = any(
-                    f.endswith('.bin') and os.path.getsize(os.path.join(path, f)) > 100 * 1024 * 1024
-                    for f in files
-                )
-                has_xml = any(f.endswith('.xml') for f in files)
-                if has_bin and has_xml:
-                    selected_path = path
-                    selected_name = name
-                    break
-            except Exception:
-                continue
+    if not os.path.isdir(selected_path):
+        # Fallback check if preferred model directory is missing
+        if os.path.isdir("./qwen2.5-7b-instruct-int4-ov"):
+            selected_path = "./qwen2.5-7b-instruct-int4-ov"
+            selected_name = "Qwen 2.5 7B"
+        elif os.path.isdir("./qwen-4b-int4-ov"):
+            selected_path = "./qwen-4b-int4-ov"
+            selected_name = "Qwen 4B INT4"
+        else:
+            print(f"ERROR: Neither 4B nor 7B model directory found.")
+            return
             
-    if not selected_path:
-        print("ERROR: No valid model directory found. Make sure download_model.py completed.")
-        return
-        
     # Parse device from command line if provided (default to NPU)
     import sys
     device = "NPU"
@@ -238,7 +218,6 @@ def startup_event():
             
     print(f"Loading/compiling {selected_name} from '{selected_path}' onto device '{device}' with MAX_PROMPT_LEN=6144...")
     start_time = time.time()
-    global pipe, loaded_model_path, effective_max_prompt_len
     _log_free_ram("startup (before model load)")
     try:
         pipe = _build_pipeline(selected_path, device, MAX_PROMPT_LEN=MAX_PROMPT_LEN)
@@ -496,6 +475,11 @@ async def chat(payload: ChatRequest):
             prompt += f"<|im_start|>{role}\n{content}<|im_end|>\n"
         prompt += "<|im_start|>assistant\n"
 
+    # Native no-think instruct mode for Qwen 4B when not in explicit diagnostic reasoning mode
+    is_cot_request = any("<reasoning>" in m.get("content", "") for m in payload.messages)
+    if not is_cot_request and prompt.endswith("<|im_start|>assistant\n"):
+        prompt += "<think>\n\n</think>\n\n"
+
     # Setup OpenVINO GenAI GenerationConfig
     config = ov_genai.GenerationConfig()
     config.max_new_tokens = 300  # Default matching main.py's num_predict limit
@@ -568,6 +552,8 @@ async def chat(payload: ChatRequest):
         try:
             # Generate in separate thread to prevent blocking FastAPI event loop
             reply = await loop.run_in_executor(None, run_inference, target_pipe, prompt, config)
+            if not is_cot_request:
+                reply = _clean_reply_text(reply)
         except Exception as e:
             print(f"Inference generation error on {target_device}: {e}")
             raise HTTPException(status_code=500, detail=f"Inference error: {str(e)}")
