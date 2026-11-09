@@ -127,6 +127,21 @@ STRUCTURE_RULES = [
         "action": "remove_line",
     },
     {
+        "name": "bracket_stage_direction",
+        "pattern": re.compile(r"\[[^\]\n]{1,80}\]\s*"),
+        "action": "strip",
+    },
+    {
+        "name": "asterisk_action",
+        "pattern": re.compile(r"(?i)\*[a-z\s,.'-]{1,40}\*\s*"),
+        "action": "strip",
+    },
+    {
+        "name": "colon_action_prefix",
+        "pattern": re.compile(r"(?im)^[a-z][a-z\s,]{2,30}:\s*"),
+        "action": "strip",
+    },
+    {
         "name": "bracket_placeholder",
         "pattern": re.compile(r"\[[A-Z][a-zA-Z' \-]{1,30}\]"),
         "action": "log_only",
@@ -146,6 +161,41 @@ STRUCTURE_RULES = [
         "min_matches": 2,
     },
 ]
+
+
+def collapse_vertical_stacking(text: str) -> str:
+    """
+    Detects pathological 1-2 word newline stacking (slam-poetry / fragmented monologue)
+    and collapses excessive newlines into normal horizontal prose, truncating
+    excessive sentences if degenerate.
+    """
+    if "\n" not in text:
+        return text
+
+    lines = [line.strip() for line in text.split("\n")]
+    short_line_runs = 0
+    max_run = 0
+    for line in lines:
+        if line:
+            words = line.split()
+            if len(words) <= 2:
+                short_line_runs += 1
+                if short_line_runs > max_run:
+                    max_run = short_line_runs
+            else:
+                short_line_runs = 0
+        else:
+            short_line_runs = 0
+
+    if max_run >= 3:
+        # Collapse lines into normal horizontal sentences
+        collapsed = " ".join(l for l in lines if l)
+        text = re.sub(r"[ \t]{2,}", " ", collapsed).strip()
+        # If it was a degenerate 1-word-per-line stack, truncate to first 2 natural sentences
+        sentences = re.split(r"(?<=[.!?])\s+", text)
+        if len(sentences) > 2:
+            text = " ".join(sentences[:2])
+    return text
 
 
 def check_style_violations(text: str) -> list[str]:
@@ -194,6 +244,18 @@ def scrub_reply(text: str, session_id: str = "") -> str:
         elif rule["action"] == "replace":
             text = rule["pattern"].sub(rule["repl"], text)
 
+    # Strip bracketed actions/stage directions like [glance at phone screen], [sighs], [pauses]
+    text = re.sub(r"\[[^\]\n]{1,80}\]\s*", "", text)
+
+    # Strip asterisk action markers like *sighs*, *looks around*
+    text = re.sub(r"(?i)\*[a-z\s,.'-]{1,40}\*\s*", "", text)
+
+    # Strip leading colon stage-direction prefixes like 'pauses, stretches: ', 'typing slowly: ', 'softly: '
+    text = re.sub(r"(?im)^[a-z][a-z\s,]{2,30}:\s*", "", text)
+
+    # Collapse pathological 1-2 word newline stacking
+    text = collapse_vertical_stacking(text)
+
     text = re.sub(r"[ \t]{2,}", " ", text).strip()
 
     try:
@@ -240,11 +302,11 @@ NPU_SERVER_URL = "http://127.0.0.1:11435/api/chat"
 MODEL_NAME = "botbot"
 
 
-async def _call_npu_once(messages: list, num_predict: int = 300) -> str:
-    # num_predict defaults to 300 — the normal chat path's value. The CoT
+async def _call_npu_once(messages: list, num_predict: int = 250) -> str:
+    # num_predict defaults to 250 — the normal chat path's value. The CoT
     # diagnostic endpoint passes a larger budget; with the default, the
     # request body is byte-for-byte what the normal path has always sent.
-    # HTTP timeout scales with the output budget: 240s covers the 300-token
+    # HTTP timeout scales with the output budget: 240s covers the 250-token
     # normal path (observed worst ~130s); large budgets get 900s (700
     # tokens at the observed ~1 tok/s ≈ 700s worst case).
     timeout_s = 240 if num_predict <= 300 else 900
@@ -259,9 +321,9 @@ async def _call_npu_once(messages: list, num_predict: int = 300) -> str:
                         "stream": False,
                         "options": {
                             "num_predict": num_predict,
-                            "temperature": 0.85,
-                            "top_p": 0.9,
-                            "repeat_penalty": 1.15
+                            "temperature": 0.6,
+                            "top_p": 0.85,
+                            "repeat_penalty": 1.05
                         }
                     }
                 )
@@ -987,8 +1049,24 @@ async def generate_reply(session_id: str, prompt_message: str, history_message: 
         _measure_prompt_tokens_sync)
 
     mode = prep["mode"]
-    raw_reply = await _call_npu_once(prep["messages"])
+    word_count = len(prompt_message.strip().split())
+    laya_no_retrieval = (
+        prep.get("laya_routing", {}).get("retrieval_decision") == "no_personal_context_needed"
+    )
+    is_casual_short = (
+        word_count < 15
+        or (mode == "conversational" and (word_count < 25 or laya_no_retrieval))
+        or laya_no_retrieval
+        or not (prep.get("personal_context") or prep.get("reference_context"))
+    )
+    predict_tokens = 75 if is_casual_short else 250
+
+    raw_reply = await _call_npu_once(prep["messages"], num_predict=predict_tokens)
     bot_reply = await asyncio.to_thread(scrub_reply, raw_reply, session_id=session_id)
+    if is_casual_short:
+        sentences = re.split(r"(?<=[.!?])\s+", bot_reply)
+        if len(sentences) > 2:
+            bot_reply = " ".join(sentences[:2]).strip()
 
     try:
         context_present = bool(prep["personal_context"]) or bool(prep["reference_context"])
