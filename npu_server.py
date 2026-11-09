@@ -74,36 +74,58 @@ def _log_free_ram(context: str) -> None:
         print(f"[npu_server] could not read host memory state: {e}")
 
 # --- LoRA adapter (style + formatting fine-tune) ---
-# Disabled for 4B model: The existing lora_adapter/adapter_model.safetensors
-# was trained on Qwen2.5-7B (hidden_size=3584) and will crash a 4B model (hidden_size=2560).
+# Checked dynamically against model hidden_size: The existing
+# lora_adapter/adapter_model.safetensors was trained on Qwen2.5-7B
+# (hidden_size=3584) and will crash if attached to 4B (hidden_size=2560).
 ADAPTER_DIR = "./lora_adapter"
 ADAPTER_PATH = os.path.join(ADAPTER_DIR, "adapter_model.safetensors")
 ADAPTER_ALPHA = 0.4
 # Dynamic selection: 4B if present, else 7B
 MODEL_DIR = "./qwen-4b-int4-ov" if os.path.isdir("./qwen-4b-int4-ov") else "./qwen2.5-7b-instruct-int4-ov"
-# LoRA adapter was trained on Qwen2.5-7B (hidden_size=3584); disable on 4B (hidden_size=2560)
-LORA_ENABLED = (MODEL_DIR == "./qwen2.5-7b-instruct-int4-ov")
+
+lora_active = False
 
 
-def _load_adapter_config():
-    """Loads the trained LoRA adapter if enabled and present."""
-    if not LORA_ENABLED:
-        print("[npu_server] Running 4B base model without 7B LoRA adapter.")
+def _get_model_hidden_size(model_dir: str) -> Optional[int]:
+    """Inspects config.json in model_dir for hidden_size."""
+    config_path = os.path.join(model_dir, "config.json")
+    if not os.path.isfile(config_path):
+        return None
+    try:
+        import json
+        with open(config_path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        return cfg.get("hidden_size")
+    except Exception as e:
+        print(f"[LoRA] Could not inspect {config_path}: {e}")
+        return None
+
+
+def _load_adapter_config(model_dir: str):
+    """Loads the trained LoRA adapter only if compatible with model hidden_size."""
+    global lora_active
+    hidden_size = _get_model_hidden_size(model_dir)
+    if hidden_size is not None and hidden_size != 3584:
+        print(f"[npu_server] Model at '{model_dir}' has hidden_size={hidden_size} (requires 3584 for 7B LoRA). Skipping LoRA adapter cleanly.")
+        lora_active = False
         return None
     if not os.path.isfile(ADAPTER_PATH):
         print(f"[LoRA] No adapter found at '{ADAPTER_PATH}' — running base model without style adapter.")
+        lora_active = False
         return None
     try:
         adapter = ov_genai.Adapter(ADAPTER_PATH)
         config = ov_genai.AdapterConfig(adapter, ADAPTER_ALPHA)
         print(f"[LoRA] Loaded adapter from '{ADAPTER_PATH}' (alpha={ADAPTER_ALPHA}).")
+        lora_active = True
         return config
     except Exception as e:
         print(f"[LoRA] Failed to load adapter from '{ADAPTER_PATH}': {e} — running base model without style adapter.")
+        lora_active = False
         return None
 
 
-adapter_config = _load_adapter_config()
+adapter_config = _load_adapter_config(MODEL_DIR)
 
 
 def _clean_reply_text(text: str) -> str:
@@ -190,7 +212,7 @@ class ChatRequest(BaseModel):
 
 @app.on_event("startup")
 def startup_event():
-    global pipe, loaded_model_path, effective_max_prompt_len
+    global pipe, loaded_model_path, effective_max_prompt_len, adapter_config
     
     selected_path = MODEL_DIR
     selected_name = "Qwen 4B INT4" if "4b" in selected_path.lower() else "Qwen 2.5 7B"
@@ -206,6 +228,9 @@ def startup_event():
         else:
             print(f"ERROR: Neither 4B nor 7B model directory found.")
             return
+
+    # Ensure adapter_config matches selected_path
+    adapter_config = _load_adapter_config(selected_path)
             
     # Parse device from command line if provided (default to NPU)
     import sys
@@ -272,6 +297,43 @@ def startup_event():
                 _log_free_ram("total load failure (all devices/fallbacks)")
                 print("CRITICAL ERROR: Failed to load model on any device or fallback!")
 
+def extract_token_count(encoded) -> Optional[int]:
+    """Tensor-safe token extraction handling ov::Tensor, TokenizedInputs, and Python sequences."""
+    if hasattr(encoded, "input_ids"):
+        ids = encoded.input_ids
+        if hasattr(ids, "shape"):
+            try:
+                return int(ids.shape[-1])
+            except Exception:
+                pass
+        if hasattr(ids, "get_shape"):
+            try:
+                return int(ids.get_shape()[-1])
+            except Exception:
+                pass
+        if hasattr(ids, "data"):
+            arr = ids.data
+            if hasattr(arr, "shape"):
+                return int(arr.shape[-1])
+            try:
+                return int(len(arr))
+            except Exception:
+                pass
+        try:
+            return int(len(ids))
+        except (TypeError, Exception):
+            pass
+    if hasattr(encoded, "shape"):
+        try:
+            return int(encoded.shape[-1])
+        except Exception:
+            pass
+    try:
+        return int(len(encoded))
+    except (TypeError, Exception):
+        return None
+
+
 def estimate_tokens(prompt: str) -> Optional[int]:
     """
     Real tokenized length of the fully-formatted prompt, using the
@@ -290,28 +352,22 @@ def estimate_tokens(prompt: str) -> Optional[int]:
     today's existing behavior instead of breaking every request.
     """
     global pipe
+    if not pipe:
+        return None
     try:
         tokenizer = pipe.get_tokenizer()
         encoded = tokenizer.encode(prompt)
-        input_ids = encoded.input_ids
-        # input_ids is an ov::Tensor, NOT a subscriptable python
-        # sequence -- encoded.input_ids[0] (previous code) raises
-        # "'Tensor' object is not subscriptable". Tensor exposes shape
-        # as [batch, seq_len]; the token count is the last dimension.
-        # Tried in order of preference, each guarded independently so
-        # a version difference in one path doesn't take down the rest:
-        try:
-            return int(input_ids.get_shape()[-1])
-        except Exception:
-            pass
-        try:
+        n = extract_token_count(encoded)
+        if n is not None:
+            return n
+        # Fallback if extraction returned None
+        input_ids = getattr(encoded, "input_ids", encoded)
+        if hasattr(input_ids, "shape"):
             return int(input_ids.shape[-1])
-        except Exception:
-            pass
-        # Last resort: pull the raw numpy array via .data and use its
-        # shape/size directly.
-        arr = input_ids.data
-        return int(arr.shape[-1]) if hasattr(arr, "shape") else int(len(arr))
+        if hasattr(input_ids, "data"):
+            arr = input_ids.data
+            return int(arr.shape[-1]) if hasattr(arr, "shape") else int(len(arr))
+        return int(len(input_ids))
     except Exception as e:
         print(f"[token estimate] failed, assuming prompt fits NPU: {e}")
         return None
@@ -404,6 +460,8 @@ def health():
         "status": "ok" if pipe else "no_model",
         "model_loaded": pipe is not None,
         "loaded_model": loaded_model_path if loaded_model_path else None,
+        "model_dir": loaded_model_path if loaded_model_path else MODEL_DIR,
+        "lora_active": lora_active,
         # Actual prompt ceiling of the loaded pipeline (None = loaded
         # without a MAX_PROMPT_LEN constraint — unknown/default ceiling).
         # main.py derives its prompt target from this, so the ceiling
@@ -482,34 +540,59 @@ async def chat(payload: ChatRequest):
 
     # Setup OpenVINO GenAI GenerationConfig
     config = ov_genai.GenerationConfig()
-    config.max_new_tokens = 300  # Default matching main.py's num_predict limit
-    
+    config.max_new_tokens = 250  # Default matching main.py's num_predict limit
+
+    # Enforce explicit stop strings and EOS token IDs for Qwen models
+    try:
+        config.set_eos_token_id(151645)
+    except Exception:
+        config.eos_token_id = 151645
+    config.stop_token_ids = {151645, 151643}
+    config.stop_strings = {
+        "<|im_end|>",
+        "<|endoftext|>",
+        "<|im_start|>",
+        "\nUser:",
+        "\nYou:",
+        "\nuser:",
+        "\nassistant:",
+        "User:",
+        "You:",
+    }
+    config.include_stop_str_in_output = False
+
+    # Default sampling parameters tuned for Qwen3-4B
+    # (prevents runaway monologue & vertical newline degenerations)
+    temp = 0.6
+    top_p = 0.85
+    top_k = 20
+    rep_penalty = 1.05
+
     if payload.options:
         opts = payload.options
         if "num_predict" in opts:
             config.max_new_tokens = int(opts["num_predict"])
             
-        temp = opts.get("temperature", 1.0)
-        top_p = opts.get("top_p", 1.0)
-        top_k = opts.get("top_k", 0)
-        
-        # If sampling is configured, enable do_sample
-        if temp != 1.0 or top_p != 1.0 or top_k > 0:
-            config.do_sample = True
-            config.temperature = float(temp)
-            config.top_p = float(top_p)
-            if top_k > 0:
-                config.top_k = int(top_k)
+        temp = opts.get("temperature", temp)
+        top_p = opts.get("top_p", top_p)
+        top_k = opts.get("top_k", top_k)
                 
         if "repeat_penalty" in opts:
-            config.repetition_penalty = float(opts["repeat_penalty"])
+            rep_penalty = opts["repeat_penalty"]
         elif "repetition_penalty" in opts:
-            config.repetition_penalty = float(opts["repetition_penalty"])
+            rep_penalty = opts["repetition_penalty"]
             
         if "presence_penalty" in opts:
             config.presence_penalty = float(opts["presence_penalty"])
         if "frequency_penalty" in opts:
             config.frequency_penalty = float(opts["frequency_penalty"])
+
+    config.do_sample = True
+    config.temperature = float(temp)
+    config.top_p = float(top_p)
+    if top_k > 0:
+        config.top_k = int(top_k)
+    config.repetition_penalty = float(rep_penalty)
 
     # --- Route to NPU or GPU based on real estimated prompt size ---
     # NPU has a hard compiled MAX_PROMPT_LEN=6144 — exceeding it fails
