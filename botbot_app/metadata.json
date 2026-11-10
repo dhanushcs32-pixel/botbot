@@ -1,0 +1,8 @@
+{
+  "name": "E2EE Private Chat",
+  "description": "A feature-rich WhatsApp-inspired chat application with customizable wallpapers, image/PDF sharing, and integration with both cloud Gemini AI and a Localhost AI Bot running on your laptop.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

@@ -1,0 +1,1417 @@
+/**
+ * @license
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+import React, { useState, useEffect, useRef, useCallback, useMemo } from "react";
+import {
+  Send,
+  CheckCheck,
+  Activity,
+  Sparkles,
+  Search,
+  FileText,
+  Menu,
+  X,
+  Upload,
+  Globe,
+  Database,
+  Settings,
+  ArrowLeft,
+  CornerUpLeft,
+  Palette,
+  Copy,
+  Plus,
+  Brain
+} from "lucide-react";
+import { formatBytes, extractTextFromPDF } from "./lib/fileParser";
+import { ChatMessage, WallpaperConfig, Attachment } from "./types";
+import AIEngineInspector from "./components/AIEngineInspector";
+import WallpaperSettings from "./components/WallpaperSettings";
+import { LocalNotifications } from '@capacitor/local-notifications';
+import { App as CapApp } from '@capacitor/app';
+import { Clipboard } from '@capacitor/clipboard';
+
+const FASTAPI_API_KEY = "UhJDtCW-f_zPH_A6zg_hbTGFt2qXJYiV1OzwrAEGtgg";
+
+// --- CoT diagnostic mode (separate one-shot REST path; NOT the websocket pipeline) ---
+interface CoTEntry {
+  id: string;
+  prompt: string;
+  timestamp: number;
+  status: "loading" | "ok" | "parse_failed" | "error";
+  reasoning?: { content: string; note?: string };
+  reply?: string;
+  errorDetail?: string;
+  rawOutput?: string;
+  measuredTokens?: number;
+  durationS?: number;
+}
+
+// Backend allows ~900s of generation on this endpoint; client timeout sits above it.
+const COT_TIMEOUT_MS = 950000;
+
+// --- IndexedDB Offline Queue Helper ---
+export interface QueuedMessage {
+  id: string;
+  session_id: string;
+  text: string;
+  created_at: number;
+  status: "pending" | "sent" | "acked";
+  attachments?: any[];
+  replyTo?: {
+    id: string;
+    sender: "user" | "bot";
+    text: string;
+  };
+}
+
+const DB_NAME = "botbot_chat_db";
+const STORE_NAME = "offline_queue";
+const DB_VERSION = 1;
+
+function openQueueDB(): Promise<IDBDatabase> {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open(DB_NAME, DB_VERSION);
+    request.onupgradeneeded = () => {
+      const db = request.result;
+      if (!db.objectStoreNames.contains(STORE_NAME)) {
+        const store = db.createObjectStore(STORE_NAME, { keyPath: "id" });
+        store.createIndex("session_id", "session_id", { unique: false });
+        store.createIndex("created_at", "created_at", { unique: false });
+        store.createIndex("status", "status", { unique: false });
+      }
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+async function enqueueDBMessage(msg: QueuedMessage): Promise<void> {
+  const db = await openQueueDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_NAME, "readwrite");
+    tx.objectStore(STORE_NAME).put(msg);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+async function getPendingDBMessages(sessionId: string): Promise<QueuedMessage[]> {
+  const db = await openQueueDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_NAME, "readonly");
+    const store = tx.objectStore(STORE_NAME);
+    const index = store.index("session_id");
+    const request = index.getAll(IDBKeyRange.only(sessionId));
+    request.onsuccess = () => {
+      const messages = (request.result as QueuedMessage[])
+        .filter((m) => m.status !== "acked")
+        .sort((a, b) => a.created_at - b.created_at);
+      resolve(messages);
+    };
+    request.onerror = () => reject(request.error);
+  });
+}
+
+async function updateDBMessageStatus(id: string, status: "pending" | "sent" | "acked"): Promise<void> {
+  const db = await openQueueDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_NAME, "readwrite");
+    const store = tx.objectStore(STORE_NAME);
+    const getReq = store.get(id);
+    getReq.onsuccess = () => {
+      if (getReq.result) {
+        store.put({ ...getReq.result, status });
+      }
+    };
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+async function removeAckedDBMessage(id: string): Promise<void> {
+  const db = await openQueueDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_NAME, "readwrite");
+    tx.objectStore(STORE_NAME).delete(id);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+interface BotIdentityConfig {
+  name: string;
+  nickname: string;
+  avatar: string;
+}
+
+const DEFAULT_BOT_CONFIG: BotIdentityConfig = {
+  name: "BotBot AI",
+  nickname: "BotBot",
+  avatar: "🤖"
+};
+
+const INITIAL_MESSAGES: ChatMessage[] = [];
+
+export default function App() {
+  const [botConfig, setBotConfig] = useState<BotIdentityConfig>(() => {
+    const saved = localStorage.getItem("whatsapp_single_bot_config");
+    return saved ? JSON.parse(saved) : DEFAULT_BOT_CONFIG;
+  });
+
+  const [messages, setMessages] = useState<ChatMessage[]>(() => {
+    const saved = localStorage.getItem("whatsapp_single_bot_messages");
+    return saved ? JSON.parse(saved) : INITIAL_MESSAGES;
+  });
+
+  const [fastApiBaseUrl, setFastApiBaseUrl] = useState<string>(() => {
+    return localStorage.getItem("whatsapp_fastapi_base_url") || "";
+  });
+
+  const [sessionId, setSessionId] = useState<string>(() => {
+    const saved = localStorage.getItem("whatsapp_fastapi_session_id");
+    if (saved) return saved;
+    const newId = "session-" + Math.random().toString(36).substring(2, 11);
+    localStorage.setItem("whatsapp_fastapi_session_id", newId);
+    return newId;
+  });
+
+  const [previousSessions, setPreviousSessions] = useState<string[]>(() => {
+    const saved = localStorage.getItem("whatsapp_fastapi_previous_sessions");
+    return saved ? JSON.parse(saved) : [];
+  });
+
+  useEffect(() => {
+    if (sessionId) {
+      setPreviousSessions(prev => {
+        if (prev.includes(sessionId)) return prev;
+        const next = [sessionId, ...prev].slice(0, 10);
+        localStorage.setItem("whatsapp_fastapi_previous_sessions", JSON.stringify(next));
+        return next;
+      });
+    }
+  }, [sessionId]);
+
+  const switchSession = (id: string) => {
+    const trimmed = id.trim();
+    if (!trimmed || trimmed === sessionId) return;
+    setSessionId(trimmed);
+    localStorage.setItem("whatsapp_fastapi_session_id", trimmed);
+    setMessages([]);
+    setCoTEntries([]);
+    setIsTyping(false);
+    addLog(`Switched to session: ${trimmed}`, "info");
+    socketRef.current?.close();
+  };
+
+  const [wallpaper, setWallpaper] = useState<WallpaperConfig>(() => {
+    const saved = localStorage.getItem("whatsapp_ai_wallpaper");
+    return saved ? JSON.parse(saved) : { type: "preset", value: "#efeae2" };
+  });
+
+  const [showPatterns, setShowPatterns] = useState(() => {
+    const saved = localStorage.getItem("whatsapp_ai_show_patterns");
+    return saved ? JSON.parse(saved) : true;
+  });
+
+  const [searchQuery, setSearchQuery] = useState("");
+  const [showSearchBar, setShowSearchBar] = useState(false);
+  const [showWallpaperDrawer, setShowWallpaperDrawer] = useState(false);
+  const [showChatWallpaperDrawer, setShowChatWallpaperDrawer] = useState(false);
+  const [replyingTo, setReplyingTo] = useState<ChatMessage | null>(null);
+  const [showInspectorPanel, setShowInspectorPanel] = useState(true);
+  const [isMobileSidebarOpen, setIsMobileSidebarOpen] = useState(true);
+  const [showSettings, setShowSettings] = useState(false);
+
+  const [attachedFiles, setAttachedFiles] = useState<Attachment[]>([]);
+  const [inputText, setInputText] = useState("");
+  const [isTyping, setIsTyping] = useState(false);
+
+  // CoT diagnostic mode — entries are persisted locally for transcript
+  // continuity across restarts; they are never sent to the offline queue and
+  // never stored server-side (the backend does not save CoT turns).
+  const [cotMode, setCotMode] = useState<boolean>(() => {
+    const saved = localStorage.getItem("whatsapp_cot_mode");
+    return saved ? JSON.parse(saved) : false;
+  });
+  const [cotEntries, setCoTEntries] = useState<CoTEntry[]>(() => {
+    const saved = localStorage.getItem("whatsapp_cot_entries");
+    if (!saved) return [];
+    const parsed = JSON.parse(saved);
+    if (!Array.isArray(parsed)) return [];
+    // An entry persisted while a CoT request was in flight restores as
+    // "loading" with no live fetch behind it (the request died with the
+    // previous app process) — resolve it to a visible error instead of a
+    // "CoT generating..." bubble that could never clear.
+    return parsed
+      .slice(-30)
+      .map((entry: CoTEntry) =>
+        entry && entry.status === "loading"
+          ? {
+              ...entry,
+              status: "error" as const,
+              errorDetail: "The app closed before this CoT response arrived — the request is no longer running.",
+            }
+          : entry
+      );
+  });
+  const [isCoTLoading, setIsCoTLoading] = useState(false);
+
+  const [logs, setLogs] = useState<Array<{ time: string; type: "info" | "api" | "error"; text: string }>>([]);
+  const [activePayload, setActivePayload] = useState<any>(null);
+
+  const [userName, setUserName] = useState(() => {
+    return localStorage.getItem("whatsapp_ai_username") || "WiFi Client Client";
+  });
+  const [isEditingName, setIsEditingName] = useState(false);
+
+  const [viewingDocument, setViewingDocument] = useState<Attachment | null>(null);
+  const [isTestingConnection, setIsTestingConnection] = useState(false);
+  const [connectionTestResult, setConnectionTestResult] = useState<{ success: boolean; message: string } | null>(null);
+  const [isConnected, setIsConnected] = useState(false);
+
+  const socketRef = useRef<WebSocket | null>(null);
+  const chatEndRef = useRef<HTMLDivElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const sessionInputRef = useRef<HTMLInputElement>(null);
+
+  const reconnectTimeoutRef = useRef<any>(null);
+  const reconnectAttemptsRef = useRef<number>(0);
+  const isFlushingRef = useRef<boolean>(false);
+  const pendingAcksRef = useRef<Map<string, () => void>>(new Map());
+  const lastAttemptRef = useRef<Map<string, number>>(new Map());
+  const lastPongRef = useRef<number>(0);
+
+  const addLog = (text: string, type: "info" | "api" | "error" = "info") => {
+    const time = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false });
+    setLogs((prev) => [{ time, type, text }, ...prev.slice(0, 49)]);
+  };
+
+  const RETRY_COOLDOWN_MS = 10000; // longer than the 8s ack timeout below
+
+  const flushQueue = useCallback(async () => {
+    if (!socketRef.current || socketRef.current.readyState !== WebSocket.OPEN || isFlushingRef.current) {
+      return;
+    }
+
+    isFlushingRef.current = true;
+    try {
+      // Single pass per call — don't loop back and immediately re-hit items
+      // that just timed out. Retrying happens on the *next* trigger (ack of
+      // another message, reconnect, app resume), gated by the cooldown below.
+      const pending = await getPendingDBMessages(sessionId);
+
+      for (const item of pending) {
+        if (!socketRef.current || socketRef.current.readyState !== WebSocket.OPEN) break;
+
+        const lastAttempt = lastAttemptRef.current.get(item.id) ?? 0;
+        if (Date.now() - lastAttempt < RETRY_COOLDOWN_MS) {
+          // A previous attempt's ack may still be in flight — don't resend yet.
+          continue;
+        }
+        lastAttemptRef.current.set(item.id, Date.now());
+
+        await new Promise<void>((resolve, reject) => {
+          const timeout = setTimeout(() => {
+            pendingAcksRef.current.delete(item.id);
+            reject(new Error("Ack timeout (8s)"));
+          }, 8000);
+
+          pendingAcksRef.current.set(item.id, () => {
+            clearTimeout(timeout);
+            lastAttemptRef.current.delete(item.id);
+            resolve();
+          });
+
+          const sanitizedAttachments = item.attachments?.map(({ url, ...rest }: any) => rest);
+          const payload = {
+            type: "chat_message",
+            id: item.id,
+            session_id: item.session_id,
+            text: item.text,
+            message: item.text,
+            attachments: sanitizedAttachments,
+            reply_to: item.replyTo,
+            created_at: item.created_at,
+          };
+
+          socketRef.current?.send(JSON.stringify(payload));
+          updateDBMessageStatus(item.id, "sent");
+          setMessages((prev) => {
+            const updated = prev.map((m) => m.id === item.id ? { ...m, status: "delivered" as const } : m);
+            localStorage.setItem("whatsapp_single_bot_messages", JSON.stringify(updated));
+            return updated;
+          });
+        }).catch((err) => {
+          // Ack never arrived within 8s (or the socket died mid-flight) —
+          // nothing is in flight for this message anymore, so stop showing
+          // the typing indicator. Retrying stays gated by the cooldown.
+          setIsTyping(false);
+          addLog(`Delivery retry queued for msg ${item.id}: ${err.message}`, "info");
+        });
+      }
+    } finally {
+      isFlushingRef.current = false;
+    }
+  }, [sessionId]);
+
+  useEffect(() => {
+    if (!fastApiBaseUrl) return;
+
+    let heartbeatInterval: any;
+    let cancelled = false;
+
+    const scheduleReconnect = () => {
+      if (cancelled) return;
+      if (reconnectTimeoutRef.current) clearTimeout(reconnectTimeoutRef.current);
+
+      const delay = Math.min(1000 * 2 ** reconnectAttemptsRef.current, 30000);
+      reconnectAttemptsRef.current += 1;
+      addLog(`WebSocket reconnecting in ${delay / 1000}s...`, "info");
+
+      reconnectTimeoutRef.current = setTimeout(() => {
+        connectWebSocket();
+      }, delay);
+    };
+
+    const connectWebSocket = async () => {
+      if (cancelled) return;
+
+      if (!fastApiBaseUrl || !fastApiBaseUrl.startsWith("http")) {
+        addLog("Waiting for valid Base URL in settings...", "info");
+        return;
+      }
+
+      try {
+        const base = fastApiBaseUrl.trim().replace(/\/+$/, "");
+
+        const ticketRes = await fetch(`${base}/ws/ticket`, {
+          method: "POST",
+          headers: {
+            "X-API-Key": FASTAPI_API_KEY,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({ session_id: sessionId }),
+        });
+
+        if (!ticketRes.ok) {
+          throw new Error(`Failed to get WebSocket ticket: ${ticketRes.status}`);
+        }
+
+        const { ticket } = await ticketRes.json();
+        if (cancelled) return;
+
+        const wsUrl = base.replace("http", "ws") + `/ws/chat?ticket=${ticket}&session_id=${sessionId}`;
+        addLog(`Connecting: ${wsUrl}`, "info");
+
+        const socket = new WebSocket(wsUrl);
+        socketRef.current = socket;
+
+        socket.onopen = () => {
+          if (cancelled) {
+            socket.close();
+            return;
+          }
+          addLog("Connected! (Background Service Active)", "info");
+          setIsConnected(true);
+          reconnectAttemptsRef.current = 0;
+
+          lastPongRef.current = Date.now();
+
+          heartbeatInterval = setInterval(() => {
+            if (socket.readyState !== WebSocket.OPEN) return;
+
+            const sinceLastPong = Date.now() - lastPongRef.current;
+            if (sinceLastPong > 35000) {
+              // Two missed pongs (15s interval, generous margin) on a socket
+              // that still reports OPEN — it's half-open. Force a real
+              // reconnect rather than waiting on this dead handle.
+              addLog("No pong in 35s, socket appears half-open. Forcing reconnect.", "error");
+              socket.close();
+              return;
+            }
+
+            socket.send(JSON.stringify({ type: "ping" }));
+          }, 15000);
+
+          flushQueue();
+        };
+
+        socket.onmessage = async (event) => {
+          let data: any;
+          try {
+            data = JSON.parse(event.data);
+          } catch (parseErr) {
+            addLog(`Received non-JSON WebSocket message, ignoring.`, "error");
+            return;
+          }
+
+          if (data.type === "pong") {
+            lastPongRef.current = Date.now();
+            return;
+          }
+
+          // 1. Server ACK for user message
+          if (data.type === "ack" && data.id) {
+            await removeAckedDBMessage(data.id);
+            setMessages((prev) => {
+              const updated = prev.map((m) => m.id === data.id ? { ...m, status: "read" as const } : m);
+              localStorage.setItem("whatsapp_single_bot_messages", JSON.stringify(updated));
+              return updated;
+            });
+            const resolveAck = pendingAcksRef.current.get(data.id);
+            if (resolveAck) {
+              resolveAck();
+              pendingAcksRef.current.delete(data.id);
+            }
+            return;
+          }
+
+          // 1b. Server confirmation the message is durably saved — arrives
+          // later than "ack" (after generate_reply/save_turn completes).
+          // Purely additive: doesn't touch the ack-driven retry/flush path,
+          // doesn't gate anything time-sensitive. Safe no-op if unused.
+          if (data.type === "stored" && data.id) {
+            addLog(`Message ${data.id} durably stored on server.`, "info");
+            return;
+          }
+
+          // 2. Incoming bot message
+          const replyText = data.reply ?? data.text ?? data.message;
+          if (!replyText) return;
+
+          const botReplyId = data.id || "msg-ws-" + Math.random().toString(36).substring(2, 11);
+
+          // Acknowledge receipt back to server
+          if (socket.readyState === WebSocket.OPEN) {
+            socket.send(JSON.stringify({ type: "ack", id: botReplyId }));
+          }
+
+          const botMsg: ChatMessage = {
+            id: botReplyId,
+            sender: "bot",
+            text: replyText,
+            timestamp: data.created_at || Date.now(),
+            status: "read"
+          };
+
+          setIsTyping(false);
+          setMessages((prev) => {
+            if (prev.some((m) => m.id === botReplyId)) return prev;
+            const updated = [...prev, botMsg];
+            localStorage.setItem("whatsapp_single_bot_messages", JSON.stringify(updated));
+            return updated;
+          });
+
+          try {
+            await LocalNotifications.schedule({
+              notifications: [{
+                title: botConfig.name,
+                body: botMsg.text,
+                id: Math.floor(Math.random() * 1000000),
+                schedule: { at: new Date(Date.now() + 100) },
+                sound: 'default'
+              }]
+            });
+          } catch (notifyErr) {
+            console.warn("Notifications not available or permission denied", notifyErr);
+          }
+        };
+
+        socket.onclose = () => {
+          setIsConnected(false);
+          setIsTyping(false);
+          clearInterval(heartbeatInterval);
+          socketRef.current = null;
+          if (!cancelled) {
+            scheduleReconnect();
+          }
+        };
+
+        socket.onerror = () => {
+          setIsTyping(false);
+          addLog(`Socket connection dropped.`, "error");
+          socket.close();
+        };
+      } catch (err: any) {
+        // Includes the ticket endpoint returning non-200 (e.g. 503 while the
+        // backend is down) — no reply can arrive on this connection.
+        setIsTyping(false);
+        addLog(`Connection attempt failed: ${err.message}`, "error");
+        setIsConnected(false);
+        if (!cancelled) {
+          scheduleReconnect();
+        }
+      }
+    };
+
+    connectWebSocket();
+
+    return () => {
+      cancelled = true;
+      clearInterval(heartbeatInterval);
+      if (reconnectTimeoutRef.current) clearTimeout(reconnectTimeoutRef.current);
+      socketRef.current?.close();
+      socketRef.current = null;
+    };
+  }, [fastApiBaseUrl, sessionId, flushQueue]);
+
+  useEffect(() => {
+    let removeListener: (() => void) | undefined;
+    let isMounted = true;
+
+    CapApp.addListener('appStateChange', ({ isActive }) => {
+      if (!isActive) {
+        addLog("App backgrounded. Sleeping UI to save battery.", "info");
+      } else {
+        addLog("App resumed. Waking up UI.", "info");
+        flushQueue();
+      }
+    }).then((handle) => {
+      if (!isMounted) {
+        handle.remove();
+        return;
+      }
+      removeListener = () => handle.remove();
+    });
+
+    const backListener = CapApp.addListener('backButton', () => {
+      if (showSettings) {
+        setShowSettings(false);
+      } else if (!isMobileSidebarOpen) {
+        setIsMobileSidebarOpen(true);
+      } else {
+        CapApp.exitApp();
+      }
+    });
+
+    return () => {
+      isMounted = false;
+      removeListener?.();
+      backListener.then(h => h.remove());
+    };
+  }, [showSettings, isMobileSidebarOpen, flushQueue]);
+
+  useEffect(() => {
+    const requestPermissions = async () => {
+      const status = await LocalNotifications.checkPermissions();
+      if (status.display !== 'granted') {
+        await LocalNotifications.requestPermissions();
+      }
+    };
+    requestPermissions();
+  }, []);
+
+  useEffect(() => {
+    localStorage.setItem("whatsapp_single_bot_config", JSON.stringify(botConfig));
+  }, [botConfig]);
+
+  useEffect(() => {
+    localStorage.setItem("whatsapp_single_bot_messages", JSON.stringify(messages));
+  }, [messages]);
+
+  useEffect(() => {
+    localStorage.setItem("whatsapp_fastapi_base_url", fastApiBaseUrl);
+  }, [fastApiBaseUrl]);
+
+  useEffect(() => {
+    localStorage.setItem("whatsapp_ai_wallpaper", JSON.stringify(wallpaper));
+  }, [wallpaper]);
+
+  useEffect(() => {
+    localStorage.setItem("whatsapp_ai_show_patterns", JSON.stringify(showPatterns));
+  }, [showPatterns]);
+
+  useEffect(() => {
+    localStorage.setItem("whatsapp_cot_mode", JSON.stringify(cotMode));
+  }, [cotMode]);
+
+  useEffect(() => {
+    localStorage.setItem("whatsapp_cot_entries", JSON.stringify(cotEntries.slice(-30)));
+  }, [cotEntries]);
+
+  useEffect(() => {
+    localStorage.setItem("whatsapp_ai_username", userName);
+  }, [userName]);
+
+  useEffect(() => {
+    if (!isMobileSidebarOpen) {
+      chatEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' });
+    }
+  }, [messages, isTyping, isMobileSidebarOpen, cotEntries]);
+
+  const getNormalizedUrl = (baseUrl: string, endpoint: string) => {
+    const base = baseUrl.trim().replace(/\/+$/, '');
+    const path = endpoint.trim().replace(/^\/+/, '');
+    return path ? `${base}/${path}` : base + "/";
+  };
+
+  const renderAvatar = (avatarStr: string, className = "w-10 h-10") => {
+    if (avatarStr.startsWith("data:") || avatarStr.startsWith("http") || avatarStr.startsWith("blob:")) {
+      return (
+        <img
+          src={avatarStr}
+          alt="Bot Avatar"
+          className={`${className} rounded-full object-cover shadow-inner border border-slate-200/50`}
+          referrerPolicy="no-referrer"
+        />
+      );
+    }
+    return (
+      <div className={`${className} rounded-full bg-emerald-50 border border-slate-200/50 flex items-center justify-center font-bold shadow-inner`}>
+        <span className={className.includes("w-14") || className.includes("w-24") ? "text-2xl" : "text-base"}>
+          {avatarStr || "🤖"}
+        </span>
+      </div>
+    );
+  };
+
+  const handleAvatarUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    if (!file.type.startsWith("image/")) {
+      addLog("Failed to change avatar: selected file is not an image.", "error");
+      return;
+    }
+
+    const reader = new FileReader();
+    reader.onload = (event) => {
+      if (event.target?.result && typeof event.target.result === "string") {
+        setBotConfig((prev) => ({ ...prev, avatar: event.target!.result as string }));
+        addLog("Successfully updated bot profile picture!", "info");
+      }
+    };
+    reader.readAsDataURL(file);
+  };
+
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = e.target.files;
+    if (!files) return;
+
+    Array.from(files).forEach((file: File) => {
+      const isImage = file.type.startsWith("image/");
+      const isPdf = file.type === "application/pdf" || file.name.endsWith(".pdf");
+      const type = isImage ? "image" : isPdf ? "pdf" : "text";
+
+      const url = URL.createObjectURL(file);
+      const reader = new FileReader();
+      reader.onload = async (event) => {
+        const result = event.target?.result as string;
+
+        let textContents = undefined;
+        if (type === "text") {
+          textContents = result;
+        } else if (type === "pdf") {
+          const arrayBuffer = await file.arrayBuffer();
+          textContents = await Promise.resolve(extractTextFromPDF(arrayBuffer));
+        }
+
+        const newAttachment: Attachment = {
+          id: "att-" + Math.random().toString(36).substring(2, 11),
+          name: file.name,
+          type: type,
+          size: formatBytes(file.size),
+          url: url,
+          base64: type === "text" ? undefined : result,
+          textContents: textContents
+        };
+
+        setAttachedFiles((prev) => [...prev, newAttachment]);
+        addLog(`Attached ${type} file: "${file.name}"`, "info");
+      };
+
+      if (type === "text") {
+        reader.readAsText(file);
+      } else {
+        reader.readAsDataURL(file);
+      }
+    });
+
+    e.target.value = "";
+  };
+
+  const testLocalConnection = async (): Promise<boolean> => {
+    setIsTestingConnection(true);
+    setConnectionTestResult(null);
+    const targetUrl = getNormalizedUrl(fastApiBaseUrl, "/");
+    addLog(`Pinging backend: ${targetUrl}`, "info");
+
+    try {
+      const response = await fetch(targetUrl, {
+        method: "GET",
+        mode: "cors",
+        headers: {
+          "X-API-Key": FASTAPI_API_KEY
+        }
+      });
+      setIsTestingConnection(false);
+
+      if (response.ok) {
+        const msg = `Connected to ${targetUrl} (Status: ${response.status})`;
+        addLog(msg, "info");
+        setConnectionTestResult({ success: true, message: msg });
+        return true;
+      } else {
+        const msg = `Server found at ${targetUrl} but returned ${response.status}.`;
+        addLog(msg, "error");
+        setConnectionTestResult({ success: false, message: msg });
+        return false;
+      }
+    } catch (err: any) {
+      setIsTestingConnection(false);
+      const errMsg = `Connection Failed: ${targetUrl}. (Error: ${err.message})`;
+      addLog(errMsg, "error");
+      setConnectionTestResult({ success: false, message: errMsg });
+      return false;
+    }
+  };
+
+  const handleSendMessage = async (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
+    if (!inputText.trim() && attachedFiles.length === 0) return;
+
+    const currentText = inputText.trim();
+    const currentReplyTo = replyingTo;
+    const currentAttachedFiles = [...attachedFiles];
+
+    setInputText("");
+    setAttachedFiles([]);
+    setReplyingTo(null);
+
+    const userMessageId = "msg-" + Math.random().toString(36).substring(2, 11);
+    const userMessage: ChatMessage = {
+      id: userMessageId,
+      sender: "user",
+      text: currentText,
+      timestamp: Date.now(),
+      status: "sent",
+      attachments: currentAttachedFiles.length > 0 ? currentAttachedFiles : undefined,
+      replyTo: currentReplyTo ? {
+        id: currentReplyTo.id,
+        sender: currentReplyTo.sender,
+        text: currentReplyTo.text
+      } : undefined
+    };
+
+    setMessages((prev) => {
+      const updated = [...prev, userMessage];
+      localStorage.setItem("whatsapp_single_bot_messages", JSON.stringify(updated));
+      return updated;
+    });
+
+    setIsTyping(true);
+
+    const queuedItem: QueuedMessage = {
+      id: userMessageId,
+      session_id: sessionId,
+      text: currentText,
+      created_at: userMessage.timestamp,
+      status: "pending",
+      attachments: currentAttachedFiles,
+      replyTo: userMessage.replyTo
+    };
+    await enqueueDBMessage(queuedItem);
+
+    if (socketRef.current && socketRef.current.readyState === WebSocket.OPEN) {
+      flushQueue();
+    } else {
+      // Message is only queued locally — nothing can generate a reply yet,
+      // so don't leave the typing indicator running for an unsent message.
+      setIsTyping(false);
+      addLog("Offline: message buffered in storage.", "info");
+    }
+  };
+
+  const handleNewChat = () => {
+    const newId = "session-" + Math.random().toString(36).substring(2, 11);
+    setSessionId(newId);
+    localStorage.setItem("whatsapp_fastapi_session_id", newId);
+    setMessages([]);
+    localStorage.setItem("whatsapp_single_bot_messages", JSON.stringify([]));
+    setCoTEntries([]);
+    setIsTyping(false);
+    addLog(`Started new chat session: ${newId}`, "info");
+    socketRef.current?.close();
+  };
+
+  const updateCoTEntry = (id: string, patch: Partial<CoTEntry>) => {
+    setCoTEntries((prev) => prev.map((entry) => (entry.id === id ? { ...entry, ...patch } : entry)));
+  };
+
+  // CoT diagnostic send — a separate one-shot REST call. Deliberately does NOT
+  // touch the websocket, ack/dedupe, offline queue, or the isTyping indicator
+  // (Fix B) — those belong to the normal chat pipeline only.
+  const handleSendCoT = async (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
+    const text = inputText.trim();
+    if (!text) return;
+
+    if (attachedFiles.length > 0) {
+      setCoTEntries((prev) => [...prev, {
+        id: "cot-" + Math.random().toString(36).substring(2, 11),
+        prompt: text,
+        timestamp: Date.now(),
+        status: "error",
+        errorDetail: "Attachments are not supported in CoT diagnostic mode (the /chat/cot endpoint accepts text only). Remove the attachment and send again.",
+      }]);
+      return; // keep input + attachments so nothing is silently dropped
+    }
+
+    const entryId = "cot-" + Math.random().toString(36).substring(2, 11);
+    setCoTEntries((prev) => [...prev, {
+      id: entryId,
+      prompt: text,
+      timestamp: Date.now(),
+      status: "loading",
+    }]);
+    setInputText("");
+    setIsCoTLoading(true);
+
+    let timeoutId: any;
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      timeoutId = setTimeout(() => reject(new Error("cot_timeout")), COT_TIMEOUT_MS);
+    });
+
+    try {
+      const base = fastApiBaseUrl.trim().replace(/\/+$/, "");
+      if (!base) throw new Error("No Base URL configured — set it in Settings first.");
+
+      const res: Response = await Promise.race([
+        fetch(`${base}/chat/cot`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "X-API-Key": FASTAPI_API_KEY,
+            "X-CoT-Activate": "diagnostic-replay",
+          },
+          body: JSON.stringify({ message: text, session_id: sessionId }),
+        }),
+        timeoutPromise,
+      ]);
+
+      if (res.status === 403) throw new Error("403 — this endpoint requires the primary API key (guest keys are rejected server-side).");
+      if (res.status === 401) throw new Error("401 — API key rejected as invalid by the server.");
+      if (!res.ok) throw new Error(`Server returned HTTP ${res.status} for /chat/cot.`);
+
+      const data: any = await res.json();
+
+      if (data && data.error === "cot_parse_failed") {
+        updateCoTEntry(entryId, {
+          status: "parse_failed",
+          errorDetail: data.detail || "The server could not parse the model's output into reasoning/reply.",
+          rawOutput: typeof data.raw_output === "string" ? data.raw_output : JSON.stringify(data.raw_output ?? data, null, 2),
+        });
+      } else if (data && data.reply && typeof data.reply.content === "string") {
+        updateCoTEntry(entryId, {
+          status: "ok",
+          reasoning: {
+            content: data.reasoning?.content ?? "(no reasoning content returned)",
+            note: data.reasoning?.note,
+          },
+          reply: data.reply.content,
+          measuredTokens: data.measured_tokens,
+          durationS: data.duration_s,
+        });
+        addLog(`CoT reply received (mode: ${data.mode ?? "?"}, ${data.duration_s ?? "?"}s, ${data.measured_tokens ?? "?"} tokens)`, "api");
+      } else {
+        updateCoTEntry(entryId, {
+          status: "parse_failed",
+          errorDetail: "Unexpected /chat/cot response shape — no reply.content present.",
+          rawOutput: JSON.stringify(data, null, 2),
+        });
+      }
+    } catch (err: any) {
+      if (err?.message === "cot_timeout") {
+        updateCoTEntry(entryId, {
+          status: "error",
+          errorDetail: "CoT request timed out client-side after 950s (the backend allows ~900s of generation). The request may still complete server-side — check the backend log.",
+        });
+      } else {
+        updateCoTEntry(entryId, {
+          status: "error",
+          errorDetail: `CoT request failed: ${err?.message || "network error"}`,
+        });
+      }
+    } finally {
+      clearTimeout(timeoutId);
+      setIsCoTLoading(false);
+    }
+  };
+
+  const filteredMessages = messages.filter((m) => {
+    if (!searchQuery.trim()) return true;
+    return m.text.toLowerCase().includes(searchQuery.toLowerCase());
+  });
+
+  // Chronological transcript: normal messages and CoT exchanges interleaved
+  // by time. Previously CoT entries rendered as one block after ALL messages,
+  // which buried the bot's latest real replies under older CoT prompts.
+  const transcriptItems = useMemo(() => {
+    const items: Array<{ kind: "msg"; msg: ChatMessage } | { kind: "cot"; entry: CoTEntry }> = [
+      ...filteredMessages.map((msg) => ({ kind: "msg" as const, msg })),
+      ...cotEntries.map((entry) => ({ kind: "cot" as const, entry })),
+    ];
+    return items.sort((a, b) => {
+      const ta = a.kind === "msg" ? a.msg.timestamp : a.entry.timestamp;
+      const tb = b.kind === "msg" ? b.msg.timestamp : b.entry.timestamp;
+      return ta - tb;
+    });
+  }, [filteredMessages, cotEntries]);
+
+  const formatMessageTime = (time: number) => {
+    return new Date(time).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  };
+
+  const isSameDay = (time1: number, time2: number) => {
+    const d1 = new Date(time1);
+    const d2 = new Date(time2);
+    return (
+      d1.getFullYear() === d2.getFullYear() &&
+      d1.getMonth() === d2.getMonth() &&
+      d1.getDate() === d2.getDate()
+    );
+  };
+
+  const formatHeaderDate = (timestamp: number) => {
+    const date = new Date(timestamp);
+    const today = new Date();
+    const yesterday = new Date();
+    yesterday.setDate(today.getDate() - 1);
+
+    if (
+      date.getFullYear() === today.getFullYear() &&
+      date.getMonth() === today.getMonth() &&
+      date.getDate() === today.getDate()
+    ) {
+      return "Today";
+    }
+
+    if (
+      date.getFullYear() === yesterday.getFullYear() &&
+      date.getMonth() === yesterday.getMonth() &&
+      date.getDate() === yesterday.getDate()
+    ) {
+      return "Yesterday";
+    }
+
+    return date.toLocaleDateString([], {
+      weekday: "long",
+      year: "numeric",
+      month: "long",
+      day: "numeric",
+    });
+  };
+
+  const renderMessage = (msg: ChatMessage) => {
+    const isMe = msg.sender === "user";
+    return (
+      <div className={`flex flex-col relative group w-full ${isMe ? "items-end" : "items-start"}`}>
+        <div className={`opacity-0 group-hover:opacity-100 absolute top-1/2 -translate-y-1/2 flex items-center space-x-1 z-20 ${isMe ? "right-[77%] mr-2" : "left-[77%] ml-2"}`}>
+          <button type="button" onClick={() => setReplyingTo(msg)} className="p-1.5 bg-white border border-slate-200 text-slate-500 rounded-full shadow-md"><CornerUpLeft className="w-3.5 h-3.5" /></button>
+          <button type="button" onClick={async (e) => { e.stopPropagation(); await Clipboard.write({ string: msg.text }); addLog("Copied!", "info"); }} className="p-1.5 bg-white border border-slate-200 text-slate-500 rounded-full shadow-md"><Copy className="w-3.5 h-3.5" /></button>
+        </div>
+        <div className={`max-w-[85%] sm:max-w-[75%] rounded-2xl px-3.5 py-2 shadow-sm text-[14.5px] relative ${isMe ? "bg-[#d9fdd3] text-[#111b21] rounded-tr-none" : "bg-white text-[#111b21] rounded-tl-none"}`}>
+          <div className={`absolute top-0 w-2 h-2 ${isMe ? "right-[-4px] border-t-[8px] border-t-[#d9fdd3] border-r-[4px] border-r-transparent" : "left-[-4px] border-t-[8px] border-t-white border-l-[4px] border-l-transparent"}`} />
+          {msg.replyTo && (<div className="bg-black/5 border-l-4 border-emerald-600 rounded-lg p-2 mb-1.5 text-xs text-slate-600"><div className="font-bold text-emerald-700 text-[10px] uppercase">{msg.replyTo.sender === "user" ? "You" : botConfig.name}</div><div className="truncate">{msg.replyTo.text}</div></div>)}
+          {msg.attachments?.map(att => (
+            <div key={att.id} className="rounded-lg overflow-hidden border border-black/5 mb-1.5 cursor-pointer" onClick={() => setViewingDocument(att)}>
+              {att.type === "image" ? <img src={att.url || att.base64} className="max-h-64 w-full object-cover" /> : <div className="flex items-center space-x-2 p-2 bg-black/5"><FileText className="w-5 h-5 text-emerald-600" /><span className="text-xs font-bold truncate">{att.name}</span></div>}
+            </div>
+          ))}
+          <div className="break-words leading-relaxed whitespace-pre-wrap select-text">{msg.text}</div>
+          <div className="flex items-center justify-end space-x-1 mt-0.5 text-[10.5px] text-slate-400 select-none">
+            <span>{formatMessageTime(msg.timestamp)}</span>
+            {isMe && (
+              <span className={msg.status === "read" ? "text-sky-500" : msg.status === "delivered" ? "text-slate-400" : "text-amber-500"}>
+                <CheckCheck className="w-4 h-4" />
+              </span>
+            )}
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  const renderCoTEntry = (entry: CoTEntry) => (
+    <>
+      {/* CoT prompt — persisted user-style bubble, badged so the mode is unmistakable */}
+      <div className="flex flex-col w-full items-end">
+        <div className="max-w-[85%] sm:max-w-[75%] rounded-2xl rounded-tr-none px-3.5 py-2 shadow-sm text-[14.5px] bg-[#d9fdd3] text-[#111b21]">
+          <div className="flex items-center justify-end mb-0.5"><span className="text-[9px] font-bold uppercase tracking-wide bg-amber-100 text-amber-700 border border-amber-300 rounded px-1.5 py-0.5">CoT</span></div>
+          <div className="break-words leading-relaxed whitespace-pre-wrap select-text">{entry.prompt}</div>
+          <div className="flex items-center justify-end mt-0.5 text-[10.5px] text-slate-400 select-none"><span>{formatMessageTime(entry.timestamp)}</span></div>
+        </div>
+      </div>
+
+      {entry.status === "loading" && (
+        <div className="flex flex-col w-full items-start">
+          <div className="max-w-[85%] sm:max-w-[75%] rounded-2xl rounded-tl-none border-l-4 border-amber-400 bg-amber-50 px-3.5 py-2.5 shadow-sm">
+            <div className="text-[11px] font-semibold text-amber-700 flex items-center space-x-2">
+              <Activity className="w-3.5 h-3.5 animate-spin shrink-0" />
+              <span>CoT generating — may take several minutes…</span>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {entry.status === "ok" && (
+        <>
+          <div className="flex flex-col w-full items-start">
+            <div className="max-w-[85%] sm:max-w-[75%] rounded-2xl rounded-tl-none border-l-4 border-amber-500 bg-[#2b2410] px-3.5 py-2 shadow-sm">
+              <div className="text-[10px] font-bold uppercase tracking-wide text-amber-300 mb-1">🧠 reasoning — self-report, not verified</div>
+              {entry.reasoning?.note && (<div className="text-[10px] italic text-amber-200/70 mb-1.5">{entry.reasoning.note}</div>)}
+              <div className="break-words leading-relaxed whitespace-pre-wrap select-text text-[13px] text-amber-100">{entry.reasoning?.content}</div>
+              <div className="mt-1 text-right text-[10px] text-amber-200/60 select-none">{entry.durationS != null && <span>{entry.durationS}s · </span>}{entry.measuredTokens != null && <span>{entry.measuredTokens} tokens</span>}</div>
+            </div>
+          </div>
+          <div className="flex flex-col w-full items-start">
+            <div className="max-w-[85%] sm:max-w-[75%] rounded-2xl rounded-tl-none px-3.5 py-2 shadow-sm text-[14.5px] bg-white text-[#111b21]">
+              <div className="break-words leading-relaxed whitespace-pre-wrap select-text">{entry.reply}</div>
+            </div>
+          </div>
+        </>
+      )}
+
+      {entry.status === "parse_failed" && (
+        <div className="flex flex-col w-full items-start">
+          <div className="max-w-[85%] sm:max-w-[75%] rounded-2xl rounded-tl-none border-l-4 border-rose-500 bg-rose-50 px-3.5 py-2 shadow-sm">
+            <div className="text-[10px] font-bold uppercase tracking-wide text-rose-700 mb-1">⚠️ CoT parse failed</div>
+            <div className="text-xs text-rose-600 break-words">{entry.errorDetail}</div>
+            {entry.rawOutput && (
+              <details className="mt-1.5">
+                <summary className="text-[10px] font-bold text-rose-600 cursor-pointer select-none">Inspect raw model output</summary>
+                <pre className="mt-1 max-h-40 overflow-y-auto text-[10px] whitespace-pre-wrap font-mono bg-white/80 rounded p-2 text-slate-700 select-text">{entry.rawOutput}</pre>
+              </details>
+            )}
+          </div>
+        </div>
+      )}
+
+      {entry.status === "error" && (
+        <div className="flex flex-col w-full items-start">
+          <div className="max-w-[85%] sm:max-w-[75%] rounded-2xl rounded-tl-none border-l-4 border-rose-500 bg-rose-50 px-3.5 py-2 shadow-sm">
+            <div className="text-[10px] font-bold uppercase tracking-wide text-rose-700 mb-1">⚠️ CoT request error</div>
+            <div className="text-xs text-rose-600 break-words">{entry.errorDetail}</div>
+          </div>
+        </div>
+      )}
+    </>
+  );
+
+  return (
+    <div className="min-h-[100dvh] w-full flex flex-col font-sans antialiased relative items-center">
+      {/* 1. FIXED BACKGROUND LAYER */}
+      <div
+        className="fixed inset-0 z-0"
+        style={{
+          backgroundColor: wallpaper.type === "solid" || wallpaper.type === "preset" ? wallpaper.value : "#efeae2",
+          backgroundImage: wallpaper.type === "custom" ? `url(${wallpaper.value})` : undefined,
+          backgroundSize: "cover",
+          backgroundPosition: "center",
+          backgroundAttachment: "fixed"
+        }}
+      />
+
+      {showPatterns && (wallpaper.type === "solid" || wallpaper.type === "preset") && (
+        <div className="fixed inset-0 opacity-12 bg-[radial-gradient(#000000_10%,transparent_11%)] bg-[length:14px_14px] pointer-events-none z-0" />
+      )}
+
+      {/* Top Green Accent Banner */}
+      <div className="h-[127px] w-full bg-[#00a884] fixed top-0 left-0 z-0 hidden md:block" />
+
+      {/* Main Container */}
+      <div className="flex-1 w-full max-w-[1600px] md:px-6 md:py-5 relative z-10 flex flex-col md:flex-row justify-center">
+
+        {/* Actual App Window */}
+        <div className="w-full flex flex-col md:flex-row bg-transparent md:bg-[#eae6df] rounded-none md:rounded-2xl shadow-2xl md:border border-gray-300/40 min-h-[100dvh] md:min-h-0 overflow-visible relative">
+
+          {/* 1. LEFT PANEL: SIDEBAR */}
+          <div className={`w-full md:w-[410px] shrink-0 bg-white flex flex-col border-r border-slate-200/90 transition-all duration-300 z-50 ${
+            isMobileSidebarOpen ? "flex h-[100dvh] sticky top-0" : "hidden md:flex h-full"
+          }`}>
+            {showSettings ? (
+              <>
+                <div className="bg-[#008069] text-white px-4 py-[20px] flex items-center space-x-6 shrink-0 shadow-sm">
+                  <button onClick={() => setShowSettings(false)} className="p-1 hover:bg-emerald-800 rounded-full transition cursor-pointer">
+                    <ArrowLeft className="w-5 h-5 text-white" />
+                  </button>
+                  <h2 className="text-base font-semibold tracking-wide">Settings</h2>
+                </div>
+
+                <div className="flex-1 overflow-y-auto p-4 space-y-4 bg-slate-50/40">
+                  <div className="bg-white p-4 rounded-xl border border-slate-200/60 space-y-3.5 shadow-xs">
+                    <div className="flex items-center justify-between border-b border-slate-100 pb-1.5">
+                      <h4 className="text-xs font-bold text-slate-800 flex items-center uppercase tracking-wider">
+                        <Globe className="w-4 h-4 mr-1.5 text-[#00a884]" /> Laptop WiFi Connection
+                      </h4>
+                      <span className={`text-[9px] px-1.5 py-0.5 rounded font-bold uppercase tracking-tight ${isConnected ? "bg-emerald-100 text-emerald-800" : "bg-rose-100 text-rose-800"}`}>
+                        {isConnected ? "Connected" : "Disconnected"}
+                      </span>
+                    </div>
+
+                    <div className="space-y-3.5 text-xs font-sans">
+                      <div>
+                        <label className="block text-[10px] text-slate-500 font-bold mb-1 uppercase tracking-tight">Laptop Base URL</label>
+                        <input type="text" value={fastApiBaseUrl} onChange={(e) => setFastApiBaseUrl(e.target.value)} className="w-full bg-white border border-slate-200 px-2.5 py-1.5 rounded-lg focus:outline-none focus:border-[#00a884] text-xs font-mono text-slate-800" placeholder="e.g. http://192.168.1.5:8000/" />
+                      </div>
+                      <button type="button" onClick={testLocalConnection} disabled={isTestingConnection} className="w-full bg-[#128c7e] hover:bg-[#075e54] text-white py-2 rounded-lg font-bold text-[10px] transition shadow-xs flex items-center justify-center space-x-1.5 cursor-pointer">
+                        <Activity className={`w-3.5 h-3.5 ${isTestingConnection ? "animate-spin" : ""}`} />
+                        <span>{isTestingConnection ? "Pinging Laptop..." : "Test Connection"}</span>
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="bg-white p-4 rounded-xl border border-slate-200/60 space-y-2.5 shadow-xs">
+                    <div className="flex items-center justify-between">
+                      <span className="text-xs font-bold text-slate-800 flex items-center uppercase tracking-wider"><Brain className="w-4 h-4 mr-1.5 text-amber-500" /> CoT Diagnostic Mode (primary key only)</span>
+                      <button type="button" onClick={() => setCotMode(!cotMode)} className={`relative inline-flex h-5 w-10 shrink-0 items-center rounded-full transition-colors cursor-pointer ${cotMode ? "bg-amber-500" : "bg-slate-300"}`}>
+                        <span className={`inline-block h-4 w-4 transform rounded-full bg-white shadow transition-transform ${cotMode ? "translate-x-5" : "translate-x-1"}`} />
+                      </button>
+                    </div>
+                    <p className="text-[10px] leading-relaxed text-slate-500">Sends messages to a special diagnostic endpoint that also returns the model's self-narrated reasoning before the reply. Takes several minutes per message. Requires the primary API key (guest keys are rejected server-side). The reasoning is a self-report, NOT verified to reflect the model's actual process.</p>
+                  </div>
+
+                  <div className="bg-white p-4 rounded-xl border border-slate-200/60 space-y-3.5 shadow-xs">
+                    <div className="flex justify-between items-center"><h4 className="text-xs font-bold text-slate-800 flex items-center uppercase tracking-wider"><Sparkles className="w-4 h-4 mr-1.5 text-[#00a884]" /> Customize Bot Identity</h4></div>
+                    <div className="space-y-2">
+                      <div className="flex items-center space-x-3.5">
+                        <div className="w-14 h-14 rounded-full bg-white shadow-inner border border-slate-200 flex items-center justify-center shrink-0 overflow-hidden">{renderAvatar(botConfig.avatar, "w-14 h-14")}</div>
+                        <div className="flex-1 space-y-1.5">
+                          <input type="file" accept="image/*" id="bot-profile-pic-uploader" className="hidden" onChange={handleAvatarUpload} />
+                          <label htmlFor="bot-profile-pic-uploader" className="inline-flex items-center space-x-1 px-3 py-1.5 bg-[#128c7e] hover:bg-[#075e54] text-white text-[10px] font-bold rounded-lg cursor-pointer transition shadow-xs"><Upload className="w-3.5 h-3.5" /><span>Upload Photo</span></label>
+                        </div>
+                      </div>
+                    </div>
+                    <div className="grid grid-cols-2 gap-3.5 pt-1.5">
+                      <input type="text" value={botConfig.name} onChange={(e) => setBotConfig((prev) => ({ ...prev, name: e.target.value }))} className="w-full bg-white border border-slate-200 px-2.5 py-1.5 rounded-lg text-xs" />
+                      <input type="text" value={botConfig.nickname} onChange={(e) => setBotConfig((prev) => ({ ...prev, nickname: e.target.value }))} className="w-full bg-white border border-slate-200 px-2.5 py-1.5 rounded-lg text-xs" />
+                    </div>
+                  </div>
+
+                  <div className="bg-white p-4 rounded-xl border border-slate-200/60 space-y-2.5 shadow-xs">
+                    <div className="flex justify-between items-center">
+                      <span className="text-xs font-bold text-slate-800 flex items-center uppercase tracking-wider"><Palette className="w-4 h-4 mr-1.5 text-emerald-500" /> Appearance & Themes</span>
+                      <button onClick={() => setShowWallpaperDrawer(!showWallpaperDrawer)} className="px-3 py-1 bg-slate-50 hover:bg-slate-100 text-slate-600 rounded-lg text-[10px] font-bold border border-slate-200">{showWallpaperDrawer ? "Close" : "Open Settings"}</button>
+                    </div>
+                    {showWallpaperDrawer && <div className="p-1 pt-3 border-t border-slate-100 animate-in slide-in-from-top-4 duration-200"><WallpaperSettings currentWallpaper={wallpaper} onWallpaperChange={(w) => setWallpaper(w)} showPatterns={showPatterns} onTogglePatterns={() => setShowPatterns(!showPatterns)} /></div>}
+                  </div>
+
+                  <div className="bg-white p-4 rounded-xl border border-slate-200/60 space-y-3 shadow-xs">
+                    <span className="text-xs font-bold text-slate-800 flex items-center uppercase tracking-wider"><Database className="w-4 h-4 mr-1.5 text-blue-500" /> Session Switcher</span>
+                    {previousSessions.length > 1 && (
+                      <div className="flex flex-wrap gap-1.5">{previousSessions.map(id => (<button key={id} onClick={() => switchSession(id)} className={`px-2 py-1 rounded text-[10px] font-mono border ${id === sessionId ? "bg-blue-50 border-blue-200 text-blue-600 font-bold" : "bg-slate-50 border-slate-100 text-slate-500"}`}>{id.replace("session-", "")}</button>))}</div>
+                    )}
+                    <div className="flex space-x-2 mt-2">
+                       <input ref={sessionInputRef} type="text" defaultValue={sessionId} onKeyDown={(e) => { if (e.key === "Enter") switchSession((e.target as HTMLInputElement).value); }} className="flex-1 bg-slate-50 border border-slate-200 px-2.5 py-1.5 rounded-lg text-xs font-mono" placeholder="Session name..." />
+                       <button onClick={() => switchSession(sessionInputRef.current?.value ?? "")} className="px-3 py-1.5 bg-blue-600 text-white rounded-lg text-[10px] font-bold uppercase">Switch</button>
+                    </div>
+                  </div>
+
+                  <div className="bg-white p-4 rounded-xl border border-slate-200/60 flex items-center justify-between shadow-xs">
+                    <button onClick={handleNewChat} className="w-full px-3 py-1.5 bg-emerald-50 hover:bg-emerald-100 text-emerald-600 border border-emerald-200 rounded-lg text-xs font-bold transition">New Chat</button>
+                  </div>
+                </div>
+              </>
+            ) : (
+              <>
+                <div className="bg-[#f0f2f5] px-4 py-3 flex items-center justify-between border-b border-slate-200 shrink-0">
+                  <div className="flex items-center space-x-2.5">
+                    <div className="w-10 h-10 rounded-full bg-[#128c7e] text-white flex items-center justify-center font-bold text-lg shadow-sm shrink-0">{userName[0].toUpperCase()}</div>
+                    <h2 onClick={() => setIsEditingName(true)} className="text-xs font-bold text-slate-800 cursor-pointer">{userName}</h2>
+                  </div>
+                  <div className="flex items-center space-x-1">
+                    <button onClick={() => setShowSearchBar((s) => !s)} className={`p-1.5 rounded-full transition cursor-pointer ${showSearchBar ? "bg-emerald-100 text-emerald-700" : "hover:bg-slate-200/70 text-slate-700"}`}><Search className="w-5 h-5" /></button>
+                    <button onClick={() => setShowSettings(true)} className="p-1.5 rounded-full hover:bg-slate-200/70 transition cursor-pointer text-slate-700"><Settings className="w-5 h-5" /></button>
+                  </div>
+                </div>
+                {showSearchBar && (
+                  <div className="px-3 py-2 border-b border-slate-200 bg-white">
+                    <div className="flex items-center bg-[#f0f2f5] rounded-lg px-3 py-1.5">
+                      <Search className="w-4 h-4 text-slate-400 shrink-0" />
+                      <input
+                        autoFocus
+                        type="text"
+                        value={searchQuery}
+                        onChange={(e) => setSearchQuery(e.target.value)}
+                        placeholder="Search messages..."
+                        className="w-full bg-transparent px-2 text-xs focus:outline-none"
+                      />
+                      {searchQuery && (
+                        <button onClick={() => setSearchQuery("")} className="text-slate-400 shrink-0"><X className="w-4 h-4" /></button>
+                      )}
+                    </div>
+                  </div>
+                )}
+                <div className="flex-1 overflow-y-auto bg-white select-none">
+                  <div className="text-[11px] text-slate-400 px-4 pt-3 pb-1 uppercase font-bold tracking-wider">Conversations</div>
+                  <div onClick={() => setIsMobileSidebarOpen(false)} className="flex items-center space-x-3.5 px-4 py-3.5 hover:bg-[#f0f2f5] transition bg-emerald-50/10 border-b border-slate-150/60 cursor-pointer">
+                    {renderAvatar(botConfig.avatar, "w-12 h-12")}
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center justify-between"><h4 className="font-bold text-sm text-slate-800 truncate">{botConfig.name}</h4><span className="text-[10px] text-slate-400 font-medium">{messages.length > 0 ? formatMessageTime(messages[messages.length - 1].timestamp) : "Now"}</span></div>
+                      <p className="text-[11.5px] text-slate-500 truncate flex items-center">{messages.length > 0 && messages[messages.length - 1].sender === "user" && <CheckCheck className="w-3.5 h-3.5 mr-1 text-sky-500" />}{messages.length > 0 ? messages[messages.length - 1].text : "No messages yet"}</p>
+                    </div>
+                  </div>
+                </div>
+              </>
+            )}
+            <div className="p-3 bg-[#f0f2f5] border-t border-slate-200 text-center text-[10px] text-slate-400 font-mono flex items-center justify-center space-x-1 shrink-0"><Globe className="w-3 h-3 text-[#128c7e]" /><span>Local network connection.</span></div>
+          </div>
+
+          {/* 2. MAIN CHAT AREA */}
+          <div className={`flex-1 flex flex-col relative min-w-0 ${isMobileSidebarOpen ? "hidden md:flex" : "flex w-full"}`}>
+
+            {/* HEADER */}
+            <div className="sticky top-0 bg-[#f0f2f5]/95 backdrop-blur-md px-3 py-2 flex items-center justify-between border-b border-slate-200 shadow-sm shrink-0 z-50 w-full h-[60px]">
+              <div className="flex items-center space-x-3 min-w-0">
+                <button onClick={() => setIsMobileSidebarOpen(true)} className="p-1.5 hover:bg-slate-200 rounded-md transition shrink-0"><Menu className="w-6 h-6 text-slate-600" /></button>
+                <div className="shrink-0">{renderAvatar(botConfig.avatar, "w-10 h-10")}</div>
+                <div className="min-w-0 leading-tight">
+                  <h3 className="font-bold text-[16px] text-slate-800 truncate leading-none mb-0.5">{botConfig.name}</h3>
+                  <p className={`text-[10.5px] flex items-center font-medium truncate ${isConnected ? "text-[#00a884]" : "text-rose-500"}`}>
+                    <span className={`w-1.5 h-1.5 rounded-full mr-2 shrink-0 ${isConnected ? "bg-emerald-500" : "bg-rose-500"}`}></span>
+                    <span className="truncate">{isConnected ? `LAN: ${fastApiBaseUrl}` : "Offline (Queueing locally)"}</span>
+                  </p>
+                </div>
+              </div>
+              <button onClick={() => setShowChatWallpaperDrawer(!showChatWallpaperDrawer)} className={`p-2 rounded-full transition ${showChatWallpaperDrawer ? "bg-emerald-100 text-[#128c7e]" : "text-[#128c7e] hover:bg-slate-200"}`}><Palette className="w-5 h-5" /></button>
+            </div>
+
+            {cotMode && (
+              <div className="bg-amber-100 border-b border-amber-300 text-amber-800 text-[11px] font-semibold px-3 py-1.5 flex items-center justify-center space-x-2">
+                <Brain className="w-3.5 h-3.5 shrink-0" />
+                <span className="text-center">CoT diagnostic mode — reasoning is a self-report; replies may take several minutes</span>
+              </div>
+            )}
+
+            {showChatWallpaperDrawer && (
+              <div className="fixed top-[60px] left-0 right-0 md:absolute md:left-0 md:right-0 bg-[#f0f2f5] border-b border-slate-200 p-4 z-30 shadow-md max-h-[360px] overflow-y-auto">
+                <div className="flex justify-between items-center mb-3"><h4 className="text-xs font-bold text-slate-700 uppercase flex items-center"><Palette className="w-4 h-4 mr-1.5 text-emerald-600" /> Wallpaper Settings</h4><button onClick={() => setShowChatWallpaperDrawer(false)} className="text-xs text-rose-500 font-bold px-2 py-1">✕ Close</button></div>
+                <WallpaperSettings currentWallpaper={wallpaper} onWallpaperChange={(w) => setWallpaper(w)} showPatterns={showPatterns} onTogglePatterns={() => setShowPatterns(!showPatterns)} />
+              </div>
+            )}
+
+            {/* FLOW AREA */}
+            <div className="flex-1 flex flex-col space-y-4 px-3 py-4 z-10">
+              <div className="bg-[#ffe596]/70 backdrop-blur-xs text-[#6b5300] p-2 px-3.5 rounded-lg text-[11px] shadow-xs flex items-center justify-center space-x-2 border border-[#ffe596]/40 max-w-xs mx-auto mb-2"><Globe className="w-3.5 h-3.5 shrink-0" /><span className="font-semibold text-center select-none">Private — stays on your local network</span></div>
+              {transcriptItems.map((item, idx) => {
+                const itemTs = item.kind === "msg" ? item.msg.timestamp : item.entry.timestamp;
+                const prevItem = idx > 0 ? transcriptItems[idx - 1] : null;
+                const prevTs = prevItem ? (prevItem.kind === "msg" ? prevItem.msg.timestamp : prevItem.entry.timestamp) : null;
+                const showDateDivider = prevTs === null || !isSameDay(prevTs, itemTs);
+                return (
+                  <React.Fragment key={item.kind === "msg" ? item.msg.id : item.entry.id}>
+                    {showDateDivider && (
+                      <div className="sticky top-[60px] z-40 flex justify-center py-4 pointer-events-none">
+                        <span className="bg-[#e1f3fc] text-[#025179] text-[10px] font-bold px-4 py-1 rounded-full uppercase tracking-widest select-none pointer-events-auto border border-sky-100 shadow-none">
+                          {formatHeaderDate(itemTs)}
+                        </span>
+                      </div>
+                    )}
+                    {item.kind === "msg" ? renderMessage(item.msg) : renderCoTEntry(item.entry)}
+                  </React.Fragment>
+                );
+              })}
+              {isTyping && (
+                <div className="flex items-start">
+                  <div className="bg-white rounded-2xl rounded-tl-none px-4 py-3 shadow-sm flex items-center space-x-1">
+                    <span className="w-1.5 h-1.5 rounded-full bg-slate-400 animate-bounce [animation-delay:-0.3s]" />
+                    <span className="w-1.5 h-1.5 rounded-full bg-slate-400 animate-bounce [animation-delay:-0.15s]" />
+                    <span className="w-1.5 h-1.5 rounded-full bg-slate-400 animate-bounce" />
+                  </div>
+                </div>
+              )}
+              <div ref={chatEndRef} className="h-4" />
+            </div>
+
+            {/* INPUT BAR */}
+            <div className="sticky bottom-0 z-40 w-full bg-[#f0f2f5] border-t border-slate-200 flex flex-col pb-4 md:pb-3">
+              {replyingTo && (
+                <div className="mx-3 mt-2 mb-1 bg-white p-2 px-3 rounded-lg border-l-4 border-emerald-600 flex justify-between shadow-sm">
+                  <div className="min-w-0 flex-1">
+                    <span className="block text-[10px] font-bold text-emerald-600 uppercase">Replying to {replyingTo.sender === "user" ? "You" : botConfig.name}</span>
+                    <p className="text-xs text-slate-600 truncate">{replyingTo.text}</p>
+                  </div>
+                  <button onClick={() => setReplyingTo(null)} className="p-1 text-slate-400"><X className="w-4 h-4" /></button>
+                </div>
+              )}
+
+              {attachedFiles.length > 0 && (
+                <div className="mx-3 mt-2 flex gap-2 overflow-x-auto p-2 bg-white rounded-lg border border-slate-200 shadow-sm">
+                  {attachedFiles.map(f => (
+                    <div key={f.id} className="relative shrink-0">
+                      <div className="w-12 h-12 rounded border bg-slate-50 flex items-center justify-center overflow-hidden">
+                        {f.type === "image" ? <img src={f.url} className="object-cover w-full h-full" /> : <FileText className="w-6 h-6 text-emerald-600" />}
+                      </div>
+                      <button onClick={() => setAttachedFiles(prev => prev.filter(af => af.id !== f.id))} className="absolute -top-1 -right-1 bg-rose-500 text-white rounded-full p-0.5 shadow-sm"><X className="w-3 h-3" /></button>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              <form onSubmit={cotMode ? handleSendCoT : handleSendMessage} className="px-3 py-2 flex items-center space-x-2">
+                <button type="button" onClick={() => fileInputRef.current?.click()} className="p-1.5 hover:bg-slate-200 rounded-full transition text-[#128c7e] shrink-0">
+                  <Plus className="w-6 h-6" />
+                </button>
+                <input type="file" ref={fileInputRef} className="hidden" accept="image/*,.pdf,.txt" multiple onChange={handleFileChange} />
+
+                <div className="flex-1 bg-white rounded-xl px-4 py-2 shadow-sm border border-slate-200 flex items-center">
+                  <input
+                    type="text"
+                    value={inputText}
+                    onChange={(e) => setInputText(e.target.value)}
+                    placeholder="Type a message..."
+                    className="w-full text-sm text-[#111b21] bg-transparent focus:outline-none placeholder:text-slate-400"
+                  />
+                </div>
+
+                <button
+                  type="submit"
+                  disabled={(!inputText.trim() && attachedFiles.length === 0) || (cotMode && isCoTLoading)}
+                  className={`p-2.5 rounded-xl flex items-center justify-center text-white shrink-0 transition-all ${ (inputText.trim() || attachedFiles.length > 0) ? "bg-[#00a884] shadow-md active:scale-95" : "bg-gray-300 opacity-60" }`}
+                >
+                  <Send className="w-5 h-5" />
+                </button>
+              </form>
+            </div>
+          </div>
+
+          {showInspectorPanel && (
+            <div className="w-[360px] border-l border-slate-200 bg-slate-950 shrink-0 hidden lg:flex flex-col h-full z-20">
+              <AIEngineInspector logs={logs} payloadData={activePayload} localConfig={{ endpoint: fastApiBaseUrl, model: "FastAPI" }} testLocalConnection={testLocalConnection} />
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* ATTACHMENT / DOCUMENT VIEWER MODAL */}
+      {viewingDocument && (
+        <div
+          className="fixed inset-0 z-[100] bg-black/80 flex items-center justify-center p-4"
+          onClick={() => setViewingDocument(null)}
+        >
+          <div
+            className="bg-white rounded-xl max-w-2xl w-full max-h-[85vh] overflow-y-auto shadow-2xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between p-3 border-b border-slate-200 sticky top-0 bg-white">
+              <span className="text-sm font-bold text-slate-800 truncate pr-2">{viewingDocument.name}</span>
+              <button onClick={() => setViewingDocument(null)} className="p-1.5 rounded-full hover:bg-slate-100 shrink-0">
+                <X className="w-5 h-5 text-slate-500" />
+              </button>
+            </div>
+            <div className="p-4">
+              {viewingDocument.type === "image" ? (
+                <img src={viewingDocument.url || viewingDocument.base64} className="w-full h-auto rounded-lg" />
+              ) : (
+                <pre className="text-xs whitespace-pre-wrap text-slate-700 font-mono">
+                  {viewingDocument.textContents || "No preview available for this file."}
+                </pre>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
