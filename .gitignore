@@ -27,6 +27,12 @@ convert_adapter_to_fp32.py
 test_npu_lora_smoke.py
 conversation_export.py
 
+# runtime databases & logs
+ot.db
+*.db
+context_sufficiency_log.jsonl
+context_sufficiency_log.jsonl*
+
 # files that carry live API keys — never commit
 chat.html
 chat-guest.html
