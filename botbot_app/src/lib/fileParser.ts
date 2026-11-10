@@ -4,75 +4,16 @@
  */
 
 /**
- * Extracts printable ASCII / UTF-8 text from raw PDF ArrayBuffer streams.
- * This is a lightweight, pure-JS client-side PDF parser that reads stream structures.
+ * Safely inspects or marks PDF ArrayBuffers without blocking the UI thread or regex-scanning binary streams.
+ * Full PDF text extraction is processed server-side via pypdf/pdfplumber in media.py.
  */
-export function extractTextFromPDF(arrayBuffer: ArrayBuffer): string {
+export function extractTextFromPDF(arrayBuffer: ArrayBuffer, fileName: string = "document.pdf"): string {
   try {
-    const uint8 = new Uint8Array(arrayBuffer);
-    let binary = "";
-    
-    // Read up to 1MB of the file to keep performance high
-    const length = Math.min(uint8.length, 1000000);
-    for (let i = 0; i < length; i++) {
-      binary += String.fromCharCode(uint8[i]);
-    }
-    
-    // Find text objects inside stream segments
-    const streams = binary.match(/stream[\s\S]*?endstream/g) || [];
-    let extractedText = "";
-    
-    for (const stream of streams) {
-      // Find segments wrapped in parentheses which represent PDF strings: (String Text)
-      const matches = stream.match(/\(([^)]+)\)/g);
-      if (matches) {
-        for (const match of matches) {
-          const clean = match.slice(1, -1)
-            .replace(/\\([\s\S])/g, "$1") // unescape PDF control slashes
-            .trim();
-          
-          // Filter out PDF internal names, fonts, or garbage non-text streams
-          if (
-            clean.length > 1 && 
-            !clean.startsWith("/") && 
-            !/^[a-zA-Z0-9]{30,}$/.test(clean) &&
-            !clean.includes("font") &&
-            !clean.includes("Adobe")
-          ) {
-            extractedText += clean + " ";
-          }
-        }
-      }
-    }
-    
-    // Fallback search if stream-matching failed (e.g., uncompressed flat PDFs)
-    if (extractedText.trim().length < 15) {
-      const allMatches = binary.match(/\(([^)]+)\)/g) || [];
-      let count = 0;
-      for (const match of allMatches) {
-        const clean = match.slice(1, -1).trim();
-        if (
-          clean.length > 2 && 
-          !clean.startsWith("/") && 
-          !/^[a-zA-Z0-9]{30,}$/.test(clean) &&
-          !clean.includes("font") && 
-          !clean.includes("Widths") &&
-          count < 1500
-        ) {
-          extractedText += clean + " ";
-          count++;
-        }
-      }
-    }
-    
-    // Clean up double spaces, control characters, and return
-    return extractedText
-      .replace(/[\r\n\t]+/g, " ")
-      .replace(/\s+/g, " ")
-      .trim();
+    const size = arrayBuffer ? arrayBuffer.byteLength : 0;
+    return `[PDF attached: ${fileName} (${formatBytes(size)}) - text extraction is handled server-side]`;
   } catch (err) {
-    console.error("Error in PDF client parser:", err);
-    return "";
+    console.error("Error inspecting PDF attachment:", err);
+    return `[PDF attached: ${fileName}]`;
   }
 }
 

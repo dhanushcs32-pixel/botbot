@@ -32,8 +32,6 @@ import { LocalNotifications } from '@capacitor/local-notifications';
 import { App as CapApp } from '@capacitor/app';
 import { Clipboard } from '@capacitor/clipboard';
 
-const FASTAPI_API_KEY = "UhJDtCW-f_zPH_A6zg_hbTGFt2qXJYiV1OzwrAEGtgg";
-
 // --- CoT diagnostic mode (separate one-shot REST path; NOT the websocket pipeline) ---
 interface CoTEntry {
   id: string;
@@ -167,6 +165,10 @@ export default function App() {
 
   const [fastApiBaseUrl, setFastApiBaseUrl] = useState<string>(() => {
     return localStorage.getItem("whatsapp_fastapi_base_url") || "";
+  });
+
+  const [fastApiKey, setFastApiKey] = useState<string>(() => {
+    return localStorage.getItem("whatsapp_fastapi_key") || (import.meta as any).env?.VITE_API_KEY || "";
   });
 
   const [sessionId, setSessionId] = useState<string>(() => {
@@ -389,7 +391,7 @@ export default function App() {
         const ticketRes = await fetch(`${base}/ws/ticket`, {
           method: "POST",
           headers: {
-            "X-API-Key": FASTAPI_API_KEY,
+            "X-API-Key": fastApiKey,
             "Content-Type": "application/json",
           },
           body: JSON.stringify({ session_id: sessionId }),
@@ -402,7 +404,7 @@ export default function App() {
         const { ticket } = await ticketRes.json();
         if (cancelled) return;
 
-        const wsUrl = base.replace("http", "ws") + `/ws/chat?ticket=${ticket}&session_id=${sessionId}`;
+        const wsUrl = base.replace(/^https:\/\//i, "wss://").replace(/^http:\/\//i, "ws://") + `/ws/chat?ticket=${ticket}&session_id=${sessionId}`;
         addLog(`Connecting: ${wsUrl}`, "info");
 
         const socket = new WebSocket(wsUrl);
@@ -616,6 +618,10 @@ export default function App() {
   }, [fastApiBaseUrl]);
 
   useEffect(() => {
+    localStorage.setItem("whatsapp_fastapi_key", fastApiKey);
+  }, [fastApiKey]);
+
+  useEffect(() => {
     localStorage.setItem("whatsapp_ai_wallpaper", JSON.stringify(wallpaper));
   }, [wallpaper]);
 
@@ -704,7 +710,7 @@ export default function App() {
           textContents = result;
         } else if (type === "pdf") {
           const arrayBuffer = await file.arrayBuffer();
-          textContents = await Promise.resolve(extractTextFromPDF(arrayBuffer));
+          textContents = await Promise.resolve(extractTextFromPDF(arrayBuffer, file.name));
         }
 
         const newAttachment: Attachment = {
@@ -742,7 +748,7 @@ export default function App() {
         method: "GET",
         mode: "cors",
         headers: {
-          "X-API-Key": FASTAPI_API_KEY
+          "X-API-Key": fastApiKey
         }
       });
       setIsTestingConnection(false);
@@ -882,7 +888,7 @@ export default function App() {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
-            "X-API-Key": FASTAPI_API_KEY,
+            "X-API-Key": fastApiKey,
             "X-CoT-Activate": "diagnostic-replay",
           },
           body: JSON.stringify({ message: text, session_id: sessionId }),
@@ -1154,6 +1160,10 @@ export default function App() {
                       <div>
                         <label className="block text-[10px] text-slate-500 font-bold mb-1 uppercase tracking-tight">Laptop Base URL</label>
                         <input type="text" value={fastApiBaseUrl} onChange={(e) => setFastApiBaseUrl(e.target.value)} className="w-full bg-white border border-slate-200 px-2.5 py-1.5 rounded-lg focus:outline-none focus:border-[#00a884] text-xs font-mono text-slate-800" placeholder="e.g. http://192.168.1.5:8000/" />
+                      </div>
+                      <div>
+                        <label className="block text-[10px] text-slate-500 font-bold mb-1 uppercase tracking-tight">API Key (X-API-Key)</label>
+                        <input type="password" value={fastApiKey} onChange={(e) => setFastApiKey(e.target.value)} className="w-full bg-white border border-slate-200 px-2.5 py-1.5 rounded-lg focus:outline-none focus:border-[#00a884] text-xs font-mono text-slate-800" placeholder="Enter X-API-Key from secret_key.py" />
                       </div>
                       <button type="button" onClick={testLocalConnection} disabled={isTestingConnection} className="w-full bg-[#128c7e] hover:bg-[#075e54] text-white py-2 rounded-lg font-bold text-[10px] transition shadow-xs flex items-center justify-center space-x-1.5 cursor-pointer">
                         <Activity className={`w-3.5 h-3.5 ${isTestingConnection ? "animate-spin" : ""}`} />

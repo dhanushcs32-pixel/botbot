@@ -59,8 +59,15 @@ WHATSAPP_LINE_PATTERN = re.compile(
 _embedding_fn = None
 _collection = None
 _reference_collection = None
+_chroma_client = None
 
-client = chromadb.PersistentClient(path=str(CHROMA_STORE_DIR))
+
+def get_chroma_client():
+    global _chroma_client
+    if _chroma_client is None:
+        _chroma_client = chromadb.PersistentClient(path=str(CHROMA_STORE_DIR))
+    return _chroma_client
+
 
 def get_embedding_fn():
     global _embedding_fn
@@ -71,19 +78,21 @@ def get_embedding_fn():
         )
     return _embedding_fn
 
+
 def get_collection():
     global _collection
     if _collection is None:
-        _collection = client.get_or_create_collection(
+        _collection = get_chroma_client().get_or_create_collection(
             name="personal_data",
             embedding_function=get_embedding_fn()
         )
     return _collection
 
+
 def get_reference_collection():
     global _reference_collection
     if _reference_collection is None:
-        _reference_collection = client.get_or_create_collection(
+        _reference_collection = get_chroma_client().get_or_create_collection(
             name="reference_data",
             embedding_function=get_embedding_fn()
         )

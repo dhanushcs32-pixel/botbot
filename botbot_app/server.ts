@@ -309,18 +309,30 @@ async function startServer() {
           }
 
           case "clear_history": {
+            const adminToken = process.env.ADMIN_TOKEN;
+            if (!adminToken || payload.adminToken !== adminToken) {
+              console.warn("Unauthorized attempt to clear history");
+              ws.send(JSON.stringify({ type: "error", error: "Unauthorized: valid adminToken required" }));
+              break;
+            }
             messages = [];
-            console.log("Cleared message history");
+            console.log("Cleared message history by authenticated admin");
             broadcast({ type: "history", messages: [] });
             break;
           }
 
           case "reset_keys": {
+            const adminToken = process.env.ADMIN_TOKEN;
+            if (!adminToken || payload.adminToken !== adminToken) {
+              console.warn("Unauthorized attempt to reset keys");
+              ws.send(JSON.stringify({ type: "error", error: "Unauthorized: valid adminToken required" }));
+              break;
+            }
             registeredUsers.set("alice", { publicKey: null, online: false });
             registeredUsers.set("bob", { publicKey: null, online: false });
             activeSessions.clear();
             messages = [];
-            console.log("Reset all keys and history");
+            console.log("Reset all keys and history by authenticated admin");
             broadcast(getPresenceData());
             broadcast({ type: "history", messages: [] });
             break;

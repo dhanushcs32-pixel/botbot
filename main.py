@@ -279,20 +279,20 @@ app = FastAPI(title="Bot Bot Backend")
 
 app.add_middleware(
     CORSMiddleware,
-    # Honest origin allowlist for browser-based clients (e.g. chat.html
-    # served from localhost) AND the Capacitor app's WebView origins
-    # (capacitor://localhost on Android, https://localhost on iOS) — added
-    # 2026-09-01 after a preflight probe showed /chat/cot (custom
-    # X-CoT-Activate header) failing CORS for every app origin. Native app
-    # traffic over Tailscale doesn't use CORS; X-API-Key remains the gate.
-    # Extend this list if a browser client moves to a different origin.
+    # Honest origin allowlist for browser-based clients (e.g. chat.html,
+    # botbot_app running on :3000) AND the Capacitor app's WebView origins
+    # (capacitor://localhost on Android, https://localhost on iOS), plus
+    # Cloudflare Tunnels and LAN/Tailscale mobile connections via regex.
     allow_origins=[
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
         "http://localhost:8000",
         "http://127.0.0.1:8000",
         "capacitor://localhost",
         "https://localhost",
         "http://localhost",
     ],
+    allow_origin_regex=r"^(https://.*\.trycloudflare\.com|http://(192\.168|10\.|100\.)\d+\.\d+(:\d+)?)$",
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -300,9 +300,13 @@ app.add_middleware(
 
 NPU_SERVER_URL = "http://127.0.0.1:11435/api/chat"
 MODEL_NAME = "botbot"
+NPU_COOLDOWN_SEC = float(os.environ.get("NPU_COOLDOWN_SEC", "0.0"))
+npu_lock = asyncio.Lock()
+_last_npu_release: float | None = None
 
 
 async def _call_npu_once(messages: list, num_predict: int = 250) -> str:
+    global _last_npu_release
     # num_predict defaults to 250 — the normal chat path's value. The CoT
     # diagnostic endpoint passes a larger budget; with the default, the
     # request body is byte-for-byte what the normal path has always sent.
@@ -312,24 +316,33 @@ async def _call_npu_once(messages: list, num_predict: int = 250) -> str:
     timeout_s = 240 if num_predict <= 300 else 900
     try:
         async with npu_lock:
-            async with httpx.AsyncClient(timeout=timeout_s) as client:
-                response = await client.post(
-                    NPU_SERVER_URL,
-                    json={
-                        "model": MODEL_NAME,
-                        "messages": messages,
-                        "stream": False,
-                        "options": {
-                            "num_predict": num_predict,
-                            "temperature": 0.6,
-                            "top_p": 0.85,
-                            "repeat_penalty": 1.05
+            if NPU_COOLDOWN_SEC > 0 and _last_npu_release is not None:
+                elapsed = time.monotonic() - _last_npu_release
+                remaining = NPU_COOLDOWN_SEC - elapsed
+                if remaining > 0:
+                    print(f"[npu_throttle] cooling down {remaining:.1f}s before next call")
+                    await asyncio.sleep(remaining)
+            try:
+                async with httpx.AsyncClient(timeout=timeout_s) as client:
+                    response = await client.post(
+                        NPU_SERVER_URL,
+                        json={
+                            "model": MODEL_NAME,
+                            "messages": messages,
+                            "stream": False,
+                            "options": {
+                                "num_predict": num_predict,
+                                "temperature": 0.6,
+                                "top_p": 0.85,
+                                "repeat_penalty": 1.05
+                            }
                         }
-                    }
-                )
-                response.raise_for_status()
-                data = response.json()
-                return data["message"]["content"]
+                    )
+                    response.raise_for_status()
+                    data = response.json()
+                    return data["message"]["content"]
+            finally:
+                _last_npu_release = time.monotonic()
     except (httpx.HTTPStatusError, httpx.TimeoutException, httpx.TransportError) as e:
         print(f"[generate_reply] npu_server call failed: {e}")
         raise HTTPException(
@@ -338,35 +351,9 @@ async def _call_npu_once(messages: list, num_predict: int = 250) -> str:
         )
 
 
-NPU_MIN_GAP_SECONDS = 5.0
-
-
-class NPUThrottle:
-    def __init__(self, min_gap_seconds: float = NPU_MIN_GAP_SECONDS):
-        self._lock = asyncio.Lock()
-        self._min_gap = min_gap_seconds
-        self._last_release: float | None = None
-
-    async def __aenter__(self):
-        await self._lock.acquire()
-        if self._last_release is not None:
-            elapsed = time.monotonic() - self._last_release
-            remaining = self._min_gap - elapsed
-            if remaining > 0:
-                print(f"[npu_throttle] cooling down {remaining:.1f}s before next call")
-                await asyncio.sleep(remaining)
-        return self
-
-    async def __aexit__(self, exc_type, exc, tb):
-        self._last_release = time.monotonic()
-        self._lock.release()
-        return False
-
-
-npu_lock = NPUThrottle()
-
 active_connections: Dict[str, WebSocket] = {}
 pending_messages: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+_session_locks: Dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
 PENDING_MSG_CAP = 200  # per-session cap; oldest pushed messages are dropped past this
 
 WS_TICKET_TTL_SECONDS = 30
@@ -1442,28 +1429,31 @@ async def issue_ws_ticket(payload: TicketRequest, key_info: dict = Depends(verif
 
 
 async def _process_ws_chat_message(session_id: str, prompt_message: str, history_message: str, msg_id: str = None):
-    try:
-        bot_reply, mode = await generate_reply(session_id, prompt_message, history_message=history_message)
-        # By the time generate_reply() has returned, save_turn() has already
-        # completed inside it — the user's turn (and the bot's reply) are
-        # durably persisted. Tell the client explicitly, separate from the
-        # earlier parse-time `ack`, so "delivered" and "durably stored" are
-        # two distinct, honest signals instead of one conflated one.
-        if msg_id:
-            ws = active_connections.get(session_id)
-            if ws:
-                try:
-                    await ws.send_json({"type": "stored", "id": msg_id})
-                except Exception as e:
-                    print(f"[ws] failed to send 'stored' confirmation for {msg_id} in session '{session_id}': {e}")
-        await push_message_to_session(session_id, bot_reply, mode=mode)
-    except Exception as e:
-        print(f"[ws] reply generation error in session '{session_id}': {e}")
-        await push_message_to_session(
-            session_id,
-            "⚠️ An error occurred processing your request.",
-            mode="error"
-        )
+    # Serialize message turns strictly per session so rapid incoming messages
+    # never race to build prompts before earlier turns are durably saved.
+    async with _session_locks[session_id]:
+        try:
+            bot_reply, mode = await generate_reply(session_id, prompt_message, history_message=history_message)
+            # By the time generate_reply() has returned, save_turn() has already
+            # completed inside it — the user's turn (and the bot's reply) are
+            # durably persisted. Tell the client explicitly, separate from the
+            # earlier parse-time `ack`, so "delivered" and "durably stored" are
+            # two distinct, honest signals instead of one conflated one.
+            if msg_id:
+                ws = active_connections.get(session_id)
+                if ws:
+                    try:
+                        await ws.send_json({"type": "stored", "id": msg_id})
+                    except Exception as e:
+                        print(f"[ws] failed to send 'stored' confirmation for {msg_id} in session '{session_id}': {e}")
+            await push_message_to_session(session_id, bot_reply, mode=mode)
+        except Exception as e:
+            print(f"[ws] reply generation error in session '{session_id}': {e}")
+            await push_message_to_session(
+                session_id,
+                "⚠️ An error occurred processing your request.",
+                mode="error"
+            )
 
 
 @app.websocket("/ws/chat")
