@@ -57,6 +57,7 @@ confirmed success, exactly as before.
 """
 
 import time
+import datetime as _dt
 from typing import Callable, Awaitable, Dict, Optional, Tuple
 
 from memory import get_recent_history, is_test_session, get_sessions_with_last_activity
@@ -228,6 +229,12 @@ async def _ask_model_for_followup(
     return scrub(raw_reply, session_id)
 
 
+def _is_quiet_hours(now_ts: Optional[float] = None) -> bool:
+    """True between 23:00 (11 PM) and 08:00 (8 AM) in local time."""
+    local_hour = _dt.datetime.fromtimestamp(now_ts or time.time()).hour
+    return local_hour >= 23 or local_hour < 8
+
+
 async def check_and_send_followups(
     push_fn: PushFn,
     active_connections: Dict[str, object],
@@ -262,7 +269,16 @@ async def check_and_send_followups(
     _prune_followup_state(active_connections, keep_session_id=session_id)
 
     now = time.time()
+
+    # Enforce quiet hours: 11:00 PM to 8:00 AM local time
+    if _is_quiet_hours(now):
+        return
+
     state = _get_or_reset_state(session_id, last_active, now)
+
+    # Cap at 1 unanswered proactive followup per session: do not spam the user
+    if state["stage"] >= 1:
+        return
 
     delay = _required_delay_seconds(state)
     if now - state["last_event_at"] < delay:
@@ -287,6 +303,9 @@ async def check_and_send_followups(
         return
 
     if not message:
+        # Avoid tight infinite loop every 60s when generation/scrub returns empty
+        state["last_event_at"] = now
+        _log(f"[followup] generated empty reply for '{session_id}', advancing event window")
         return
 
     try:

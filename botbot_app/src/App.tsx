@@ -152,36 +152,84 @@ const DEFAULT_BOT_CONFIG: BotIdentityConfig = {
 
 const INITIAL_MESSAGES: ChatMessage[] = [];
 
+function safeGetItem(key: string): string | null {
+  try {
+    return localStorage.getItem(key);
+  } catch (e) {
+    console.warn(`[storage] Failed to get ${key}:`, e);
+    return null;
+  }
+}
+
+function safeSetItem(key: string, value: string): void {
+  try {
+    localStorage.setItem(key, value);
+  } catch (e) {
+    console.warn(`[storage] Failed to set ${key} (quota exceeded?):`, e);
+  }
+}
+
+function sanitizeMessagesForStorage(msgs: ChatMessage[]): any[] {
+  // Cap at last 100 messages and strip bulky base64 data to protect localStorage quota
+  return msgs.slice(-100).map((m) => {
+    if (!m.attachments || m.attachments.length === 0) return m;
+    const sanitizedAtts = m.attachments.map((att: any) => {
+      const { base64, url, ...rest } = att;
+      return rest;
+    });
+    return { ...m, attachments: sanitizedAtts };
+  });
+}
+
+function saveMessagesToStorage(msgs: ChatMessage[]) {
+  safeSetItem("whatsapp_single_bot_messages", JSON.stringify(sanitizeMessagesForStorage(msgs)));
+}
+
 export default function App() {
   const [botConfig, setBotConfig] = useState<BotIdentityConfig>(() => {
-    const saved = localStorage.getItem("whatsapp_single_bot_config");
-    return saved ? JSON.parse(saved) : DEFAULT_BOT_CONFIG;
+    const saved = safeGetItem("whatsapp_single_bot_config");
+    if (!saved) return DEFAULT_BOT_CONFIG;
+    try {
+      return JSON.parse(saved);
+    } catch {
+      return DEFAULT_BOT_CONFIG;
+    }
   });
 
   const [messages, setMessages] = useState<ChatMessage[]>(() => {
-    const saved = localStorage.getItem("whatsapp_single_bot_messages");
-    return saved ? JSON.parse(saved) : INITIAL_MESSAGES;
+    const saved = safeGetItem("whatsapp_single_bot_messages");
+    if (!saved) return INITIAL_MESSAGES;
+    try {
+      return JSON.parse(saved);
+    } catch {
+      return INITIAL_MESSAGES;
+    }
   });
 
   const [fastApiBaseUrl, setFastApiBaseUrl] = useState<string>(() => {
-    return localStorage.getItem("whatsapp_fastapi_base_url") || "";
+    return safeGetItem("whatsapp_fastapi_base_url") || "";
   });
 
   const [fastApiKey, setFastApiKey] = useState<string>(() => {
-    return localStorage.getItem("whatsapp_fastapi_key") || (import.meta as any).env?.VITE_API_KEY || "";
+    return safeGetItem("whatsapp_fastapi_key") || (import.meta as any).env?.VITE_API_KEY || "";
   });
 
   const [sessionId, setSessionId] = useState<string>(() => {
-    const saved = localStorage.getItem("whatsapp_fastapi_session_id");
+    const saved = safeGetItem("whatsapp_fastapi_session_id");
     if (saved) return saved;
     const newId = "session-" + Math.random().toString(36).substring(2, 11);
-    localStorage.setItem("whatsapp_fastapi_session_id", newId);
+    safeSetItem("whatsapp_fastapi_session_id", newId);
     return newId;
   });
 
   const [previousSessions, setPreviousSessions] = useState<string[]>(() => {
-    const saved = localStorage.getItem("whatsapp_fastapi_previous_sessions");
-    return saved ? JSON.parse(saved) : [];
+    const saved = safeGetItem("whatsapp_fastapi_previous_sessions");
+    if (!saved) return [];
+    try {
+      return JSON.parse(saved);
+    } catch {
+      return [];
+    }
   });
 
   useEffect(() => {
@@ -189,7 +237,7 @@ export default function App() {
       setPreviousSessions(prev => {
         if (prev.includes(sessionId)) return prev;
         const next = [sessionId, ...prev].slice(0, 10);
-        localStorage.setItem("whatsapp_fastapi_previous_sessions", JSON.stringify(next));
+        safeSetItem("whatsapp_fastapi_previous_sessions", JSON.stringify(next));
         return next;
       });
     }
@@ -199,7 +247,7 @@ export default function App() {
     const trimmed = id.trim();
     if (!trimmed || trimmed === sessionId) return;
     setSessionId(trimmed);
-    localStorage.setItem("whatsapp_fastapi_session_id", trimmed);
+    safeSetItem("whatsapp_fastapi_session_id", trimmed);
     setMessages([]);
     setCoTEntries([]);
     setIsTyping(false);
@@ -208,13 +256,23 @@ export default function App() {
   };
 
   const [wallpaper, setWallpaper] = useState<WallpaperConfig>(() => {
-    const saved = localStorage.getItem("whatsapp_ai_wallpaper");
-    return saved ? JSON.parse(saved) : { type: "preset", value: "#efeae2" };
+    const saved = safeGetItem("whatsapp_ai_wallpaper");
+    if (!saved) return { type: "preset", value: "#efeae2" };
+    try {
+      return JSON.parse(saved);
+    } catch {
+      return { type: "preset", value: "#efeae2" };
+    }
   });
 
   const [showPatterns, setShowPatterns] = useState(() => {
-    const saved = localStorage.getItem("whatsapp_ai_show_patterns");
-    return saved ? JSON.parse(saved) : true;
+    const saved = safeGetItem("whatsapp_ai_show_patterns");
+    if (!saved) return true;
+    try {
+      return JSON.parse(saved);
+    } catch {
+      return true;
+    }
   });
 
   const [searchQuery, setSearchQuery] = useState("");
@@ -234,13 +292,23 @@ export default function App() {
   // continuity across restarts; they are never sent to the offline queue and
   // never stored server-side (the backend does not save CoT turns).
   const [cotMode, setCotMode] = useState<boolean>(() => {
-    const saved = localStorage.getItem("whatsapp_cot_mode");
-    return saved ? JSON.parse(saved) : false;
+    const saved = safeGetItem("whatsapp_cot_mode");
+    if (!saved) return false;
+    try {
+      return JSON.parse(saved);
+    } catch {
+      return false;
+    }
   });
   const [cotEntries, setCoTEntries] = useState<CoTEntry[]>(() => {
-    const saved = localStorage.getItem("whatsapp_cot_entries");
+    const saved = safeGetItem("whatsapp_cot_entries");
     if (!saved) return [];
-    const parsed = JSON.parse(saved);
+    let parsed: any;
+    try {
+      parsed = JSON.parse(saved);
+    } catch {
+      return [];
+    }
     if (!Array.isArray(parsed)) return [];
     // An entry persisted while a CoT request was in flight restores as
     // "loading" with no live fetch behind it (the request died with the
@@ -251,10 +319,10 @@ export default function App() {
       .map((entry: CoTEntry) =>
         entry && entry.status === "loading"
           ? {
-              ...entry,
-              status: "error" as const,
-              errorDetail: "The app closed before this CoT response arrived — the request is no longer running.",
-            }
+            ...entry,
+            status: "error" as const,
+            errorDetail: "The app closed before this CoT response arrived — the request is no longer running.",
+          }
           : entry
       );
   });
@@ -264,7 +332,7 @@ export default function App() {
   const [activePayload, setActivePayload] = useState<any>(null);
 
   const [userName, setUserName] = useState(() => {
-    return localStorage.getItem("whatsapp_ai_username") || "WiFi Client Client";
+    return safeGetItem("whatsapp_ai_username") || "WiFi Client Client";
   });
   const [isEditingName, setIsEditingName] = useState(false);
 
@@ -299,32 +367,11 @@ export default function App() {
 
     isFlushingRef.current = true;
     try {
-      // Single pass per call — don't loop back and immediately re-hit items
-      // that just timed out. Retrying happens on the *next* trigger (ack of
-      // another message, reconnect, app resume), gated by the cooldown below.
-      const pending = await getPendingDBMessages(sessionId);
-
-      for (const item of pending) {
-        if (!socketRef.current || socketRef.current.readyState !== WebSocket.OPEN) break;
-
-        const lastAttempt = lastAttemptRef.current.get(item.id) ?? 0;
-        if (Date.now() - lastAttempt < RETRY_COOLDOWN_MS) {
-          // A previous attempt's ack may still be in flight — don't resend yet.
-          continue;
-        }
-        lastAttemptRef.current.set(item.id, Date.now());
-
-        await new Promise<void>((resolve, reject) => {
-          const timeout = setTimeout(() => {
-            pendingAcksRef.current.delete(item.id);
-            reject(new Error("Ack timeout (8s)"));
-          }, 8000);
-
-          pendingAcksRef.current.set(item.id, () => {
-            clearTimeout(timeout);
-            lastAttemptRef.current.delete(item.id);
-            resolve();
-          });
+      let pending = await getPendingDBMessages(sessionId);
+      while (pending.length > 0 && socketRef.current && socketRef.current.readyState === WebSocket.OPEN) {
+        let sentAny = false;
+        for (const item of pending) {
+          if (!socketRef.current || socketRef.current.readyState !== WebSocket.OPEN) break;
 
           const sanitizedAttachments = item.attachments?.map(({ url, ...rest }: any) => rest);
           const payload = {
@@ -337,21 +384,57 @@ export default function App() {
             reply_to: item.replyTo,
             created_at: item.created_at,
           };
+          const payloadStr = JSON.stringify(payload);
 
-          socketRef.current?.send(JSON.stringify(payload));
-          updateDBMessageStatus(item.id, "sent");
-          setMessages((prev) => {
-            const updated = prev.map((m) => m.id === item.id ? { ...m, status: "delivered" as const } : m);
-            localStorage.setItem("whatsapp_single_bot_messages", JSON.stringify(updated));
-            return updated;
+          // Permanent failure guard: drop payloads > 10MB to prevent infinite crash loops
+          if (payloadStr.length > 10 * 1024 * 1024) {
+            await removeAckedDBMessage(item.id);
+            setMessages((prev) => {
+              const updated = prev.map((m) =>
+                m.id === item.id
+                  ? { ...m, status: "error" as const, text: (m.text || "") + " [Failed: attachment payload exceeds 10MB limit]" }
+                  : m
+              );
+              saveMessagesToStorage(updated);
+              return updated;
+            });
+            addLog(`Message ${item.id} dropped: attachment payload exceeds 10MB limit.`, "error");
+            continue;
+          }
+
+          const lastAttempt = lastAttemptRef.current.get(item.id) ?? 0;
+          if (Date.now() - lastAttempt < RETRY_COOLDOWN_MS) {
+            continue;
+          }
+          lastAttemptRef.current.set(item.id, Date.now());
+          sentAny = true;
+
+          await new Promise<void>((resolve, reject) => {
+            const timeout = setTimeout(() => {
+              pendingAcksRef.current.delete(item.id);
+              reject(new Error("Ack timeout (8s)"));
+            }, 8000);
+
+            pendingAcksRef.current.set(item.id, () => {
+              clearTimeout(timeout);
+              lastAttemptRef.current.delete(item.id);
+              resolve();
+            });
+
+            socketRef.current?.send(payloadStr);
+            updateDBMessageStatus(item.id, "sent");
+            setMessages((prev) => {
+              const updated = prev.map((m) => m.id === item.id ? { ...m, status: "delivered" as const } : m);
+              saveMessagesToStorage(updated);
+              return updated;
+            });
+          }).catch((err) => {
+            setIsTyping(false);
+            addLog(`Delivery retry queued for msg ${item.id}: ${err.message}`, "info");
           });
-        }).catch((err) => {
-          // Ack never arrived within 8s (or the socket died mid-flight) —
-          // nothing is in flight for this message anymore, so stop showing
-          // the typing indicator. Retrying stays gated by the cooldown.
-          setIsTyping(false);
-          addLog(`Delivery retry queued for msg ${item.id}: ${err.message}`, "info");
-        });
+        }
+        if (!sentAny) break;
+        pending = await getPendingDBMessages(sessionId);
       }
     } finally {
       isFlushingRef.current = false;
@@ -459,7 +542,7 @@ export default function App() {
             await removeAckedDBMessage(data.id);
             setMessages((prev) => {
               const updated = prev.map((m) => m.id === data.id ? { ...m, status: "read" as const } : m);
-              localStorage.setItem("whatsapp_single_bot_messages", JSON.stringify(updated));
+              saveMessagesToStorage(updated);
               return updated;
             });
             const resolveAck = pendingAcksRef.current.get(data.id);
@@ -502,7 +585,7 @@ export default function App() {
           setMessages((prev) => {
             if (prev.some((m) => m.id === botReplyId)) return prev;
             const updated = [...prev, botMsg];
-            localStorage.setItem("whatsapp_single_bot_messages", JSON.stringify(updated));
+            saveMessagesToStorage(updated);
             return updated;
           });
 
@@ -525,7 +608,9 @@ export default function App() {
           setIsConnected(false);
           setIsTyping(false);
           clearInterval(heartbeatInterval);
-          socketRef.current = null;
+          if (socketRef.current === socket) {
+            socketRef.current = null;
+          }
           if (!cancelled) {
             scheduleReconnect();
           }
@@ -606,39 +691,39 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    localStorage.setItem("whatsapp_single_bot_config", JSON.stringify(botConfig));
+    safeSetItem("whatsapp_single_bot_config", JSON.stringify(botConfig));
   }, [botConfig]);
 
   useEffect(() => {
-    localStorage.setItem("whatsapp_single_bot_messages", JSON.stringify(messages));
+    saveMessagesToStorage(messages);
   }, [messages]);
 
   useEffect(() => {
-    localStorage.setItem("whatsapp_fastapi_base_url", fastApiBaseUrl);
+    safeSetItem("whatsapp_fastapi_base_url", fastApiBaseUrl);
   }, [fastApiBaseUrl]);
 
   useEffect(() => {
-    localStorage.setItem("whatsapp_fastapi_key", fastApiKey);
+    safeSetItem("whatsapp_fastapi_key", fastApiKey);
   }, [fastApiKey]);
 
   useEffect(() => {
-    localStorage.setItem("whatsapp_ai_wallpaper", JSON.stringify(wallpaper));
+    safeSetItem("whatsapp_ai_wallpaper", JSON.stringify(wallpaper));
   }, [wallpaper]);
 
   useEffect(() => {
-    localStorage.setItem("whatsapp_ai_show_patterns", JSON.stringify(showPatterns));
+    safeSetItem("whatsapp_ai_show_patterns", JSON.stringify(showPatterns));
   }, [showPatterns]);
 
   useEffect(() => {
-    localStorage.setItem("whatsapp_cot_mode", JSON.stringify(cotMode));
+    safeSetItem("whatsapp_cot_mode", JSON.stringify(cotMode));
   }, [cotMode]);
 
   useEffect(() => {
-    localStorage.setItem("whatsapp_cot_entries", JSON.stringify(cotEntries.slice(-30)));
+    safeSetItem("whatsapp_cot_entries", JSON.stringify(cotEntries.slice(-30)));
   }, [cotEntries]);
 
   useEffect(() => {
-    localStorage.setItem("whatsapp_ai_username", userName);
+    safeSetItem("whatsapp_ai_username", userName);
   }, [userName]);
 
   useEffect(() => {
@@ -698,7 +783,8 @@ export default function App() {
     Array.from(files).forEach((file: File) => {
       const isImage = file.type.startsWith("image/");
       const isPdf = file.type === "application/pdf" || file.name.endsWith(".pdf");
-      const type = isImage ? "image" : isPdf ? "pdf" : "text";
+      const isDocx = file.name.endsWith(".docx");
+      const type = isImage ? "image" : isPdf ? "pdf" : isDocx ? "docx" : "text";
 
       const url = URL.createObjectURL(file);
       const reader = new FileReader();
@@ -707,10 +793,16 @@ export default function App() {
 
         let textContents = undefined;
         if (type === "text") {
-          textContents = result;
+          try {
+            textContents = await file.text();
+          } catch {
+            textContents = `[Text file attached: ${file.name}]`;
+          }
         } else if (type === "pdf") {
           const arrayBuffer = await file.arrayBuffer();
           textContents = await Promise.resolve(extractTextFromPDF(arrayBuffer, file.name));
+        } else if (type === "docx") {
+          textContents = `[Word document attached: ${file.name} (${formatBytes(file.size)}) - text extraction is handled server-side]`;
         }
 
         const newAttachment: Attachment = {
@@ -719,7 +811,7 @@ export default function App() {
           type: type,
           size: formatBytes(file.size),
           url: url,
-          base64: type === "text" ? undefined : result,
+          base64: result,
           textContents: textContents
         };
 
@@ -727,11 +819,8 @@ export default function App() {
         addLog(`Attached ${type} file: "${file.name}"`, "info");
       };
 
-      if (type === "text") {
-        reader.readAsText(file);
-      } else {
-        reader.readAsDataURL(file);
-      }
+      // Always read as Data URL so base64 is uniformly populated for all attachment types
+      reader.readAsDataURL(file);
     });
 
     e.target.value = "";
@@ -802,7 +891,7 @@ export default function App() {
 
     setMessages((prev) => {
       const updated = [...prev, userMessage];
-      localStorage.setItem("whatsapp_single_bot_messages", JSON.stringify(updated));
+      saveMessagesToStorage(updated);
       return updated;
     });
 
@@ -832,9 +921,9 @@ export default function App() {
   const handleNewChat = () => {
     const newId = "session-" + Math.random().toString(36).substring(2, 11);
     setSessionId(newId);
-    localStorage.setItem("whatsapp_fastapi_session_id", newId);
+    safeSetItem("whatsapp_fastapi_session_id", newId);
     setMessages([]);
-    localStorage.setItem("whatsapp_single_bot_messages", JSON.stringify([]));
+    saveMessagesToStorage([]);
     setCoTEntries([]);
     setIsTyping(false);
     addLog(`Started new chat session: ${newId}`, "info");
@@ -1133,9 +1222,8 @@ export default function App() {
         <div className="w-full flex flex-col md:flex-row bg-transparent md:bg-[#eae6df] rounded-none md:rounded-2xl shadow-2xl md:border border-gray-300/40 min-h-[100dvh] md:min-h-0 overflow-visible relative">
 
           {/* 1. LEFT PANEL: SIDEBAR */}
-          <div className={`w-full md:w-[410px] shrink-0 bg-white flex flex-col border-r border-slate-200/90 transition-all duration-300 z-50 ${
-            isMobileSidebarOpen ? "flex h-[100dvh] sticky top-0" : "hidden md:flex h-full"
-          }`}>
+          <div className={`w-full md:w-[410px] shrink-0 bg-white flex flex-col border-r border-slate-200/90 transition-all duration-300 z-50 ${isMobileSidebarOpen ? "flex h-[100dvh] sticky top-0" : "hidden md:flex h-full"
+            }`}>
             {showSettings ? (
               <>
                 <div className="bg-[#008069] text-white px-4 py-[20px] flex items-center space-x-6 shrink-0 shadow-sm">
@@ -1213,8 +1301,8 @@ export default function App() {
                       <div className="flex flex-wrap gap-1.5">{previousSessions.map(id => (<button key={id} onClick={() => switchSession(id)} className={`px-2 py-1 rounded text-[10px] font-mono border ${id === sessionId ? "bg-blue-50 border-blue-200 text-blue-600 font-bold" : "bg-slate-50 border-slate-100 text-slate-500"}`}>{id.replace("session-", "")}</button>))}</div>
                     )}
                     <div className="flex space-x-2 mt-2">
-                       <input ref={sessionInputRef} type="text" defaultValue={sessionId} onKeyDown={(e) => { if (e.key === "Enter") switchSession((e.target as HTMLInputElement).value); }} className="flex-1 bg-slate-50 border border-slate-200 px-2.5 py-1.5 rounded-lg text-xs font-mono" placeholder="Session name..." />
-                       <button onClick={() => switchSession(sessionInputRef.current?.value ?? "")} className="px-3 py-1.5 bg-blue-600 text-white rounded-lg text-[10px] font-bold uppercase">Switch</button>
+                      <input ref={sessionInputRef} type="text" defaultValue={sessionId} onKeyDown={(e) => { if (e.key === "Enter") switchSession((e.target as HTMLInputElement).value); }} className="flex-1 bg-slate-50 border border-slate-200 px-2.5 py-1.5 rounded-lg text-xs font-mono" placeholder="Session name..." />
+                      <button onClick={() => switchSession(sessionInputRef.current?.value ?? "")} className="px-3 py-1.5 bg-blue-600 text-white rounded-lg text-[10px] font-bold uppercase">Switch</button>
                     </div>
                   </div>
 
@@ -1363,7 +1451,7 @@ export default function App() {
                 <button type="button" onClick={() => fileInputRef.current?.click()} className="p-1.5 hover:bg-slate-200 rounded-full transition text-[#128c7e] shrink-0">
                   <Plus className="w-6 h-6" />
                 </button>
-                <input type="file" ref={fileInputRef} className="hidden" accept="image/*,.pdf,.txt" multiple onChange={handleFileChange} />
+                <input type="file" ref={fileInputRef} className="hidden" accept="image/*,.pdf,.docx,.txt" multiple onChange={handleFileChange} />
 
                 <div className="flex-1 bg-white rounded-xl px-4 py-2 shadow-sm border border-slate-200 flex items-center">
                   <input
@@ -1378,7 +1466,7 @@ export default function App() {
                 <button
                   type="submit"
                   disabled={(!inputText.trim() && attachedFiles.length === 0) || (cotMode && isCoTLoading)}
-                  className={`p-2.5 rounded-xl flex items-center justify-center text-white shrink-0 transition-all ${ (inputText.trim() || attachedFiles.length > 0) ? "bg-[#00a884] shadow-md active:scale-95" : "bg-gray-300 opacity-60" }`}
+                  className={`p-2.5 rounded-xl flex items-center justify-center text-white shrink-0 transition-all ${(inputText.trim() || attachedFiles.length > 0) ? "bg-[#00a884] shadow-md active:scale-95" : "bg-gray-300 opacity-60"}`}
                 >
                   <Send className="w-5 h-5" />
                 </button>

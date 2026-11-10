@@ -16,37 +16,67 @@ past conversations (from RAG) must only inform STYLE, never be
 copied or repeated as actual response content.
 """
 
+import re
 from typing import Optional, List, Dict, Any
 from laya_engine import classify_mode_and_retrieval, LAYA_ENABLED, is_laya_available
 
 
 # ----------------------------------------------------------------
-# Behavioral mode keyword lists
+# Crisis Detection & Behavioral mode patterns
 # ----------------------------------------------------------------
 
-SUPPORTIVE_KEYWORDS = [
-    "anxious", "depressed", "sad", "lonely", "stressed",
-    "overwhelmed", "scared", "hurt", "crying", "hopeless",
-    "worthless", "tired of", "can't cope", "feel like giving up",
-    "miss", "grief", "heartbroken", "exhausted", "burnt out",
-    "panic", "afraid", "insecure", "ashamed", "guilty"
+CRISIS_PATTERNS = [
+    r"\b(?:kill|killing)\s+(?:my\s*self|myself)\b",
+    r"\bwant\s+to\s+die\b",
+    r"\b(?:don'?t|do\s+not)\s+want\s+to\s+live\b",
+    r"\bend\s+(?:my\s*life|it\s+all)\b",
+    r"\bsuicid(?:e|al)\b",
+    r"\b(?:hurt|hurting)\s+(?:my\s*self|myself)\b",
+    r"\bcutting\s+myself\b",
+    r"\bbetter\s+off\s+dead\b",
+    r"\bno\s+reason\s+to\s+live\b",
+    r"\bcan'?t\s+go\s+on\s+living\b",
+    r"\bend\s+my\s+pain\s+forever\b",
 ]
+CRISIS_REGEX = re.compile("|".join(CRISIS_PATTERNS), re.IGNORECASE)
 
-GUIDANCE_KEYWORDS = [
-    "career", "future", "goal", "plan", "decide", "decision",
-    "should i", "advice", "direction", "purpose", "life path",
-    "choice", "path", "job offer", "next step", "stuck between",
-    "thinking of switching", "considering", "what should i do"
+
+def detect_crisis(message: str) -> bool:
+    """Deterministic regex detector for acute distress, suicidal ideation, or self-harm."""
+    if not message or not isinstance(message, str):
+        return False
+    return bool(CRISIS_REGEX.search(message))
+
+
+SUPPORTIVE_PATTERNS = [
+    r"anxious", r"depressed", r"sad", r"lonely", r"stressed",
+    r"overwhelmed", r"scared", r"hurt", r"crying", r"hopeless",
+    r"worthless", r"tired\s+of", r"can'?t\s+cope", r"feel\s+like\s+giving\s+up",
+    r"miss", r"grief", r"heartbroken", r"exhausted", r"burnt\s+out",
+    r"panic", r"afraid", r"insecure", r"ashamed", r"guilty"
 ]
+SUPPORTIVE_REGEX = re.compile(r"\b(?:" + "|".join(SUPPORTIVE_PATTERNS) + r")\b", re.IGNORECASE)
+
+GUIDANCE_PATTERNS = [
+    r"career", r"future", r"goal", r"plan", r"decide", r"decision",
+    r"should\s+i", r"advice", r"direction", r"purpose", r"life\s+path",
+    r"choice", r"path", r"job\s+offer", r"next\s+step", r"stuck\s+between",
+    r"thinking\s+of\s+switching", r"considering", r"what\s+should\s+i\s+do"
+]
+GUIDANCE_REGEX = re.compile(r"\b(?:" + "|".join(GUIDANCE_PATTERNS) + r")\b", re.IGNORECASE)
+
+# Backwards compatibility lists
+SUPPORTIVE_KEYWORDS = [p.replace(r"\s+", " ").replace(r"'?", "'") for p in SUPPORTIVE_PATTERNS]
+GUIDANCE_KEYWORDS = [p.replace(r"\s+", " ") for p in GUIDANCE_PATTERNS]
 
 
 def _detect_mode_heuristic(message: str) -> str:
-    """Keyword-based heuristic fallback for behavioral mode detection."""
-    msg = message.lower()
-
-    if any(k in msg for k in SUPPORTIVE_KEYWORDS):
+    """Keyword-based heuristic fallback for behavioral mode detection with word boundaries."""
+    if not message:
+        return "conversational"
+    if CRISIS_REGEX.search(message) or SUPPORTIVE_REGEX.search(message):
         return "supportive"
-    elif any(k in msg for k in GUIDANCE_KEYWORDS):
+    elif GUIDANCE_REGEX.search(message):
         return "guidance"
     return "conversational"
 
@@ -56,21 +86,36 @@ def detect_mode_detailed(
     recent_turns: Optional[List[Dict[str, str]]] = None
 ) -> Dict[str, Any]:
     """
-    Evaluates behavioral mode and personal RAG need via Laya typed decisions.
-    If Laya is disabled, unavailable, or confidence is below 0.55, falls back
-    to keyword heuristics. Returns a detailed dictionary with mode, confidence,
-    retrieval decision, and telemetry.
+    Evaluates behavioral mode and personal RAG need.
+    High-priority safety check: acute crisis signals deterministically trigger supportive mode.
+    Otherwise evaluates behavioral mode via Laya typed decisions or regex heuristic fallback.
     """
+    if detect_crisis(message):
+        return {
+            "mode": "supportive",
+            "mode_confidence": 1.0,
+            "mode_probabilities": {"supportive": 1.0, "guidance": 0.0, "conversational": 0.0},
+            "needs_personal_context": False,
+            "retrieval_decision": "no_personal_context_needed",
+            "retrieval_confidence": 1.0,
+            "retrieval_probabilities": {"needs_personal_context": 0.0, "no_personal_context_needed": 1.0},
+            "latency_ms": 0.0,
+            "used_fallback": False,
+            "is_crisis": True,
+        }
+
     if LAYA_ENABLED:
         try:
             res = classify_mode_and_retrieval(message, recent_turns=recent_turns)
             # Threshold: >= 0.55 confidence on Laya's mode choice
             if not res.get("used_fallback") and res.get("mode_confidence", 0.0) >= 0.55:
+                res["is_crisis"] = False
                 return res
             # Fall back to heuristic if confidence is low
             heuristic_mode = _detect_mode_heuristic(message)
             res["mode"] = heuristic_mode
             res["used_fallback"] = True
+            res["is_crisis"] = False
             return res
         except Exception as e:
             print(f"[mode_router] Laya classification error: {e}")
@@ -87,6 +132,7 @@ def detect_mode_detailed(
         "retrieval_probabilities": {"needs_personal_context": 1.0, "no_personal_context_needed": 0.0},
         "latency_ms": 0.0,
         "used_fallback": True,
+        "is_crisis": False,
     }
 
 
@@ -215,12 +261,15 @@ feeling..."). Just respond the way someone who truly gets them would.
 
 USER_NAME = "Dhanush"  # update this if the user's name changes
 
-ANTI_REPETITION_INSTRUCTION = f"""
+
+def build_anti_repetition_instruction(user_name: str = "Dhanush") -> str:
+    name = user_name.strip() if user_name and user_name.strip() else "the user"
+    return f"""
 The excerpts below are for STYLE reference only (communication patterns,
 emotional tone) — never copy or closely mimic their exact phrases as reply
 content; always generate a fresh, original response.
 
-IDENTITY: you're talking to {USER_NAME} right now. When "{USER_NAME}" appears
+IDENTITY: you're talking to {name} right now. When "{name}" appears
 as a speaker in an excerpt, that IS the current user — don't narrate their
 own words back to them in third person.
 
@@ -239,6 +288,23 @@ the question, say so honestly rather than guessing.
 Each excerpt is labeled with who it's from and its date, e.g.
 "[Chat with Surya | 12/06/2026]" — use this to identify who/when, but
 never read the label text aloud in your reply.
+"""
+
+
+ANTI_REPETITION_INSTRUCTION = build_anti_repetition_instruction(USER_NAME)
+
+CRISIS_SUPPORT_DIRECTIVE = """
+CRITICAL SAFETY DIRECTIVE:
+The user is expressing acute distress or thoughts of self-harm/suicide.
+Your absolute top priority is their immediate safety and emotional well-being.
+- Respond with genuine warmth, care, presence, and calm reassurance.
+- Do NOT judge, scold, diagnose, dismiss, or debate their feelings.
+- Clearly and compassionately share that help is available right now:
+  * 988 Suicide & Crisis Lifeline: Call or text 988 (free, confidential, 24/7 in US & Canada).
+  * Crisis Text Line: Text HOME to 741741.
+  * International / India: Tele-MANAS at 14416 or Vandrevala Foundation at +91 9999 666 555.
+  * Encourage them to reach out to a trusted loved one, counselor, or local emergency services.
+- Keep your tone gentle, direct, and supportive. Do not use emojis.
 """
 
 NO_CONTEXT_INSTRUCTION = """
@@ -335,21 +401,17 @@ Rules:
     lines (e.g. "In.\\nAll.\\nThe.\\nDarkness."). Write 1 to 2 normal horizontal sentences.
   * NO hallucinated time jumps or self-dialogue: Do not invent fake time gaps ("20 mins later",
     "after 30 min") or simulate both sides of a conversation. Respond only to the latest message.
-- Emoji use: the user's preferred communication style, given at the very
-  end of this prompt, is the final word on this — it overrides anything
-  said here. If that style says no emojis, use none, full stop, no
-  exceptions. Only if no style preference is given at all, default to using
-  emojis sparingly and only when they'd fit naturally, the way a close
-  friend texting would — not in every message, not more than one or two at
-  a time, and never in supportive/serious emotional moments where they'd
-  feel dismissive.
+- Emoji use: Never use emojis under any circumstances. Write in clean plain text without emojis or emoticons.
 """
 
 
 def get_system_prompt(mode: str, personal_context: str = "", style_profile: str = "",
                        session_summaries: str = "", reference_context: str = "",
                        referenced_session_context: str = "",
-                       sufficiency_state: str | None = None) -> str:
+                       sufficiency_state: str | None = None,
+                       user_name: str = "Dhanush",
+                       is_crisis: bool = False,
+                       current_session_summary: str = "") -> str:
     """
     Builds the full system prompt sent to npu_server.py for a given turn.
 
@@ -365,8 +427,20 @@ def get_system_prompt(mode: str, personal_context: str = "", style_profile: str 
     sufficiency_state - Laya-assessed context sufficiency:
                          'sufficient_to_answer', 'partial_context_hedge_needed',
                          'insufficient_context_abstain', or None
+    user_name         - Name of the active user/tenant ("Dhanush" for primary, "User" or session for guest)
+    is_crisis         - Whether acute self-harm/crisis signals were detected
+    current_session_summary - Rolled-up memory summary for the active ongoing session
     """
     parts = [BASE_PERSONA]
+
+    if is_crisis:
+        parts.append(CRISIS_SUPPORT_DIRECTIVE)
+
+    if current_session_summary:
+        parts.append(
+            "\nContext and key facts from earlier in this current conversation:\n"
+            f"{current_session_summary}\n"
+        )
 
     if referenced_session_context:
         parts.append(
@@ -398,7 +472,7 @@ def get_system_prompt(mode: str, personal_context: str = "", style_profile: str 
     parts.append(EMOTIONAL_UNDERSTANDING_INSTRUCTION)
 
     if personal_context:
-        parts.append(ANTI_REPETITION_INSTRUCTION)
+        parts.append(build_anti_repetition_instruction(user_name))
         parts.append(f"\nRelevant personal context:\n{personal_context}\n")
     else:
         parts.append(NO_CONTEXT_INSTRUCTION)

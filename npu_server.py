@@ -134,7 +134,11 @@ def _clean_reply_text(text: str) -> str:
         return ""
     cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
     if "<think>" in cleaned and "</think>" not in cleaned:
-        cleaned = cleaned.split("<think>")[0]
+        pre_think = cleaned.split("<think>")[0].strip()
+        if pre_think:
+            cleaned = pre_think
+        else:
+            cleaned = cleaned.replace("<think>", "").strip()
     return cleaned.replace("</think>", "").strip()
 
 
@@ -534,7 +538,12 @@ async def chat(payload: ChatRequest):
         prompt += "<|im_start|>assistant\n"
 
     # Native no-think instruct mode for Qwen 4B when not in explicit diagnostic reasoning mode
-    is_cot_request = any("<reasoning>" in m.get("content", "") for m in payload.messages)
+    active_content = ""
+    if payload.messages:
+        sys_content = payload.messages[0].get("content", "") if payload.messages[0].get("role") == "system" else ""
+        latest_content = payload.messages[-1].get("content", "")
+        active_content = sys_content + "\n" + latest_content
+    is_cot_request = "<reasoning>" in active_content
     if not is_cot_request and prompt.endswith("<|im_start|>assistant\n"):
         prompt += "<think>\n\n</think>\n\n"
 

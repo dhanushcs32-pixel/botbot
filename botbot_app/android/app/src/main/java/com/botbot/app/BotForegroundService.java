@@ -39,6 +39,13 @@ public class BotForegroundService extends Service {
         return START_STICKY;
     }
 
+    /**
+     * Required for Android 15 (API 35+) dataSync foreground services to handle runtime timeout cleanly.
+     */
+    public void onTimeout(int startId, int fgsType) {
+        stopSelf(startId);
+    }
+
     @Override
     public void onDestroy() {
         super.onDestroy();

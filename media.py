@@ -17,17 +17,26 @@ Documents (PDF, DOCX, TXT) are read directly for their text content.
 Everything runs 100% locally — no cloud calls, no API keys.
 """
 
+import os
 import io
 import logging
 import base64
+import shutil
 from pathlib import Path
 
 from PIL import Image
 import pytesseract
 
 # Windows doesn't add Tesseract to PATH by default — point pytesseract
-# directly at the installed binary so it can find it.
-pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+# at the configured/installed binary so it can find it portably.
+_default_tess = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+_tess_cmd = os.getenv("TESSERACT_CMD")
+if _tess_cmd and Path(_tess_cmd).exists():
+    pytesseract.pytesseract.tesseract_cmd = _tess_cmd
+elif Path(_default_tess).exists():
+    pytesseract.pytesseract.tesseract_cmd = _default_tess
+elif shutil.which("tesseract"):
+    pytesseract.pytesseract.tesseract_cmd = shutil.which("tesseract")
 
 # Persistent failure logging: same destination as main.py's debug_log
 # (botbot.debug logger -> botbot_debug.log). media.py can't import main
@@ -71,6 +80,17 @@ MAX_IMAGE_DIMENSION_PX = 2000
 # dense/long document photo, and truncating here means the trim logic
 # downstream never has to deal with a single field this disproportionate.
 OCR_TEXT_MAX_CHARS = 4000
+
+# Hard cap on how much document text (PDF, DOCX, TXT) gets extracted.
+# Bounds context length to avoid blowing through context budget (~6144 tokens).
+MAX_EXTRACTED_DOC_CHARS = 8000
+
+
+def _truncate_doc_text(text: str) -> str:
+    """Caps extracted document text at MAX_EXTRACTED_DOC_CHARS with a clear notice."""
+    if len(text) <= MAX_EXTRACTED_DOC_CHARS:
+        return text
+    return text[:MAX_EXTRACTED_DOC_CHARS].rstrip() + "\n\n[Document truncated to fit context window]"
 
 # Minimum available system RAM (MB) required before attempting to load/run
 # the BLIP captioning model. This machine has been observed to run with as
@@ -309,7 +329,7 @@ def process_pdf(file_bytes: bytes) -> str:
                 pages_text.append(text.strip())
         if not pages_text:
             return "[PDF contained no extractable text — it may be a scanned/image-only PDF.]"
-        combined = "\n\n".join(pages_text)
+        combined = _truncate_doc_text("\n\n".join(pages_text))
         return f"[Document text extracted from PDF:]\n{combined}"
     except Exception as e:
         return f"[Could not read PDF: {e}]"
@@ -327,7 +347,7 @@ def process_docx(file_bytes: bytes) -> str:
         paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
         if not paragraphs:
             return "[Word document contained no extractable text.]"
-        combined = "\n".join(paragraphs)
+        combined = _truncate_doc_text("\n".join(paragraphs))
         return f"[Document text extracted from Word file:]\n{combined}"
     except Exception as e:
         return f"[Could not read Word document: {e}]"
@@ -339,7 +359,7 @@ def process_text(file_bytes: bytes) -> str:
         text = file_bytes.decode("utf-8")
     except UnicodeDecodeError:
         text = file_bytes.decode("latin1")
-    return f"[Text file contents:]\n{text.strip()}"
+    return f"[Text file contents:]\n{_truncate_doc_text(text.strip())}"
 
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif"}
@@ -369,32 +389,31 @@ def process_uploaded_file(filename: str, file_bytes: bytes) -> str:
 def decode_app_attachment(attachment: dict) -> str:
     """
     Converts one attachment dict sent by the Android app's /chat JSON
-    payload into extracted text. The app packages attachments
-    differently depending on type:
-      - images/PDFs: "base64" field is a full data URL, e.g.
-        "data:image/png;base64,AAAA..." (from FileReader.readAsDataURL)
-      - text files: "base64" field is actually already raw decoded
-        text, not base64 (from FileReader.readAsText) — the field
-        name is just a holdover from how the app's state is shaped
-
-    This mirrors that distinction so both cases are handled correctly,
-    then reuses process_uploaded_file() for the actual extraction.
+    payload into extracted text. Handles data URLs (base64) for all
+    file types (images, PDFs, DOCX, and text), with a fallback for
+    raw string payloads.
     """
     name = attachment.get("name") or "attachment"
     att_type = attachment.get("type")
     raw = attachment.get("base64") or ""
 
-    if att_type == "text":
-        return f"[Text file '{name}' contents:]\n{raw.strip()}" if raw.strip() else \
-            f"[Text file '{name}' was sent but appears empty.]"
+    # If raw is a data URL (e.g. "data:text/plain;base64,..." or "data:image/png;base64,...")
+    if isinstance(raw, str) and (raw.startswith("data:") or "," in raw):
+        try:
+            b64_part = raw.split(",", 1)[1] if "," in raw else raw
+            file_bytes = base64.b64decode(b64_part)
+            return process_uploaded_file(name, file_bytes)
+        except Exception as e:
+            return f"[Could not decode attachment '{name}': {e}]"
 
-    # image/pdf case: raw is a data URL like "data:image/png;base64,...."
-    if "," in raw:
-        raw = raw.split(",", 1)[1]
+    # Fallback if raw text was sent directly in "base64" field
+    if att_type == "text" or (isinstance(raw, str) and not raw.startswith("data:")):
+        if raw and raw.strip():
+            return f"[Text file '{name}' contents:]\n{_truncate_doc_text(raw.strip())}"
+        return f"[Text file '{name}' was sent but appears empty.]"
 
     try:
         file_bytes = base64.b64decode(raw)
+        return process_uploaded_file(name, file_bytes)
     except Exception as e:
         return f"[Could not decode attachment '{name}': {e}]"
-
-    return process_uploaded_file(name, file_bytes)

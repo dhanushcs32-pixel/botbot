@@ -26,32 +26,32 @@ Usage:
 """
 
 import argparse
-import sqlite3
 import time
 
 import httpx
 
-from secret_key import API_KEY
-from memory import DB_PATH, is_test_session
+from secret_key import API_KEYS
+from memory import get_db_connection, is_test_session
+
+API_KEY = API_KEYS.get("primary", "")
 
 
 def get_sessions_needing_summary(include_test: bool, force: bool) -> list[str]:
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    if force:
-        cursor.execute("SELECT DISTINCT session_id FROM conversations")
-        session_ids = [row[0] for row in cursor.fetchall()]
-    else:
-        cursor.execute(
-            """
-            SELECT DISTINCT c.session_id
-            FROM conversations c
-            LEFT JOIN session_summaries s ON c.session_id = s.session_id
-            WHERE s.session_id IS NULL
-            """
-        )
-        session_ids = [row[0] for row in cursor.fetchall()]
-    conn.close()
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        if force:
+            cursor.execute("SELECT DISTINCT session_id FROM conversations")
+            session_ids = [row[0] for row in cursor.fetchall()]
+        else:
+            cursor.execute(
+                """
+                SELECT DISTINCT c.session_id
+                FROM conversations c
+                LEFT JOIN session_summaries s ON c.session_id = s.session_id
+                WHERE s.session_id IS NULL
+                """
+            )
+            session_ids = [row[0] for row in cursor.fetchall()]
 
     if not include_test:
         session_ids = [sid for sid in session_ids if not is_test_session(sid)]

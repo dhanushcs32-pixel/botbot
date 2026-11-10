@@ -65,7 +65,6 @@ SEED_PHRASES = {
         "Please don't hesitate to reach out if you need anything else.",
         "Wishing you all the best going forward.",
         "Feel free to reach out anytime.",
-        "I'm always here if you need to talk.",
     ],
     "hedging": [
         "I could be wrong, but it seems like this might be the case.",
@@ -196,13 +195,16 @@ def check_semantic_violations(text: str, session_id: str = "") -> list[dict]:
     return findings
 
 
-def strip_semantic_violations(text: str, session_id: str = "") -> tuple[str, list[dict]]:
+def strip_semantic_violations(text: str, session_id: str = "", mode: str = "") -> tuple[str, list[dict]]:
     """
     Runs check_semantic_violations(), then removes only the sentences
     flagged with "enforce": True (see ENFORCE_CATEGORIES /
     ENFORCE_SIMILARITY_THRESHOLD). Returns (cleaned_text, findings) —
     findings includes every flagged sentence, enforced or not, so logging
     stays exactly as informative as it was in log-only mode.
+
+    If mode == "supportive", formal_signoff stripping is relaxed so genuine
+    warmth/support sentences are not stripped from a vulnerable user.
 
     Removal is done via exact substring replacement (each sentence text
     came from splitting the original string, so it's guaranteed to be a
@@ -216,6 +218,9 @@ def strip_semantic_violations(text: str, session_id: str = "") -> tuple[str, lis
 
     cleaned = text
     for f in findings:
+        # In supportive mode, do not strip warm signoffs like "Feel free to reach out anytime"
+        if mode == "supportive" and f.get("category") == "formal_signoff":
+            continue
         if f["enforce"]:
             cleaned = cleaned.replace(f["sentence"], "", 1)
 

@@ -154,17 +154,17 @@ def test_tagging():
     # Using "test"-named ids here would make Test 5 fail for a totally
     # different reason (isolation filtering) than what Test 5 is actually
     # checking (query-aware retrieval).
-    known_people = {"sooryan", "sharadhi", "sampada"}
+    known_people = {"alice", "bob", "charlie"}
 
     memory.save_session_summary(
-        "tagcheck_sooryan",
-        "User discussed feeling anxious about an upcoming trip with Sooryan, "
+        "tagcheck_alice",
+        "User discussed feeling anxious about an upcoming trip with Alice, "
         "and mentioned wanting to go hiking next weekend.",
         known_people=known_people,
     )
     memory.save_session_summary(
-        "tagcheck_sharadhi",
-        "User talked about a disagreement with Sharadhi regarding weekend plans.",
+        "tagcheck_bob",
+        "User talked about a disagreement with Bob regarding weekend plans.",
         known_people=known_people,
     )
     memory.save_session_summary(
@@ -175,45 +175,45 @@ def test_tagging():
 
     conn = sqlite3.connect(memory.DB_PATH)
     cur = conn.cursor()
-    cur.execute("SELECT tag_type, tag_value FROM session_summary_tags WHERE session_id = ?", ("tagcheck_sooryan",))
+    cur.execute("SELECT tag_type, tag_value FROM session_summary_tags WHERE session_id = ?", ("tagcheck_alice",))
     tags = cur.fetchall()
     conn.close()
     tag_dict = {}
     for t, v in tags:
         tag_dict.setdefault(t, set()).add(v)
 
-    check("sooryan session tagged with person:sooryan",
-          "sooryan" in tag_dict.get("person", set()), detail=str(tag_dict.get("person")))
-    check("sooryan session NOT tagged with unrelated people",
-          "sharadhi" not in tag_dict.get("person", set()))
-    check("sooryan session has activity tags (e.g. 'hiking' or 'trip')",
+    check("alice session tagged with person:alice",
+          "alice" in tag_dict.get("person", set()), detail=str(tag_dict.get("person")))
+    check("alice session NOT tagged with unrelated people",
+          "bob" not in tag_dict.get("person", set()))
+    check("alice session has activity tags (e.g. 'hiking' or 'trip')",
           bool(tag_dict.get("activity")) and any(
               w in tag_dict["activity"] for w in ("hiking", "trip", "weekend", "anxious")),
           detail=str(tag_dict.get("activity")))
     # person name should be excluded from activity tags (name shouldn't double as activity keyword)
     check("person name excluded from activity tags",
-          "sooryan" not in tag_dict.get("activity", set()))
+          "alice" not in tag_dict.get("activity", set()))
 
     # wholesale replace check: re-saving should replace, not accumulate duplicates.
-    # Text below deliberately avoids the literal word "Sooryan" (even in
-    # negation) so a stale person:sooryan tag can't reappear via an
+    # Text below deliberately avoids the literal word "Alice" (even in
+    # negation) so a stale person:alice tag can't reappear via an
     # accidental substring match — that would give a false pass/fail
     # unrelated to whether replace-vs-accumulate logic is actually correct.
     memory.save_session_summary(
-        "tagcheck_sooryan",
+        "tagcheck_alice",
         "User now only talks about cooking and grocery shopping, nothing else today.",
         known_people=known_people,
     )
     conn = sqlite3.connect(memory.DB_PATH)
     cur = conn.cursor()
-    cur.execute("SELECT tag_type, tag_value FROM session_summary_tags WHERE session_id = ?", ("tagcheck_sooryan",))
+    cur.execute("SELECT tag_type, tag_value FROM session_summary_tags WHERE session_id = ?", ("tagcheck_alice",))
     tags2 = cur.fetchall()
     conn.close()
     tag_dict2 = {}
     for t, v in tags2:
         tag_dict2.setdefault(t, set()).add(v)
-    check("re-save replaces old tags (sooryan/trip tags gone after re-save)",
-          "sooryan" not in tag_dict2.get("person", set()) and "trip" not in tag_dict2.get("activity", set()),
+    check("re-save replaces old tags (alice/trip tags gone after re-save)",
+          "alice" not in tag_dict2.get("person", set()) and "trip" not in tag_dict2.get("activity", set()),
           detail=str(tag_dict2))
 
 
@@ -222,7 +222,7 @@ def test_tagging():
 # ============================================================
 def test_query_retrieval():
     print("\n=== TEST 5: get_recent_summaries query-aware retrieval ===")
-    # tagcheck_sharadhi should be findable via a query mentioning "sharadhi"
+    # tagcheck_bob should be findable via a query mentioning "bob"
     # even though tagcheck_neither was saved more recently in real time... but
     # since we save in insertion order and ORDER BY id DESC LIMIT 200 governs
     # the eligible pool, let's just confirm query-match ordering vs no-query.
@@ -230,19 +230,19 @@ def test_query_retrieval():
     no_query = memory.get_recent_summaries(exclude_session_id=None, limit=5, query=None)
     check("no-query call returns some summaries", len(no_query) > 0, detail=str(len(no_query)))
 
-    with_query = memory.get_recent_summaries(exclude_session_id=None, limit=5, query="what about sharadhi and weekend plans")
+    with_query = memory.get_recent_summaries(exclude_session_id=None, limit=5, query="what about bob and weekend plans")
     check("query call returns some summaries", len(with_query) > 0)
 
-    # The sharadhi summary should be the FIRST result when querying "sharadhi",
+    # The bob summary should be the FIRST result when querying "bob",
     # even if it wasn't the most recently-saved session.
-    sharadhi_summary = memory.get_summary_for_session("tagcheck_sharadhi")
-    check("sharadhi summary retrievable directly (sanity)", sharadhi_summary is not None)
-    check("sharadhi summary is first (or present) in query-matched results",
-          sharadhi_summary in with_query,
+    bob_summary = memory.get_summary_for_session("tagcheck_bob")
+    check("bob summary retrievable directly (sanity)", bob_summary is not None)
+    check("bob summary is first (or present) in query-matched results",
+          bob_summary in with_query,
           detail=f"with_query={with_query}")
-    if sharadhi_summary in with_query:
-        check("sharadhi summary is FIRST in query-matched ordering (matched sessions surface first)",
-              with_query[0] == sharadhi_summary,
+    if bob_summary in with_query:
+        check("bob summary is FIRST in query-matched ordering (matched sessions surface first)",
+              with_query[0] == bob_summary,
               detail=f"first={with_query[0]!r}")
 
 
@@ -251,9 +251,9 @@ def test_query_retrieval():
 # ============================================================
 def test_isolation_still_respected():
     print("\n=== TEST 6: test-session isolation unaffected by query matching ===")
-    memory.save_session_summary("faketest_session", "User discussed sooryan and hiking a lot here.",
-                                 known_people={"sooryan"})
-    results = memory.get_recent_summaries(exclude_session_id=None, limit=20, query="sooryan hiking")
+    memory.save_session_summary("faketest_session", "User discussed alice and hiking a lot here.",
+                                 known_people={"alice"})
+    results = memory.get_recent_summaries(exclude_session_id=None, limit=20, query="alice hiking")
     faketest_summary = memory.get_summary_for_session("faketest_session")
     check("test-named session excluded from results even when query matches its tags",
           faketest_summary not in results)

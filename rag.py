@@ -12,6 +12,7 @@ using sentence-transformers, no cloud calls involved.
 
 import os
 import re
+import time
 from pathlib import Path
 from datetime import date, datetime, timedelta
 from dateutil import parser as dateutil_parser
@@ -299,6 +300,11 @@ def index_single_file(file_path: Path) -> int:
     metadatas = [build_metadata(c) for c in chunk_dicts]
 
     MAX_BATCH = 4000
+    try:
+        get_collection().delete(where={"source": relative_source})
+    except Exception:
+        pass
+
     for batch_start in range(0, len(chunks), MAX_BATCH):
         batch_end = batch_start + MAX_BATCH
         get_collection().upsert(
@@ -308,6 +314,7 @@ def index_single_file(file_path: Path) -> int:
         )
 
     print(f"Indexed: {relative_source} ({len(chunks)} chunks, source_type={source_type})")
+    invalidate_known_people_cache()
     return len(chunks)
 
 
@@ -329,6 +336,7 @@ def index_personal_data():
             continue  
         total_chunks += index_single_file(file_path)
 
+    invalidate_known_people_cache()
     print(f"\nDone. Indexed {len(txt_files)} file(s), {total_chunks} total chunks.")
 
 
@@ -919,18 +927,32 @@ KNOWN_PEOPLE_PAGE_SIZE = 1000  # ChromaDB's SQLite backend errors on unpaginated
                                 # through results instead of fetching all at once.
 
 
-_known_people_cache = {"count": -1, "people": set()}
+_known_people_cache = {"count": -1, "people": set(), "expires_at": 0.0}
+KNOWN_PEOPLE_TTL_SECONDS = 300.0  # 5 minutes TTL
+
+
+def invalidate_known_people_cache():
+    """Invalidates the in-memory cache of known people so subsequent calls refresh from ChromaDB."""
+    global _known_people_cache
+    _known_people_cache = {"count": -1, "people": set(), "expires_at": 0.0}
 
 
 def get_known_people() -> set[str]:
+    """Returns the set of unique person names mentioned across indexed data,
+    cached with a 300-second TTL to avoid repeated collection.count() queries."""
     global _known_people_cache
+    now = time.monotonic()
+    if now < _known_people_cache.get("expires_at", 0.0) and _known_people_cache.get("people"):
+        return _known_people_cache["people"]
+
     try:
         collection = get_collection()
         count = collection.count()
         if count == 0:
             return set()
 
-        if _known_people_cache.get("count") == count:
+        if _known_people_cache.get("count") == count and _known_people_cache.get("people"):
+            _known_people_cache["expires_at"] = now + KNOWN_PEOPLE_TTL_SECONDS
             return _known_people_cache["people"]
 
         people = set()
@@ -946,7 +968,11 @@ def get_known_people() -> set[str]:
                 if meta and meta.get("person"):
                     people.add(meta["person"])
             offset += KNOWN_PEOPLE_PAGE_SIZE
-        _known_people_cache = {"count": count, "people": people}
+        _known_people_cache = {
+            "count": count,
+            "people": people,
+            "expires_at": now + KNOWN_PEOPLE_TTL_SECONDS
+        }
         return people
     except Exception as e:
         # Fail-open, but never silently: an empty set here is
@@ -957,10 +983,11 @@ def get_known_people() -> set[str]:
 
 
 TRIVIAL_MESSAGE_PATTERNS = {
-    "hi", "hey", "hello", "yo", "sup", "hii", "hiii", "heyy",
-    "lol", "lmao", "ok", "okay", "k", "kk", "cool", "nice",
-    "thanks", "thank you", "ty", "bye", "gn", "gm", "good morning",
-    "good night", "wassup", "whats up", "what's up"
+    "hi", "hey", "hello", "yo", "sup", "hii", "hiii", "heyy", "heyyy",
+    "lol", "lmao", "rofl", "ok", "okay", "k", "kk", "cool", "nice",
+    "thanks", "thank you", "ty", "thx", "bye", "gn", "gm", "good morning",
+    "good night", "wassup", "whats up", "what's up", "yeah", "yep", "nope",
+    "sure", "alright"
 }
 
 
@@ -974,8 +1001,6 @@ def is_trivial_message(message: str) -> bool:
             remainder = cleaned.replace(pat, "").strip(" ,!?.")
             if not remainder or remainder in TRIVIAL_MESSAGE_PATTERNS:
                 return True
-    if len(cleaned) <= 4 and cleaned.isalpha():
-        return True
     return False
 
 
@@ -1027,8 +1052,19 @@ MONTH_NAMES = [
 
 
 def parse_date_reference(message: str) -> tuple[date, date] | None:
-    msg = message.lower()
+    msg = message.lower().strip()
     today = date.today()
+
+    # Guard against casual conversational phrases using "today"
+    casual_today_patterns = [
+        r"^how\s+(?:r|are)\s+u\s+today\b",
+        r"^how\s+(?:r|are)\s+you\s+today\b",
+        r"^how\s+is\s+it\s+going\s+today\b",
+        r"^how\s+was\s+your\s+day\b",
+        r"^what'?s\s+up\s+today\b",
+    ]
+    if any(re.search(p, msg) for p in casual_today_patterns):
+        return None
 
     if "day before yesterday" in msg:
         d = today - timedelta(days=2)
@@ -1036,7 +1072,7 @@ def parse_date_reference(message: str) -> tuple[date, date] | None:
     if "yesterday" in msg:
         d = today - timedelta(days=1)
         return d, d
-    if "today" in msg:
+    if re.search(r"\b(?:earlier\s+today|from\s+today|chats?\s+today|today'?s\s+chat|events?\s+today)\b", msg) or msg == "today":
         return today, today
     if "last week" in msg:
         this_week_start = today - timedelta(days=today.weekday())
@@ -1052,8 +1088,12 @@ def parse_date_reference(message: str) -> tuple[date, date] | None:
             d = today - timedelta(days=days_since)
             return d, d
 
-    looks_date_like = bool(re.search(r"\d{1,2}(st|nd|rd|th)?[\s/-]", msg)) or any(m in msg for m in MONTH_NAMES)
-    if looks_date_like:
+    # Require explicit date context: day with month or formatted date/year
+    has_month = any(re.search(rf"\b{m}\b", msg) for m in MONTH_NAMES)
+    has_date_format = bool(re.search(r"\b\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?\b", msg))
+    has_year = bool(re.search(r"\b(?:in|year|since)\s+(?:19|20)\d{2}\b", msg))
+
+    if has_month or has_date_format or has_year:
         try:
             parsed = dateutil_parser.parse(message, fuzzy=True, dayfirst=True, default=datetime(today.year, 1, 1))
             return parsed.date(), parsed.date()
@@ -1176,11 +1216,14 @@ def search_personal_data(query: str, top_k: int = 6, max_result_chars: int = MAX
         margin = max(best_distance * 0.5, 0.15)
         threshold = best_distance + margin
         filtered = [
-            (doc, meta) for doc, meta, dist in zip(documents, metadatas, distances)
+            (id_, doc, meta) for id_, doc, meta, dist in zip(ids, documents, metadatas, distances)
             if dist <= threshold
         ]
         if filtered:
-            documents, metadatas = zip(*filtered)
+            ids, documents, metadatas = zip(*filtered)
+            ids = list(ids)
+            documents = list(documents)
+            metadatas = list(metadatas)
 
     if HYBRID_SEARCH_ENABLED and ids:
         try:
