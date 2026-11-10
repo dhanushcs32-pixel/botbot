@@ -6,6 +6,7 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import {
   Send,
+  Check,
   CheckCheck,
   Activity,
   Sparkles,
@@ -22,7 +23,9 @@ import {
   Palette,
   Copy,
   Plus,
-  Brain
+  Brain,
+  Camera,
+  Bell
 } from "lucide-react";
 import { formatBytes, extractTextFromPDF } from "./lib/fileParser";
 import { ChatMessage, WallpaperConfig, Attachment } from "./types";
@@ -31,6 +34,7 @@ import WallpaperSettings from "./components/WallpaperSettings";
 import { LocalNotifications } from '@capacitor/local-notifications';
 import { App as CapApp } from '@capacitor/app';
 import { Clipboard } from '@capacitor/clipboard';
+import { toPng } from 'html-to-image';
 
 // --- CoT diagnostic mode (separate one-shot REST path; NOT the websocket pipeline) ---
 interface CoTEntry {
@@ -207,7 +211,7 @@ export default function App() {
   });
 
   const [fastApiBaseUrl, setFastApiBaseUrl] = useState<string>(() => {
-    return safeGetItem("whatsapp_fastapi_base_url") || "";
+    return safeGetItem("whatsapp_fastapi_base_url") || (import.meta as any).env?.VITE_FASTAPI_BASE_URL || "";
   });
 
   const [fastApiKey, setFastApiKey] = useState<string>(() => {
@@ -281,7 +285,7 @@ export default function App() {
   const [showChatWallpaperDrawer, setShowChatWallpaperDrawer] = useState(false);
   const [replyingTo, setReplyingTo] = useState<ChatMessage | null>(null);
   const [showInspectorPanel, setShowInspectorPanel] = useState(true);
-  const [isMobileSidebarOpen, setIsMobileSidebarOpen] = useState(true);
+  const [isMobileSidebarOpen, setIsMobileSidebarOpen] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
 
   const [attachedFiles, setAttachedFiles] = useState<Attachment[]>([]);
@@ -340,11 +344,144 @@ export default function App() {
   const [isTestingConnection, setIsTestingConnection] = useState(false);
   const [connectionTestResult, setConnectionTestResult] = useState<{ success: boolean; message: string } | null>(null);
   const [isConnected, setIsConnected] = useState(false);
+  const [toastMessage, setToastMessage] = useState<string | null>(null);
 
   const socketRef = useRef<WebSocket | null>(null);
   const chatEndRef = useRef<HTMLDivElement>(null);
+  const chatFlowRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const sessionInputRef = useRef<HTMLInputElement>(null);
+  const toastTimeoutRef = useRef<any>(null);
+
+  const showToast = useCallback((msg: string) => {
+    if (toastTimeoutRef.current) clearTimeout(toastTimeoutRef.current);
+    setToastMessage(msg);
+    toastTimeoutRef.current = setTimeout(() => {
+      setToastMessage(null);
+    }, 2500);
+  }, []);
+
+  const copyToClipboard = useCallback(async (text: string) => {
+    let copied = false;
+    try {
+      await Clipboard.write({ string: text });
+      copied = true;
+    } catch {
+      // Ignore Capacitor clipboard error
+    }
+    if (!copied && typeof navigator !== "undefined" && navigator.clipboard && window.isSecureContext) {
+      try {
+        await navigator.clipboard.writeText(text);
+        copied = true;
+      } catch {
+        // Ignore navigator clipboard error
+      }
+    }
+    if (!copied) {
+      try {
+        const textarea = document.createElement("textarea");
+        textarea.value = text;
+        textarea.style.position = "fixed";
+        textarea.style.left = "-999999px";
+        textarea.style.top = "-999999px";
+        document.body.appendChild(textarea);
+        textarea.focus();
+        textarea.select();
+        const res = document.execCommand("copy");
+        document.body.removeChild(textarea);
+        if (res) copied = true;
+      } catch (e) {
+        console.warn("execCommand copy failed", e);
+      }
+    }
+    if (copied) {
+      showToast("Copied to clipboard!");
+    } else {
+      showToast("Failed to copy");
+    }
+  }, [showToast]);
+
+  const triggerNotification = useCallback(async (title: string, body: string) => {
+    let dispatched = false;
+    if (typeof window !== "undefined" && "Notification" in window) {
+      if (Notification.permission === "granted") {
+        try {
+          new Notification(title, {
+            body,
+            icon: "/pwa-192x192.png"
+          });
+          dispatched = true;
+        } catch (e) {
+          console.debug("Web Notification failed", e);
+        }
+      }
+    }
+    try {
+      await LocalNotifications.schedule({
+        notifications: [{
+          title,
+          body,
+          id: Math.floor(Math.random() * 1000000),
+          schedule: { at: new Date(Date.now() + 100) },
+          sound: 'default'
+        }]
+      });
+      dispatched = true;
+    } catch (notifyErr) {
+      console.debug("LocalNotifications schedule failed", notifyErr);
+    }
+    return dispatched;
+  }, []);
+
+  const requestNotificationPermissions = useCallback(async (): Promise<boolean> => {
+    let granted = false;
+    if (typeof window !== "undefined" && "Notification" in window) {
+      try {
+        const perm = await Notification.requestPermission();
+        if (perm === "granted") granted = true;
+      } catch (e) {
+        console.warn("Notification.requestPermission error", e);
+      }
+    }
+    try {
+      const status = await LocalNotifications.checkPermissions();
+      if (status.display !== 'granted') {
+        const req = await LocalNotifications.requestPermissions();
+        if (req.display === 'granted') granted = true;
+      } else {
+        granted = true;
+      }
+    } catch (e) {
+      console.debug("Capacitor LocalNotifications permission check failed", e);
+    }
+    return granted;
+  }, []);
+
+  const captureLongScreenshot = useCallback(async () => {
+    if (!chatFlowRef.current) return;
+    showToast("Generating screenshot...");
+    try {
+      const node = chatFlowRef.current;
+      const dataUrl = await toPng(node, {
+        backgroundColor: wallpaper.type === "solid" || wallpaper.type === "preset" ? wallpaper.value : "#efeae2",
+        pixelRatio: 2,
+        height: node.scrollHeight,
+        style: {
+          height: 'auto',
+          maxHeight: 'none',
+          overflow: 'visible'
+        }
+      });
+      const link = document.createElement('a');
+      link.download = `botbot_chat_${Date.now()}.png`;
+      link.href = dataUrl;
+      link.click();
+      showToast("Screenshot captured!");
+    } catch (err) {
+      console.error("Screenshot capture failed:", err);
+      showToast("Screenshot capture failed");
+    }
+  }, [wallpaper, showToast]);
 
   const reconnectTimeoutRef = useRef<any>(null);
   const reconnectAttemptsRef = useRef<number>(0);
@@ -589,19 +726,8 @@ export default function App() {
             return updated;
           });
 
-          try {
-            await LocalNotifications.schedule({
-              notifications: [{
-                title: botConfig.name,
-                body: botMsg.text,
-                id: Math.floor(Math.random() * 1000000),
-                schedule: { at: new Date(Date.now() + 100) },
-                sound: 'default'
-              }]
-            });
-          } catch (notifyErr) {
-            console.warn("Notifications not available or permission denied", notifyErr);
-          }
+          // Trigger notification (Web Notification or Capacitor LocalNotifications)
+          triggerNotification(botConfig.name, botMsg.text);
         };
 
         socket.onclose = () => {
@@ -682,9 +808,13 @@ export default function App() {
 
   useEffect(() => {
     const requestPermissions = async () => {
-      const status = await LocalNotifications.checkPermissions();
-      if (status.display !== 'granted') {
-        await LocalNotifications.requestPermissions();
+      try {
+        const status = await LocalNotifications.checkPermissions();
+        if (status.display !== 'granted') {
+          await LocalNotifications.requestPermissions();
+        }
+      } catch {
+        // Ignored when running outside Capacitor mobile shell
       }
     };
     requestPermissions();
@@ -1102,9 +1232,9 @@ export default function App() {
     const isMe = msg.sender === "user";
     return (
       <div className={`flex flex-col relative group w-full ${isMe ? "items-end" : "items-start"}`}>
-        <div className={`opacity-0 group-hover:opacity-100 absolute top-1/2 -translate-y-1/2 flex items-center space-x-1 z-20 ${isMe ? "right-[77%] mr-2" : "left-[77%] ml-2"}`}>
-          <button type="button" onClick={() => setReplyingTo(msg)} className="p-1.5 bg-white border border-slate-200 text-slate-500 rounded-full shadow-md"><CornerUpLeft className="w-3.5 h-3.5" /></button>
-          <button type="button" onClick={async (e) => { e.stopPropagation(); await Clipboard.write({ string: msg.text }); addLog("Copied!", "info"); }} className="p-1.5 bg-white border border-slate-200 text-slate-500 rounded-full shadow-md"><Copy className="w-3.5 h-3.5" /></button>
+        <div className={`opacity-80 sm:opacity-0 group-hover:opacity-100 transition-opacity absolute top-1/2 -translate-y-1/2 flex items-center space-x-1 z-20 ${isMe ? "right-[77%] mr-2" : "left-[77%] ml-2"}`}>
+          <button type="button" onClick={() => setReplyingTo(msg)} title="Reply" className="p-1.5 bg-white border border-slate-200 text-slate-500 rounded-full shadow-md hover:bg-slate-50 cursor-pointer"><CornerUpLeft className="w-3.5 h-3.5" /></button>
+          <button type="button" onClick={(e) => { e.stopPropagation(); copyToClipboard(msg.text); }} title="Copy Message" className="p-1.5 bg-white border border-slate-200 text-slate-500 rounded-full shadow-md hover:bg-slate-50 cursor-pointer"><Copy className="w-3.5 h-3.5" /></button>
         </div>
         <div className={`max-w-[85%] sm:max-w-[75%] rounded-2xl px-3.5 py-2 shadow-sm text-[14.5px] relative ${isMe ? "bg-[#d9fdd3] text-[#111b21] rounded-tr-none" : "bg-white text-[#111b21] rounded-tl-none"}`}>
           <div className={`absolute top-0 w-2 h-2 ${isMe ? "right-[-4px] border-t-[8px] border-t-[#d9fdd3] border-r-[4px] border-r-transparent" : "left-[-4px] border-t-[8px] border-t-white border-l-[4px] border-l-transparent"}`} />
@@ -1270,6 +1400,45 @@ export default function App() {
                     <p className="text-[10px] leading-relaxed text-slate-500">Sends messages to a special diagnostic endpoint that also returns the model's self-narrated reasoning before the reply. Takes several minutes per message. Requires the primary API key (guest keys are rejected server-side). The reasoning is a self-report, NOT verified to reflect the model's actual process.</p>
                   </div>
 
+                  <div className="bg-white p-4 rounded-xl border border-slate-200/60 space-y-3 shadow-xs">
+                    <div className="flex items-center justify-between border-b border-slate-100 pb-1.5">
+                      <h4 className="text-xs font-bold text-slate-800 flex items-center uppercase tracking-wider">
+                        <Bell className="w-4 h-4 mr-1.5 text-[#00a884]" /> Notifications
+                      </h4>
+                      <span className="text-[10px] text-slate-400 font-medium">Alerts & Badges</span>
+                    </div>
+                    <p className="text-[10.5px] leading-relaxed text-slate-500">
+                      Receive notifications when {botConfig.name} replies while this tab or app is in the background.
+                    </p>
+                    <div className="flex gap-2">
+                      <button
+                        type="button"
+                        onClick={async () => {
+                          const ok = await requestNotificationPermissions();
+                          if (ok) {
+                            showToast("Notifications enabled!");
+                          } else {
+                            showToast("Permission status checked");
+                          }
+                        }}
+                        className="flex-1 bg-slate-100 hover:bg-slate-200 text-slate-700 py-1.5 px-3 rounded-lg font-bold text-[10px] transition cursor-pointer"
+                      >
+                        Enable Notifications
+                      </button>
+                      <button
+                        type="button"
+                        onClick={async () => {
+                          await triggerNotification(botConfig.name, "Test notification: BotBot alerts are working!");
+                          showToast("Test notification dispatched!");
+                        }}
+                        className="flex-1 bg-[#128c7e] hover:bg-[#075e54] text-white py-1.5 px-3 rounded-lg font-bold text-[10px] transition shadow-xs flex items-center justify-center space-x-1 cursor-pointer"
+                      >
+                        <Bell className="w-3 h-3" />
+                        <span>Test Notification</span>
+                      </button>
+                    </div>
+                  </div>
+
                   <div className="bg-white p-4 rounded-xl border border-slate-200/60 space-y-3.5 shadow-xs">
                     <div className="flex justify-between items-center"><h4 className="text-xs font-bold text-slate-800 flex items-center uppercase tracking-wider"><Sparkles className="w-4 h-4 mr-1.5 text-[#00a884]" /> Customize Bot Identity</h4></div>
                     <div className="space-y-2">
@@ -1360,19 +1529,26 @@ export default function App() {
           <div className={`flex-1 flex flex-col relative min-w-0 ${isMobileSidebarOpen ? "hidden md:flex" : "flex w-full"}`}>
 
             {/* HEADER */}
-            <div className="sticky top-0 bg-[#f0f2f5]/95 backdrop-blur-md px-3 py-2 flex items-center justify-between border-b border-slate-200 shadow-sm shrink-0 z-50 w-full h-[60px]">
-              <div className="flex items-center space-x-3 min-w-0">
+            <div className="sticky top-0 bg-[#f0f2f5]/95 backdrop-blur-md px-3 py-2 flex items-center justify-between border-b border-slate-200 shadow-sm shrink-0 z-50 w-full min-h-[60px]" style={{ paddingTop: 'max(0.5rem, env(safe-area-inset-top))' }}>
+              <div className="flex items-center space-x-2.5 min-w-0 flex-1 mr-2">
                 <button onClick={() => setIsMobileSidebarOpen(true)} className="p-1.5 hover:bg-slate-200 rounded-md transition shrink-0"><Menu className="w-6 h-6 text-slate-600" /></button>
                 <div className="shrink-0">{renderAvatar(botConfig.avatar, "w-10 h-10")}</div>
                 <div className="min-w-0 leading-tight">
                   <h3 className="font-bold text-[16px] text-slate-800 truncate leading-none mb-0.5">{botConfig.name}</h3>
                   <p className={`text-[10.5px] flex items-center font-medium truncate ${isConnected ? "text-[#00a884]" : "text-rose-500"}`}>
                     <span className={`w-1.5 h-1.5 rounded-full mr-2 shrink-0 ${isConnected ? "bg-emerald-500" : "bg-rose-500"}`}></span>
-                    <span className="truncate">{isConnected ? `LAN: ${fastApiBaseUrl}` : "Offline (Queueing locally)"}</span>
+                    <span className="truncate max-w-[130px] sm:max-w-[240px]">{isConnected ? (fastApiBaseUrl.includes("trycloudflare") ? "Tunnel Connected" : `LAN: ${fastApiBaseUrl}`) : "Offline (Queueing locally)"}</span>
                   </p>
                 </div>
               </div>
-              <button onClick={() => setShowChatWallpaperDrawer(!showChatWallpaperDrawer)} className={`p-2 rounded-full transition ${showChatWallpaperDrawer ? "bg-emerald-100 text-[#128c7e]" : "text-[#128c7e] hover:bg-slate-200"}`}><Palette className="w-5 h-5" /></button>
+              <div className="flex items-center space-x-1 shrink-0">
+                <button onClick={captureLongScreenshot} title="Capture Full Chat Screenshot" className="p-2 rounded-full text-slate-600 hover:bg-slate-200 transition cursor-pointer">
+                  <Camera className="w-5 h-5" />
+                </button>
+                <button onClick={() => setShowChatWallpaperDrawer(!showChatWallpaperDrawer)} title="Wallpaper Settings" className={`p-2 rounded-full transition cursor-pointer ${showChatWallpaperDrawer ? "bg-emerald-100 text-[#128c7e]" : "text-[#128c7e] hover:bg-slate-200"}`}>
+                  <Palette className="w-5 h-5" />
+                </button>
+              </div>
             </div>
 
             {cotMode && (
@@ -1390,7 +1566,7 @@ export default function App() {
             )}
 
             {/* FLOW AREA */}
-            <div className="flex-1 flex flex-col space-y-4 px-3 py-4 z-10">
+            <div id="chat-flow-container" ref={chatFlowRef} className="flex-1 flex flex-col space-y-4 px-3 py-4 z-10">
               <div className="bg-[#ffe596]/70 backdrop-blur-xs text-[#6b5300] p-2 px-3.5 rounded-lg text-[11px] shadow-xs flex items-center justify-center space-x-2 border border-[#ffe596]/40 max-w-xs mx-auto mb-2"><Globe className="w-3.5 h-3.5 shrink-0" /><span className="font-semibold text-center select-none">Private — stays on your local network</span></div>
               {transcriptItems.map((item, idx) => {
                 const itemTs = item.kind === "msg" ? item.msg.timestamp : item.entry.timestamp;
@@ -1400,8 +1576,8 @@ export default function App() {
                 return (
                   <React.Fragment key={item.kind === "msg" ? item.msg.id : item.entry.id}>
                     {showDateDivider && (
-                      <div className="sticky top-[60px] z-40 flex justify-center py-4 pointer-events-none">
-                        <span className="bg-[#e1f3fc] text-[#025179] text-[10px] font-bold px-4 py-1 rounded-full uppercase tracking-widest select-none pointer-events-auto border border-sky-100 shadow-none">
+                      <div className="flex justify-center my-3 select-none date-separator-divider">
+                        <span className="bg-[#e1f3fc]/90 backdrop-blur-xs text-[#025179] text-[11px] font-semibold px-3 py-1 rounded-lg uppercase tracking-wider shadow-xs border border-sky-200/50">
                           {formatHeaderDate(itemTs)}
                         </span>
                       </div>
@@ -1508,6 +1684,13 @@ export default function App() {
               )}
             </div>
           </div>
+        </div>
+      )}
+      {/* FLOATING TOAST NOTIFICATION */}
+      {toastMessage && (
+        <div className="fixed bottom-20 left-1/2 -translate-x-1/2 z-[110] bg-slate-900/95 text-white text-xs font-medium px-4 py-2.5 rounded-full shadow-2xl backdrop-blur-md flex items-center space-x-2 animate-in fade-in slide-in-from-bottom-2 border border-slate-700/50">
+          <Check className="w-4 h-4 text-emerald-400 shrink-0" />
+          <span>{toastMessage}</span>
         </div>
       )}
     </div>
