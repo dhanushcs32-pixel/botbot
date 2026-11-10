@@ -6,7 +6,7 @@
 export interface Attachment {
   id: string;
   name: string;
-  type: "image" | "pdf" | "text";
+  type: "image" | "pdf" | "text" | "docx";
   size: string;
   url: string;         // Object URL for browser preview rendering
   base64?: string;     // Base64 representation for sending to APIs

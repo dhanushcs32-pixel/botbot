@@ -284,6 +284,7 @@ export default function App() {
   const [showWallpaperDrawer, setShowWallpaperDrawer] = useState(false);
   const [showChatWallpaperDrawer, setShowChatWallpaperDrawer] = useState(false);
   const [replyingTo, setReplyingTo] = useState<ChatMessage | null>(null);
+  const [selectedMessageId, setSelectedMessageId] = useState<string | null>(null);
   const [showInspectorPanel, setShowInspectorPanel] = useState(true);
   const [isMobileSidebarOpen, setIsMobileSidebarOpen] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
@@ -1230,17 +1231,51 @@ export default function App() {
 
   const renderMessage = (msg: ChatMessage) => {
     const isMe = msg.sender === "user";
+    const isSelected = selectedMessageId === msg.id;
+
     return (
       <div className={`flex flex-col relative group w-full ${isMe ? "items-end" : "items-start"}`}>
-        <div className={`opacity-80 sm:opacity-0 group-hover:opacity-100 transition-opacity absolute top-1/2 -translate-y-1/2 flex items-center space-x-1 z-20 ${isMe ? "right-[77%] mr-2" : "left-[77%] ml-2"}`}>
-          <button type="button" onClick={() => setReplyingTo(msg)} title="Reply" className="p-1.5 bg-white border border-slate-200 text-slate-500 rounded-full shadow-md hover:bg-slate-50 cursor-pointer"><CornerUpLeft className="w-3.5 h-3.5" /></button>
-          <button type="button" onClick={(e) => { e.stopPropagation(); copyToClipboard(msg.text); }} title="Copy Message" className="p-1.5 bg-white border border-slate-200 text-slate-500 rounded-full shadow-md hover:bg-slate-50 cursor-pointer"><Copy className="w-3.5 h-3.5" /></button>
-        </div>
-        <div className={`max-w-[85%] sm:max-w-[75%] rounded-2xl px-3.5 py-2 shadow-sm text-[14.5px] relative ${isMe ? "bg-[#d9fdd3] text-[#111b21] rounded-tr-none" : "bg-white text-[#111b21] rounded-tl-none"}`}>
+        {isSelected && (
+          <div className={`absolute top-1/2 -translate-y-1/2 flex items-center space-x-1 z-20 ${isMe ? "right-[77%] mr-2" : "left-[77%] ml-2"}`}>
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                setReplyingTo(msg);
+                setSelectedMessageId(null);
+              }}
+              title="Reply"
+              className="p-1.5 bg-white border border-slate-200 text-slate-500 rounded-full shadow-md hover:bg-slate-50 cursor-pointer"
+            >
+              <CornerUpLeft className="w-3.5 h-3.5" />
+            </button>
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                copyToClipboard(msg.text);
+                setSelectedMessageId(null);
+              }}
+              title="Copy Message"
+              className="p-1.5 bg-white border border-slate-200 text-slate-500 rounded-full shadow-md hover:bg-slate-50 cursor-pointer"
+            >
+              <Copy className="w-3.5 h-3.5" />
+            </button>
+          </div>
+        )}
+        <div
+          onClick={(e) => {
+            e.stopPropagation();
+            setSelectedMessageId(isSelected ? null : msg.id);
+          }}
+          className={`max-w-[85%] sm:max-w-[75%] rounded-2xl px-3.5 py-2 shadow-sm text-[14.5px] relative cursor-pointer transition-all ${
+            isSelected ? "ring-2 ring-emerald-500 ring-offset-1" : ""
+          } ${isMe ? "bg-[#d9fdd3] text-[#111b21] rounded-tr-none" : "bg-white text-[#111b21] rounded-tl-none"}`}
+        >
           <div className={`absolute top-0 w-2 h-2 ${isMe ? "right-[-4px] border-t-[8px] border-t-[#d9fdd3] border-r-[4px] border-r-transparent" : "left-[-4px] border-t-[8px] border-t-white border-l-[4px] border-l-transparent"}`} />
           {msg.replyTo && (<div className="bg-black/5 border-l-4 border-emerald-600 rounded-lg p-2 mb-1.5 text-xs text-slate-600"><div className="font-bold text-emerald-700 text-[10px] uppercase">{msg.replyTo.sender === "user" ? "You" : botConfig.name}</div><div className="truncate">{msg.replyTo.text}</div></div>)}
           {msg.attachments?.map(att => (
-            <div key={att.id} className="rounded-lg overflow-hidden border border-black/5 mb-1.5 cursor-pointer" onClick={() => setViewingDocument(att)}>
+            <div key={att.id} className="rounded-lg overflow-hidden border border-black/5 mb-1.5 cursor-pointer" onClick={(e) => { e.stopPropagation(); setViewingDocument(att); }}>
               {att.type === "image" ? <img src={att.url || att.base64} className="max-h-64 w-full object-cover" /> : <div className="flex items-center space-x-2 p-2 bg-black/5"><FileText className="w-5 h-5 text-emerald-600" /><span className="text-xs font-bold truncate">{att.name}</span></div>}
             </div>
           ))}
@@ -1566,7 +1601,7 @@ export default function App() {
             )}
 
             {/* FLOW AREA */}
-            <div id="chat-flow-container" ref={chatFlowRef} className="flex-1 flex flex-col space-y-4 px-3 py-4 z-10">
+            <div id="chat-flow-container" ref={chatFlowRef} onClick={() => setSelectedMessageId(null)} className="flex-1 flex flex-col space-y-4 px-3 py-4 z-10">
               <div className="bg-[#ffe596]/70 backdrop-blur-xs text-[#6b5300] p-2 px-3.5 rounded-lg text-[11px] shadow-xs flex items-center justify-center space-x-2 border border-[#ffe596]/40 max-w-xs mx-auto mb-2"><Globe className="w-3.5 h-3.5 shrink-0" /><span className="font-semibold text-center select-none">Private — stays on your local network</span></div>
               {transcriptItems.map((item, idx) => {
                 const itemTs = item.kind === "msg" ? item.msg.timestamp : item.entry.timestamp;
