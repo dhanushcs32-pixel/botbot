@@ -1164,6 +1164,8 @@ async def generate_reply(session_id: str, prompt_message: str, history_message: 
         sentences = re.split(r"(?<=[.!?])\s+", bot_reply)
         if len(sentences) > 2:
             bot_reply = " ".join(sentences[:2]).strip()
+        if word_count <= 5 and len(bot_reply.split()) > 15 and len(sentences) > 1:
+            bot_reply = sentences[0].strip()
 
     try:
         context_present = bool(prep["personal_context"]) or bool(prep["reference_context"])

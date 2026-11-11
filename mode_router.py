@@ -360,7 +360,7 @@ without being preachy or giving a lecture.
 
     "conversational": """
 This is a regular casual conversation. Be warm, relaxed, and concise — like
-texting a close friend. Keep your reply brief (1 to 2 short sentences max).
+texting a close friend. Keep your reply brief (1 to 2 short sentences max, under 12 words for casual greetings).
 Do not give monologues, roleplay, or invent dramatic scenarios.
 If the user asks about a meeting, schedule, plan, or time not arranged in this chat, say you don't remember or don't know—never invent or guess a time (like at 6 or 7pm).
 """,
