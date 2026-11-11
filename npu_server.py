@@ -2,6 +2,8 @@ import os
 import re
 import time
 import asyncio
+import threading
+import gc
 from collections import deque
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -11,6 +13,7 @@ import uvicorn
 
 app = FastAPI(title="NPU LLM Offloader Server")
 npu_lock = asyncio.Lock()
+npu_infer_lock = threading.Lock()
 pipe = None
 loaded_model_path = None
 
@@ -74,16 +77,21 @@ def _log_free_ram(context: str) -> None:
         print(f"[npu_server] could not read host memory state: {e}")
 
 # --- LoRA adapter (style + formatting fine-tune) ---
-# Checked dynamically against model hidden_size: The existing
-# lora_adapter/adapter_model.safetensors was trained on Qwen2.5-7B
-# (hidden_size=3584) and will crash if attached to 4B (hidden_size=2560).
+# Dynamically verified against base model hidden_size:
+# For Qwen 4B (hidden_size=2560), lora_A in_features must be 2560.
 ADAPTER_DIR = "./lora_adapter"
 ADAPTER_PATH = os.path.join(ADAPTER_DIR, "adapter_model.safetensors")
-ADAPTER_ALPHA = 0.4
+LORA_ALPHA = float(os.getenv("LORA_ALPHA", "0.28"))
+ADAPTER_ALPHA = LORA_ALPHA
+CACHE_DIR = "./.npu_cache"
+os.makedirs(CACHE_DIR, exist_ok=True)
+
 # Dynamic selection: 4B if present, else 7B
 MODEL_DIR = "./qwen-4b-int4-ov" if os.path.isdir("./qwen-4b-int4-ov") else "./qwen2.5-7b-instruct-int4-ov"
 
 lora_active = False
+_cached_adapter = None
+_cached_adapter_config = None
 
 
 def _get_model_hidden_size(model_dir: str) -> Optional[int]:
@@ -101,24 +109,63 @@ def _get_model_hidden_size(model_dir: str) -> Optional[int]:
         return None
 
 
-def _load_adapter_config(model_dir: str):
-    """Loads the trained LoRA adapter only if compatible with model hidden_size."""
-    global lora_active
-    hidden_size = _get_model_hidden_size(model_dir)
-    if hidden_size is not None and hidden_size != 3584:
-        print(f"[npu_server] Model at '{model_dir}' has hidden_size={hidden_size} (requires 3584 for 7B LoRA). Skipping LoRA adapter cleanly.")
-        lora_active = False
+def _get_adapter_in_features(adapter_path: str) -> Optional[int]:
+    """Inspects the first self-attention/projection lora_A tensor in adapter_path for in_features."""
+    if not os.path.isfile(adapter_path):
         return None
+    try:
+        from safetensors import safe_open
+        with safe_open(adapter_path, framework="pt") as f:
+            # Check projection layers first
+            for k in f.keys():
+                if "lora_A" in k and any(proj in k for proj in ["q_proj", "k_proj", "v_proj", "gate_proj", "up_proj"]):
+                    shape = f.get_tensor(k).shape
+                    if len(shape) >= 2:
+                        return shape[1]
+            # Fallback to any lora_A
+            for k in f.keys():
+                if "lora_A" in k:
+                    shape = f.get_tensor(k).shape
+                    if len(shape) >= 2:
+                        return shape[1]
+    except Exception as e:
+        print(f"[LoRA] Could not inspect adapter tensors in {adapter_path}: {e}")
+    return None
+
+
+def _load_adapter_config(model_dir: str):
+    """Loads the trained LoRA adapter only if compatible with model hidden_size.
+    Ensures Adapter and AdapterConfig are instantiated ONCE globally at server startup.
+    """
+    global lora_active, LORA_ALPHA, ADAPTER_ALPHA, _cached_adapter, _cached_adapter_config
+    if _cached_adapter_config is not None:
+        return _cached_adapter_config
+
+    LORA_ALPHA = float(os.getenv("LORA_ALPHA", "0.28"))
+    ADAPTER_ALPHA = LORA_ALPHA
+
+    hidden_size = _get_model_hidden_size(model_dir)
     if not os.path.isfile(ADAPTER_PATH):
         print(f"[LoRA] No adapter found at '{ADAPTER_PATH}' — running base model without style adapter.")
         lora_active = False
         return None
+
+    adapter_in_features = _get_adapter_in_features(ADAPTER_PATH)
+    if hidden_size is not None and adapter_in_features is not None:
+        if hidden_size != adapter_in_features:
+            print(f"[npu_server] Model at '{model_dir}' hidden_size={hidden_size} does not match adapter in_features={adapter_in_features}. Skipping LoRA adapter cleanly.")
+            lora_active = False
+            return None
+        print(f"[npu_server] Dynamic LoRA check verified: model hidden_size ({hidden_size}) == adapter in_features ({adapter_in_features}).")
+    elif hidden_size is None:
+        print(f"[npu_server] Could not determine model hidden_size for '{model_dir}'. Proceeding.")
+
     try:
-        adapter = ov_genai.Adapter(ADAPTER_PATH)
-        config = ov_genai.AdapterConfig(adapter, ADAPTER_ALPHA)
-        print(f"[LoRA] Loaded adapter from '{ADAPTER_PATH}' (alpha={ADAPTER_ALPHA}).")
+        _cached_adapter = ov_genai.Adapter(str(ADAPTER_PATH))
+        _cached_adapter_config = ov_genai.AdapterConfig(_cached_adapter, alpha=LORA_ALPHA)
+        print(f"[LoRA] Loaded single global adapter instance from '{ADAPTER_PATH}' (alpha={LORA_ALPHA}).")
         lora_active = True
-        return config
+        return _cached_adapter_config
     except Exception as e:
         print(f"[LoRA] Failed to load adapter from '{ADAPTER_PATH}': {e} — running base model without style adapter.")
         lora_active = False
@@ -153,6 +200,8 @@ def _build_pipeline(path, device, **kwargs):
     silently fall back to the un-adapted base model's behavior while
     NPU-routed requests got the adapter, an inconsistency worth avoiding.
     """
+    if "CACHE_DIR" not in kwargs:
+        kwargs["CACHE_DIR"] = CACHE_DIR
     if adapter_config is not None:
         kwargs = {**kwargs, "adapters": adapter_config}
     return ov_genai.LLMPipeline(path, device, **kwargs)
@@ -425,10 +474,27 @@ async def get_gpu_pipeline():
 
 def run_inference(target_pipe, prompt: str, config: ov_genai.GenerationConfig) -> str:
     """Wrapper function to run in executor. Takes the pipe explicitly
-    now (NPU or lazily-compiled GPU) rather than always reading the
-    global `pipe`, so the /api/chat routing logic can pick which
-    device actually handles a given request."""
-    return target_pipe.generate(prompt, config)
+    now (NPU or lazily-compiled GPU).
+    Protected by threading.Lock() and auto-recovery for 9+ hour continuous uptime."""
+    global pipe, loaded_model_path, effective_max_prompt_len
+    with npu_infer_lock:
+        try:
+            return target_pipe.generate(prompt, config)
+        except RuntimeError as e:
+            err_str = str(e)
+            if "DEVICE_LOST" in err_str or "ZE_RESULT_ERROR" in err_str or "infer_request" in err_str or "RuntimeError" in err_str:
+                print(f"[NPU Uptime Guard] NPU driver error encountered: {e}. Auto-recovering pipeline from cache...")
+                try:
+                    gc.collect()
+                    target_model = loaded_model_path if loaded_model_path else MODEL_DIR
+                    pipe = _build_pipeline(target_model, "NPU", MAX_PROMPT_LEN=MAX_PROMPT_LEN)
+                    effective_max_prompt_len = MAX_PROMPT_LEN
+                    print("[NPU Uptime Guard] Pipeline recovered successfully. Retrying generation...")
+                    return pipe.generate(prompt, config)
+                except Exception as rec_err:
+                    print(f"[NPU Uptime Guard] Recovery retry failed: {rec_err}")
+                    raise e
+            raise e
 
 
 @app.get("/")
@@ -440,6 +506,7 @@ def read_root():
     }
 
 @app.get("/api/health")
+@app.get("/health")
 def health():
     # Truthful health: previously returned a static "ok" even when no
     # model had loaded (pipe is None) — the server looked healthy while
@@ -522,30 +589,6 @@ async def chat(payload: ChatRequest):
     global pipe
     if not pipe:
         raise HTTPException(status_code=503, detail="Model pipeline is not initialized or loaded.")
-        
-    # Format messages using OpenVINO GenAI tokenizer's chat template
-    try:
-        tokenizer = pipe.get_tokenizer()
-        prompt = tokenizer.apply_chat_template(payload.messages, add_generation_prompt=True)
-    except Exception as e:
-        # Fallback to manual ChatML formatting (Qwen standard)
-        print(f"Error applying template: {e}. Formatting manually.")
-        prompt = ""
-        for msg in payload.messages:
-            role = msg.get("role", "user")
-            content = msg.get("content", "")
-            prompt += f"<|im_start|>{role}\n{content}<|im_end|>\n"
-        prompt += "<|im_start|>assistant\n"
-
-    # Native no-think instruct mode for Qwen 4B when not in explicit diagnostic reasoning mode
-    active_content = ""
-    if payload.messages:
-        sys_content = payload.messages[0].get("content", "") if payload.messages[0].get("role") == "system" else ""
-        latest_content = payload.messages[-1].get("content", "")
-        active_content = sys_content + "\n" + latest_content
-    is_cot_request = "<reasoning>" in active_content
-    if not is_cot_request and prompt.endswith("<|im_start|>assistant\n"):
-        prompt += "<think>\n\n</think>\n\n"
 
     # Setup OpenVINO GenAI GenerationConfig
     config = ov_genai.GenerationConfig()
@@ -570,12 +613,12 @@ async def chat(payload: ChatRequest):
     }
     config.include_stop_str_in_output = False
 
-    # Default sampling parameters tuned for Qwen3-4B
-    # (prevents runaway monologue & vertical newline degenerations)
-    temp = 0.6
+    # Default sampling parameters tuned for Qwen 4B with LoRA
+    # (prevents dreamy wandering and random memory drift)
+    temp = 0.45
     top_p = 0.85
     top_k = 20
-    rep_penalty = 1.05
+    rep_penalty = 1.12
 
     if payload.options:
         opts = payload.options
@@ -602,6 +645,57 @@ async def chat(payload: ChatRequest):
     if top_k > 0:
         config.top_k = int(top_k)
     config.repetition_penalty = float(rep_penalty)
+
+    max_allowed_prompt = MAX_PROMPT_LEN - config.max_new_tokens - 64
+
+    # Format messages using OpenVINO GenAI tokenizer's chat template
+    def _format_chatml(msgs):
+        try:
+            tokenizer = pipe.get_tokenizer()
+            return tokenizer.apply_chat_template(msgs, add_generation_prompt=True)
+        except Exception as e:
+            # Fallback to manual ChatML formatting (Qwen standard)
+            p = ""
+            for msg in msgs:
+                role = msg.get("role", "user")
+                content = msg.get("content", "")
+                p += f"<|im_start|>{role}\n{content}<|im_end|>\n"
+            p += "<|im_start|>assistant\n"
+            return p
+
+    messages = list(payload.messages)
+    prompt = _format_chatml(messages)
+    tok_est = estimate_tokens(prompt)
+    if tok_est is None:
+        tok_est = len(prompt) // 3
+
+    # Hard prompt token truncation: truncate oldest conversation history turns first,
+    # preserving system prompt (messages[0]) and latest user turn (messages[-1]).
+    if tok_est > max_allowed_prompt and len(messages) > 2:
+        print(f"[prompt_guard] Prompt tokens ({tok_est}) exceed max allowed ({max_allowed_prompt}). Pruning history turns...")
+        while tok_est > max_allowed_prompt and len(messages) > 2:
+            messages.pop(1)
+            prompt = _format_chatml(messages)
+            tok_est = estimate_tokens(prompt)
+            if tok_est is None:
+                tok_est = len(prompt) // 3
+        print(f"[prompt_guard] Pruned prompt to {tok_est} tokens across {len(messages)} turns.")
+
+    if tok_est > max_allowed_prompt and messages:
+        excess_chars = (tok_est - max_allowed_prompt) * 4 + 128
+        if len(messages[-1].get("content", "")) > excess_chars:
+            messages[-1]["content"] = messages[-1]["content"][:-excess_chars] + " [truncated]"
+            prompt = _format_chatml(messages)
+
+    # Native no-think instruct mode for Qwen 4B when not in explicit diagnostic reasoning mode
+    active_content = ""
+    if messages:
+        sys_content = messages[0].get("content", "") if messages[0].get("role") == "system" else ""
+        latest_content = messages[-1].get("content", "")
+        active_content = sys_content + "\n" + latest_content
+    is_cot_request = "<reasoning>" in active_content
+    if not is_cot_request and prompt.endswith("<|im_start|>assistant\n"):
+        prompt += "<think>\n\n</think>\n\n"
 
     # --- Route to NPU or GPU based on real estimated prompt size ---
     # NPU has a hard compiled MAX_PROMPT_LEN=6144 — exceeding it fails

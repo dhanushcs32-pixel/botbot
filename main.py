@@ -204,6 +204,24 @@ def collapse_vertical_stacking(text: str) -> str:
     return text
 
 
+def collapse_repetitive_phrases(text: str) -> str:
+    """Collapses consecutive loops of identical sentences or short phrases."""
+    if not text:
+        return text
+    sentences = re.split(r"(?<=[.!?])\s+", text)
+    if len(sentences) <= 2:
+        return text
+    deduped = []
+    for s in sentences:
+        s_clean = s.strip()
+        if not s_clean:
+            continue
+        if deduped and s_clean.lower() == deduped[-1].strip().lower():
+            continue
+        deduped.append(s_clean)
+    return " ".join(deduped)
+
+
 def check_style_violations(text: str) -> list[str]:
     violations = []
     if EMOJI_PATTERN.search(text):
@@ -222,7 +240,7 @@ def check_style_violations(text: str) -> list[str]:
     return violations
 
 
-def scrub_reply(text: str, session_id: str = "", mode: str = "") -> str:
+def scrub_reply(text: str, session_id: str = "", mode: str = "", is_crisis: bool = False) -> str:
     if not text:
         return text
 
@@ -264,6 +282,9 @@ def scrub_reply(text: str, session_id: str = "", mode: str = "") -> str:
     # Collapse pathological 1-2 word newline stacking
     text = collapse_vertical_stacking(text)
 
+    # Collapse looped/repeating sentences
+    text = collapse_repetitive_phrases(text)
+
     text = re.sub(r"[ \t]{2,}", " ", text).strip()
 
     try:
@@ -279,6 +300,17 @@ def scrub_reply(text: str, session_id: str = "", mode: str = "") -> str:
             )
     except Exception as e:
         print(f"[semantic_style_check] error, skipping: {e}")
+
+    # Strip out unsolicited helpline numbers / clinical hotline scripts if the model generated any
+    sentences = re.split(r"(?<=[.!?])\s+", text)
+    cleaned_sentences = [
+        s for s in sentences
+        if not re.search(r"\b(?:988\d*|14416|helpline|lifeline|tele-manas|hotline)\b", s, re.IGNORECASE)
+    ]
+    if cleaned_sentences:
+        text = " ".join(cleaned_sentences).strip()
+    elif not text.strip() and raw_cleaned:
+        text = "I hear you, and I'm right here with you. What's on your mind?"
 
     # Fallback: if scrub_reply completely wiped the text, fall back to cleaned raw reply
     if not text.strip() and raw_cleaned:
@@ -355,9 +387,9 @@ async def _call_npu_once(messages: list, num_predict: int = 250) -> str:
                             "stream": False,
                             "options": {
                                 "num_predict": num_predict,
-                                "temperature": 0.6,
+                                "temperature": 0.45,
                                 "top_p": 0.85,
-                                "repeat_penalty": 1.05
+                                "repeat_penalty": 1.12
                             }
                         }
                     )
@@ -1127,7 +1159,7 @@ async def generate_reply(session_id: str, prompt_message: str, history_message: 
     predict_tokens = 75 if is_casual_short else 250
 
     raw_reply = await _call_npu_once(prep["messages"], num_predict=predict_tokens)
-    bot_reply = await asyncio.to_thread(scrub_reply, raw_reply, session_id=session_id, mode=mode)
+    bot_reply = await asyncio.to_thread(scrub_reply, raw_reply, session_id=session_id, mode=mode, is_crisis=is_crisis)
     if is_casual_short:
         sentences = re.split(r"(?<=[.!?])\s+", bot_reply)
         if len(sentences) > 2:
@@ -1464,7 +1496,7 @@ async def chat_cot(payload: CotRequest, request: Request,
     # Tone parity with the normal path: the parsed reply goes through the
     # SAME scrub pipeline as /chat (emoji removal, AI-tell phrases,
     # structure rules, semantic style strip).
-    reply = await asyncio.to_thread(scrub_reply, reply, session_id=session_id, mode=prep["mode"])
+    reply = await asyncio.to_thread(scrub_reply, reply, session_id=session_id, mode=prep["mode"], is_crisis=prep.get("is_crisis", False))
 
     return {
         "mode": prep["mode"],

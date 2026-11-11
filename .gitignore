@@ -20,8 +20,16 @@ chat*.html
 # ==============================================================================
 personal_data/
 my_style.txt
+# Personal LoRA Data, Chat Exports & Adapters (NEVER COMMIT)
 lora data/
 lora_data/
+lora_adapter/*.safetensors
+lora_adapter/archive_7b/
+**/message_*.json
+**/lora_train_*.jsonl
+**/lora_val_*.jsonl
+**/steering_vectors_data.jsonl
+.npu_cache/
 master_clean_pairs.json
 clean_*_export.py
 instagram_*.py

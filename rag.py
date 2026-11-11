@@ -1014,6 +1014,15 @@ def should_bypass_personal_retrieval(query: str, laya_routing: dict | None = Non
     if is_trivial_message(query):
         return True
 
+    if is_meta_memory_question(query):
+        if known_people is None:
+            try:
+                known_people = get_known_people()
+            except Exception:
+                known_people = set()
+        if detect_mentioned_person(query, known_people) is None:
+            return True
+
     if laya_routing and not laya_routing.get("used_fallback"):
         ret_dec = laya_routing.get("retrieval_decision")
         ret_conf = laya_routing.get("retrieval_confidence", 0.0)
@@ -1034,7 +1043,11 @@ META_MEMORY_PATTERNS = [
     "our chats", "our past", "you and me", "you and i", "between us",
     "what did we talk", "what did we discuss", "have we talked",
     "have we discussed", "did i tell you", "did i mention",
-    "have i told you", "have i mentioned"
+    "have i told you", "have i mentioned", "what time we said",
+    "what time did we", "what time are we", "what time we're",
+    "did we say", "did we agree", "are we meeting", "when are we",
+    "when did we say", "remind me what time", "remind me when",
+    "remind me what we"
 ]
 
 

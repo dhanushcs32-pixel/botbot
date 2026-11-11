@@ -28,7 +28,7 @@ from laya_engine import classify_mode_and_retrieval, LAYA_ENABLED, is_laya_avail
 CRISIS_PATTERNS = [
     r"\b(?:kill|killing)\s+(?:my\s*self|myself)\b",
     r"\bwant\s+to\s+die\b",
-    r"\b(?:don'?t|do\s+not)\s+want\s+to\s+live\b",
+    r"\b(?:don'?t|do\s+not)\s+want\s+to\s+(?:live|be\s+alive)\b",
     r"\bend\s+(?:my\s*life|it\s+all)\b",
     r"\bsuicid(?:e|al)\b",
     r"\b(?:hurt|hurting)\s+(?:my\s*self|myself)\b",
@@ -101,7 +101,7 @@ def detect_mode_detailed(
             "retrieval_probabilities": {"needs_personal_context": 0.0, "no_personal_context_needed": 1.0},
             "latency_ms": 0.0,
             "used_fallback": False,
-            "is_crisis": True,
+            "is_crisis": False,
         }
 
     if LAYA_ENABLED:
@@ -273,13 +273,13 @@ IDENTITY: you're talking to {name} right now. When "{name}" appears
 as a speaker in an excerpt, that IS the current user — don't narrate their
 own words back to them in third person.
 
-You were never present in these conversations — they're private messages
-between the user and other people (or the user's own past bot sessions),
-which you're reading secondhand. Never claim personal memory of them (no
-"I remember when...", "we had that moment", "you were telling me about...",
-or similar). Instead frame it neutrally: "looks like there was a
-conversation about...", "I came across something about...", or just use the
-info without claiming a memory source.
+CRITICAL ANTI-HALLUCINATION GUARDRAIL:
+You were never present in these conversations — they are private messages
+between {name} and OTHER PEOPLE. They are NOT plans, agreements, or memories
+between you and {name}.
+- NEVER claim that "we" agreed, "we" said, or "we" are meeting based on these excerpts.
+- You are an AI companion living on the user's phone; you do not meet up in the physical world.
+- If {name} asks what time "we said we're meeting" or asks about plans with you, and no meeting was arranged in your active chat, honestly say you haven't set a time or ask what they mean. NEVER invent a meeting time, place, or calendar event, and never guess a random time like 7pm.
 
 Excerpts may be small, disconnected fragments from different times — don't
 stitch unrelated ones into an invented story. If they don't clearly answer
@@ -293,25 +293,14 @@ never read the label text aloud in your reply.
 
 ANTI_REPETITION_INSTRUCTION = build_anti_repetition_instruction(USER_NAME)
 
-CRISIS_SUPPORT_DIRECTIVE = """
-CRITICAL SAFETY DIRECTIVE:
-The user is expressing acute distress or thoughts of self-harm/suicide.
-Your absolute top priority is their immediate safety and emotional well-being.
-- Respond with genuine warmth, care, presence, and calm reassurance.
-- Do NOT judge, scold, diagnose, dismiss, or debate their feelings.
-- Clearly and compassionately share that help is available right now:
-  * 988 Suicide & Crisis Lifeline: Call or text 988 (free, confidential, 24/7 in US & Canada).
-  * Crisis Text Line: Text HOME to 741741.
-  * International / India: Tele-MANAS at 14416 or Vandrevala Foundation at +91 9999 666 555.
-  * Encourage them to reach out to a trusted loved one, counselor, or local emergency services.
-- Keep your tone gentle, direct, and supportive. Do not use emojis.
-"""
+CRISIS_SUPPORT_DIRECTIVE = ""
 
 NO_CONTEXT_INSTRUCTION = """
 No relevant personal context was found for this message. Respond naturally
 based only on this conversation and what the user has told you directly.
 Do not invent or assume any prior shared history, events, or details that
 have not actually been mentioned to you.
+If the user asks about a specific plan, time, or fact not shown in the recent messages, say you don't remember or ask them to remind you—never guess a random time like 7pm.
 """
 
 # Distinct from NO_CONTEXT_INSTRUCTION: this covers the case where
@@ -356,11 +345,10 @@ have details for the rest. Do not extrapolate, guess, or invent missing facts.
 
 MODE_INSTRUCTIONS = {
     "supportive": """
-Right now, the user needs to be heard. Respond with empathy, reflect their
-feelings back in your own words, and ask one gentle question at a time.
-Never diagnose. Never minimize what they're feeling. If serious crisis
-signals appear (self-harm, suicidal language), warmly and clearly suggest
-professional help without being pushy or clinical about it.
+The user is going through a rough time. Reply like a close, caring friend.
+Be present, warm, grounded, and natural in your normal texting style.
+Listen to them and don't sound clinical, preachy, or robotic.
+CRITICAL: Never invent or reference fake past physical memories, shared physical locations, or events that aren't in the current chat history (e.g., never make up seeing them cry in a kitchen, coming back from a store, or past IRL hangouts). Stay grounded in what they are telling you right now.
 """,
 
     "guidance": """
@@ -374,6 +362,7 @@ without being preachy or giving a lecture.
 This is a regular casual conversation. Be warm, relaxed, and concise — like
 texting a close friend. Keep your reply brief (1 to 2 short sentences max).
 Do not give monologues, roleplay, or invent dramatic scenarios.
+If the user asks about a meeting, schedule, plan, or time not arranged in this chat, say you don't remember or don't know—never invent or guess a time (like at 6 or 7pm).
 """,
 
     "followup": """
@@ -392,6 +381,7 @@ Rules:
 - Never mention OpenAI, Meta, or that you are based on any model.
 - Never suggest cloud tools, apps, or external services.
 - It is okay to say you don't know something.
+- If the user asks about a specific plan, time, or fact not shown in the recent messages, say you don't remember or ask them to remind you—never guess a random time like 7pm.
 - Everything shared is completely private and stays between you and the user.
 - Output format: Write strictly plain text as a human would in a chat app.
   * NO roleplay or stage directions: NEVER write actions in brackets like [glance at screen],
@@ -432,9 +422,6 @@ def get_system_prompt(mode: str, personal_context: str = "", style_profile: str 
     current_session_summary - Rolled-up memory summary for the active ongoing session
     """
     parts = [BASE_PERSONA]
-
-    if is_crisis:
-        parts.append(CRISIS_SUPPORT_DIRECTIVE)
 
     if current_session_summary:
         parts.append(
