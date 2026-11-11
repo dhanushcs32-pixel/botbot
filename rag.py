@@ -220,40 +220,23 @@ def chunk_messages(messages: list[dict], size: int = MESSAGES_PER_CHUNK,
 
 
 PLATFORM_MARKER_PATTERN = re.compile(r"(whatsapp|insta)", re.IGNORECASE)
+NOTE_FILE_PREFIXES = ("journal", "notes", "note", "diary", "todo")
 
 
 def extract_person_key(filename: str) -> str:
     """
     Derives a person key from a personal_data filename, e.g.
-    "Name1Whatsapp.txt" / "NameInsta.txt" -> "name" (both files
-    for the same person resolve to the SAME key, regardless of platform
-    or whether a digit happens to appear in the filename).
-
-    Previous version only stripped text starting from the first digit,
-    which broke in two ways confirmed against real filenames:
-      1. Filenames with NO digit (e.g. "NameInsta.txt",
-         "OtherNameInsta.txt") kept the platform word baked into the
-         key ("nameinsta", "othernameinsta"), which then almost
-         never substring-matches how a person actually phrases a
-         question, so detect_mentioned_person() silently failed and
-         search fell through to unfiltered similarity search instead.
-      2. Even when digit-stripping "worked", the SAME person's WhatsApp
-         and Insta export files could resolve to two DIFFERENT keys
-         depending on which file had a digit, splitting one person's
-         history across two separate, unmatched person keys.
-    Fixed by stripping the platform marker (whatsapp/insta, case
-    insensitive) wherever it appears in the filename, independent of
-    digit position, then separately trimming leading/trailing digit or
-    underscore runs left over from numbering (e.g. "Name1", "_sinsta").
-
-    Known remaining edge case, NOT auto-fixed here since it risks
-    silently merging the wrong person: inconsistent/ambiguous filenames
-    like "name_sinsta.txt" (digit/underscore in the middle rather than
-    at a clean boundary) may still produce a key that doesn't match that
-    person's other files. Rename the file for a clean key rather than
-    relying on this function to guess correctly.
+    "Name1Whatsapp.txt" / "NameInsta.txt" -> "name".
+    Notes, journals, diaries, and todos return "" (they are personal notes,
+    not person chats).
     """
     name = re.sub(r"\.txt$", "", filename, flags=re.IGNORECASE)
+    stem_lower = name.lower()
+    for prefix in NOTE_FILE_PREFIXES:
+        if stem_lower.startswith(prefix):
+            return ""
+
+    name = re.sub(r"^(?:chat_with_|message(?:_from)?_)", "", name, flags=re.IGNORECASE)
     name = PLATFORM_MARKER_PATTERN.sub("", name)
     name = re.sub(r"^[\d_]+", "", name)
     name = re.sub(r"[\d_]+$", "", name)
@@ -861,17 +844,22 @@ def search_reference_data(query: str, top_k: int = 3) -> str:
 
 def build_excerpt_label(meta: dict) -> str:
     meta = meta or {}
-    person = meta.get("person")
-    date_range = meta.get("date_range")
     source = meta.get("source", "unknown")
+    person = meta.get("person") or (extract_person_key(source) if source != "unknown" else "")
+    date_range = meta.get("date_range")
     source_type = meta.get("source_type")
+
+    stem = Path(source).stem
+    stem_lower = stem.lower()
+    is_note = any(stem_lower.startswith(p) for p in NOTE_FILE_PREFIXES)
 
     if source_type == "bot_conversation":
         label = "Past conversation with you (bot memory)"
-    elif person:
-        label = f"Chat with {person.capitalize()}"
+    elif is_note or not person or source_type == "notes":
+        title = stem.replace("_", " ").strip().title()
+        label = f"Personal Note: {title}"
     else:
-        label = f"Personal notes ({source})"
+        label = f"Chat with {person.capitalize()}"
 
     if date_range:
         label += f" | {date_range}"
@@ -912,11 +900,20 @@ def expand_bot_conversation_matches(documents: list, metadatas: list) -> list[tu
 
 
 def detect_mentioned_person(query: str, known_people: set[str]) -> str | None:
-    query_lower = query.lower()
-    for person in known_people:
-        if person and person in query_lower:
-            return person
-    return None
+    if not query or not known_people:
+        return None
+    # Sort candidates by length descending so longer names (e.g. "ravindra") take precedence over substrings ("ravi")
+    candidates = sorted([p.strip() for p in known_people if p and p.strip()], key=lambda x: len(x), reverse=True)
+    matches = []
+    for person in candidates:
+        m = re.search(rf"\b{re.escape(person)}\b", query, re.IGNORECASE)
+        if m:
+            matches.append((m.start(), len(person), person))
+    if not matches:
+        return None
+    # Sort by earliest position in query, then longest match
+    matches.sort(key=lambda x: (x[0], -x[1]))
+    return matches[0][2]
 
 
 KNOWN_PEOPLE_PAGE_SIZE = 1000  # ChromaDB's SQLite backend errors on unpaginated
@@ -1004,17 +1001,54 @@ def is_trivial_message(message: str) -> bool:
     return False
 
 
+import calendar
+
+_last_laya_filtered_count: int = 0
+
+
+def get_last_laya_filtered_count() -> int:
+    global _last_laya_filtered_count
+    return _last_laya_filtered_count
+
+
+VAGUE_SCHEDULING_PATTERNS = [
+    "what time are we", "what time did we agree", "when are we meeting",
+    "are we meeting", "what time we're meeting", "when are we hanging out",
+    "what are we doing", "what time did we say we're meeting", "what time we said we're meeting"
+]
+
+META_MEMORY_PATTERNS = [
+    "our conversation", "our conversations", "our chat", "our chats",
+    "what did we talk about", "what did we discuss", "have we talked about",
+    "did i tell you", "did i mention", "have i told you", "have i mentioned",
+    "do you remember what we", "do you remember when we", "remember what we talked",
+    "remember when we talked"
+]
+
+
+def is_vague_scheduling_question(message: str) -> bool:
+    msg = message.lower()
+    return any(p in msg for p in VAGUE_SCHEDULING_PATTERNS)
+
+
+def is_meta_memory_question(message: str) -> bool:
+    msg = message.lower()
+    return any(p in msg for p in META_MEMORY_PATTERNS)
+
+
 def should_bypass_personal_retrieval(query: str, laya_routing: dict | None = None, known_people: set[str] | None = None) -> bool:
     """
     Checks whether personal RAG retrieval should be bypassed:
     1. Standard trivial messages ("ok", "lol", "hey, good morning", etc.).
-    2. Laya classified as 'no_personal_context_needed' with confidence (>= 0.60)
+    2. Vague scheduling questions with the bot ("what time are we meeting?") where no person is mentioned.
+    3. Laya classified as 'no_personal_context_needed' with confidence (>= 0.60)
        AND no known person or date reference is detected in the query.
     """
     if is_trivial_message(query):
         return True
 
-    if is_meta_memory_question(query):
+    # Vague scheduling question without a mentioned person bypasses external chats
+    if is_vague_scheduling_question(query):
         if known_people is None:
             try:
                 known_people = get_known_people()
@@ -1038,30 +1072,18 @@ def should_bypass_personal_retrieval(query: str, laya_routing: dict | None = Non
     return False
 
 
-META_MEMORY_PATTERNS = [
-    "remember", "recall", "our conversation", "our conversations", "our chat",
-    "our chats", "our past", "you and me", "you and i", "between us",
-    "what did we talk", "what did we discuss", "have we talked",
-    "have we discussed", "did i tell you", "did i mention",
-    "have i told you", "have i mentioned", "what time we said",
-    "what time did we", "what time are we", "what time we're",
-    "did we say", "did we agree", "are we meeting", "when are we",
-    "when did we say", "remind me what time", "remind me when",
-    "remind me what we"
-]
-
-
-def is_meta_memory_question(message: str) -> bool:
-    msg = message.lower()
-    return any(p in msg for p in META_MEMORY_PATTERNS)
-
-
 WEEKDAY_NAMES = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
-MONTH_NAMES = [
-    "january", "february", "march", "april", "may", "june", "july",
+MONTH_NAMES_NO_MAY = [
+    "january", "february", "march", "april", "june", "july",
     "august", "september", "october", "november", "december",
     "jan", "feb", "mar", "apr", "jun", "jul", "aug", "sep", "sept", "oct", "nov", "dec"
 ]
+MONTH_MAP = {
+    "january": 1, "jan": 1, "february": 2, "feb": 2, "march": 3, "mar": 3,
+    "april": 4, "apr": 4, "may": 5, "june": 6, "jun": 6, "july": 7, "jul": 7,
+    "august": 8, "aug": 8, "september": 9, "sep": 9, "sept": 9, "october": 10, "oct": 10,
+    "november": 11, "nov": 11, "december": 12, "dec": 12,
+}
 
 
 def parse_date_reference(message: str) -> tuple[date, date] | None:
@@ -1101,10 +1123,33 @@ def parse_date_reference(message: str) -> tuple[date, date] | None:
             d = today - timedelta(days=days_since)
             return d, d
 
-    # Require explicit date context: day with month or formatted date/year
-    has_month = any(re.search(rf"\b{m}\b", msg) for m in MONTH_NAMES)
-    has_date_format = bool(re.search(r"\b\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?\b", msg))
+    # Guard against lowercase auxiliary verb "may" (e.g. "I may be late", "may I ask")
+    is_may_month = bool(
+        re.search(r"\b(?:in\s+)?May\s+\d{1,4}\b", message)
+        or re.search(r"\b\d{1,2}(?:st|nd|rd|th)?\s+(?:of\s+)?May\b", message)
+        or re.search(r"\b(?:in|during)\s+May\b", message)
+        or re.search(r"\bMay\s+(?:19|20)\d{2}\b", message, re.IGNORECASE)
+    )
+
+    has_other_month = any(re.search(rf"\b{m}\b", msg) for m in MONTH_NAMES_NO_MAY)
+    has_month = has_other_month or is_may_month
+
+    # Require explicit date separators (/ or . or full YYYY-MM-DD); avoid duration ranges like "1-2 hours" or "3-4 days"
+    has_date_format = bool(re.search(r"\b\d{4}-\d{2}-\d{2}\b", msg)) or bool(re.search(r"\b\d{1,2}[/.]\d{1,2}(?:[/.]\d{2,4})?\b", msg))
     has_year = bool(re.search(r"\b(?:in|year|since)\s+(?:19|20)\d{2}\b", msg))
+
+    # Month-only match (e.g. "in march", "during april", "march 2024"): expand to entire month range
+    if has_month and not has_date_format:
+        has_day = bool(re.search(r"\b(?:\d{1,2}(?:st|nd|rd|th)?\s+(?:of\s+)?[a-z]+|[a-z]+\s+\d{1,2}(?:st|nd|rd|th)?)\b", msg))
+        if not has_day:
+            year_match = re.search(r"\b(19\d{2}|20\d{2})\b", msg)
+            year = int(year_match.group(1)) if year_match else today.year
+            for m_name, m_num in MONTH_MAP.items():
+                if m_name == "may" and not is_may_month:
+                    continue
+                if re.search(rf"\b{m_name}\b", msg):
+                    last_day = calendar.monthrange(year, m_num)[1]
+                    return date(year, m_num, 1), date(year, m_num, last_day)
 
     if has_month or has_date_format or has_year:
         try:
@@ -1199,27 +1244,11 @@ def search_personal_data(query: str, top_k: int = 6, max_result_chars: int = MAX
     distances = results.get("distances", [[]])[0]
     ids = results.get("ids", [[]])[0]
 
-    if not documents and date_range and mentioned_person:
-        results = get_collection().query(
-            query_texts=[query], n_results=min(top_k, count),
-            where={"$and": [{"source_type": {"$ne": "bot_conversation"}}, {"person": mentioned_person}]},
-            include=["documents", "metadatas", "distances"]
-        )
-        documents = results.get("documents", [[]])[0]
-        metadatas = results.get("metadatas", [[]])[0]
-        distances = results.get("distances", [[]])[0]
-        ids = results.get("ids", [[]])[0]
-
-    if not documents:
-        results = get_collection().query(
-            query_texts=[query], n_results=min(top_k, count),
-            where={"source_type": {"$ne": "bot_conversation"}},
-            include=["documents", "metadatas", "distances"]
-        )
-        documents = results.get("documents", [[]])[0]
-        metadatas = results.get("metadatas", [[]])[0]
-        distances = results.get("distances", [[]])[0]
-        ids = results.get("ids", [[]])[0]
+    # No silent unfiltered fallback on date miss:
+    # If the user explicitly asked for a specific date and date-filtered retrieval returns 0 hits,
+    # return empty context with an explicit note instead of silently falling back to unrelated dates.
+    if date_range and not documents:
+        return "No records found for that date."
 
     if not documents:
         return ""
@@ -1247,10 +1276,13 @@ def search_personal_data(query: str, top_k: int = 6, max_result_chars: int = MAX
             print(f"[rag] hybrid fusion failed (personal), dense-only: {e}")
 
     # Post-RRF Laya Typed-Decision Filtering: drop irrelevant chunks before assembly
+    global _last_laya_filtered_count
+    _last_laya_filtered_count = 0
     if LAYA_ENABLED and is_laya_available() and documents:
         try:
             cand_chunks = [{"text": d, "metadata": m} for d, m in zip(documents, metadatas)]
             kept, diag = rerank_and_filter_chunks(query, cand_chunks, max_chars=max_result_chars)
+            _last_laya_filtered_count = len(cand_chunks) - len(kept)
             if not kept:
                 return ""
             documents = [c["text"] for c in kept]

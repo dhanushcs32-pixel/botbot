@@ -5,7 +5,7 @@ Saves every conversation turn to a local SQLite database and
 retrieves recent history so the bot remembers what was said
 earlier in the same session.
 
-Database file: memory.db (created automatically in C:\\mybot)
+Database file: memory.db (created automatically in C:\\botbot)
 """
 
 import hashlib
@@ -339,9 +339,14 @@ def init_db():
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 session_id TEXT NOT NULL UNIQUE,
                 summary TEXT NOT NULL,
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                is_guest INTEGER DEFAULT 0
             )
         """)
+        cursor.execute("PRAGMA table_info(session_summaries)")
+        ss_cols = {row[1] for row in cursor.fetchall()}
+        if "is_guest" not in ss_cols:
+            cursor.execute("ALTER TABLE session_summaries ADD COLUMN is_guest INTEGER DEFAULT 0")
 
         # Secondary index over session_summaries for person/activity-aware
         # retrieval (Step 2). UNIQUE(session_id, tag_type, tag_value) makes
@@ -457,10 +462,38 @@ def _estimate_tokens(text: str) -> int:
     return max(1, len(text) // 4)
 
 
+def deduplicate_assistant_turns(turns: list[dict]) -> list[dict]:
+    """Filters out consecutive duplicate or near-duplicate assistant replies from history
+    so repetition loops don't get fed into the prompt context."""
+    if not turns:
+        return []
+    filtered = []
+    last_assistant_norm = None
+    for turn in turns:
+        role = turn.get("role")
+        content = turn.get("content", "")
+        if role == "assistant":
+            norm = re.sub(r"[^a-z0-9]", "", content.lower())
+            if last_assistant_norm and norm:
+                if norm == last_assistant_norm:
+                    continue
+                shorter = min(len(norm), len(last_assistant_norm))
+                longer = max(len(norm), len(last_assistant_norm))
+                if shorter > 0 and longer > 0 and (shorter / longer) >= 0.7:
+                    import difflib
+                    ratio = difflib.SequenceMatcher(None, norm, last_assistant_norm).ratio()
+                    if ratio >= 0.8:
+                        continue
+            last_assistant_norm = norm
+        filtered.append(turn)
+    return filtered
+
+
 def get_recent_history(session_id: str, limit: int = 40, max_tokens: int = 2200) -> list[dict]:
     """
-    Returns recent turns formatted for direct use in the Ollama messages array.
+    Returns recent turns formatted for direct use in the OpenVINO NPU messages array.
     Rows already folded into any rolling-summary chunk are excluded.
+    Consecutive duplicate or near-duplicate assistant replies are filtered out.
     """
     with get_db_connection() as conn:
         cursor = conn.cursor()
@@ -494,7 +527,8 @@ def get_recent_history(session_id: str, limit: int = 40, max_tokens: int = 2200)
         token_total += turn_tokens
 
     selected.reverse()  # chronological order
-    return [{"role": role, "content": content} for role, content in selected]
+    turns = [{"role": role, "content": content} for role, content in selected]
+    return deduplicate_assistant_turns(turns)
 
 
 def get_full_session_history(session_id: str, limit: int = 200) -> list[dict]:
@@ -524,7 +558,7 @@ def get_all_turns(session_id: str) -> list[dict]:
         cursor = conn.cursor()
         cursor.execute(
             """
-            SELECT role, content FROM conversations
+            SELECT role, content, timestamp FROM conversations
             WHERE session_id = ?
             ORDER BY id ASC
             """,
@@ -532,7 +566,7 @@ def get_all_turns(session_id: str) -> list[dict]:
         )
         rows = cursor.fetchall()
 
-    return [{"role": role, "content": content} for role, content in rows]
+    return [{"role": role, "content": content, "timestamp": timestamp} for role, content, timestamp in rows]
 
 
 def session_has_summary(session_id: str) -> bool:
@@ -579,7 +613,7 @@ def get_replay_turn(session_id: str, turn_rowid: int, history_turns: int = 12):
 _summaries_cache = {"data": None}
 
 
-def save_session_summary(session_id: str, summary: str, known_people: set[str] | None = None):
+def save_session_summary(session_id: str, summary: str, known_people: set[str] | None = None, is_guest: bool = False):
     """
     Saves or updates the summary for a given session, then tags it for
     person/activity retrieval (Step 2).
@@ -589,11 +623,11 @@ def save_session_summary(session_id: str, summary: str, known_people: set[str] |
         cursor = conn.cursor()
         cursor.execute(
             """
-            INSERT INTO session_summaries (session_id, summary, created_at)
-            VALUES (?, ?, ?)
-            ON CONFLICT(session_id) DO UPDATE SET summary = excluded.summary, created_at = excluded.created_at
+            INSERT INTO session_summaries (session_id, summary, created_at, is_guest)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(session_id) DO UPDATE SET summary = excluded.summary, created_at = excluded.created_at, is_guest = excluded.is_guest
             """,
-            (session_id, summary, now)
+            (session_id, summary, now, int(is_guest))
         )
         conn.commit()
 
@@ -780,7 +814,7 @@ async def _maybe_rollup_session_inner(session_id: str, summarize_fn, npu_lock) -
     return True
 
 
-ALWAYS_INCLUDE_SESSIONS = {"therapytest"}
+ALWAYS_INCLUDE_SESSIONS: set[str] = set()
 
 
 def is_test_session(session_id: str) -> bool:
@@ -806,13 +840,13 @@ def is_test_session(session_id: str) -> bool:
 
 def get_recent_summaries(exclude_session_id: str = None, limit: int = 5, query: str = None) -> list[str]:
     """
-    Returns the most recent session summaries across all past sessions.
+    Returns the most recent session summaries across all past sessions (owner-only, excluding guests).
     """
     if _summaries_cache["data"] is None:
         with get_db_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(
-                "SELECT session_id, summary FROM session_summaries ORDER BY id DESC LIMIT 200"
+                "SELECT session_id, summary FROM session_summaries WHERE is_guest = 0 OR is_guest IS NULL ORDER BY id DESC LIMIT 200"
             )
             _summaries_cache["data"] = cursor.fetchall()
 
@@ -894,6 +928,47 @@ def get_all_session_ids() -> list[str]:
         cursor.execute("SELECT DISTINCT session_id FROM conversations")
         rows = cursor.fetchall()
         return [row[0] for row in rows]
+
+
+def get_last_user_message_timestamp(session_id: str) -> float | None:
+    """Returns the epoch timestamp of the most recent 'user' turn for a session, or None."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT MAX(timestamp) FROM conversations WHERE session_id = ? AND role = 'user'",
+            (session_id,)
+        )
+        row = cursor.fetchone()
+        if not row or not row[0]:
+            return None
+        try:
+            dt = datetime.fromisoformat(row[0])
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.timestamp()
+        except (TypeError, ValueError):
+            return None
+
+
+def count_unanswered_followups(session_id: str) -> int:
+    """
+    Returns the count of consecutive bot-initiated or proactive follow-up turns
+    sent since the user's last message in this session.
+    """
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT role, mode FROM conversations WHERE session_id = ? ORDER BY id DESC LIMIT 20",
+            (session_id,)
+        )
+        rows = cursor.fetchall()
+    unanswered = 0
+    for role, mode in rows:
+        if role == "user":
+            break
+        if role == "assistant" and mode in ("proactive", "followup"):
+            unanswered += 1
+    return unanswered
 
 
 # Initialize the database as soon as this module is imported

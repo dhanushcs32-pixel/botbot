@@ -178,7 +178,11 @@ def _chunk_turns_by_chars(turns: list, max_chars: int) -> list[list]:
 
 
 async def summarize_session(
-    session_id: str, force: bool = False, npu_lock=None, known_people: set[str] | None = None
+    session_id: str,
+    force: bool = False,
+    npu_lock=None,
+    known_people: set[str] | None = None,
+    is_guest: bool = False,
 ) -> str | None:
     """
     Generates and saves a summary for the given session by sending its
@@ -261,7 +265,16 @@ async def summarize_session(
 
         summary = segments[0] if len(segments) == 1 else await _consolidate_segments(segments, npu_lock)
 
-    save_session_summary(session_id, summary, known_people=known_people)
+    start_ts = turns[0].get("timestamp") if turns and isinstance(turns[0], dict) else None
+    end_ts = turns[-1].get("timestamp") if turns and isinstance(turns[-1], dict) else None
+    if start_ts and end_ts:
+        start_date = str(start_ts)[:10]
+        end_date = str(end_ts)[:10]
+        date_tag = f"[{start_date}]" if start_date == end_date else f"[{start_date} to {end_date}]"
+        if not summary.startswith("["):
+            summary = f"{date_tag} {summary}"
+
+    save_session_summary(session_id, summary, known_people=known_people, is_guest=is_guest)
     return summary
 
 

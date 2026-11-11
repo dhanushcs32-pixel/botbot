@@ -293,7 +293,7 @@ feeling..."). Just respond the way someone who truly gets them would.
 """
 
 USER_NAME = "Dhanush"  # update this if the user's name changes
-IMPORTANT_LINKS_MAX_CHARS = 1500
+IMPORTANT_LINKS_MAX_CHARS = 4000
 
 
 def build_anti_repetition_instruction(user_name: str = "Dhanush") -> str:
@@ -338,7 +338,7 @@ themselves. This matters more than anything else in this conversation.
   respect. Do not argue with them or lecture them either.
 - Ask ONE gentle, direct question about right now, for example what is going
   on tonight or whether they are safe at the moment.
-- Do not leave them alone with it: softly encourage them to let someone they
+- Do not leave them alone with it: gently encourage them to let someone they
   trust who can be physically near them know how they feel (a friend or
   family member), and offer to help find the words to tell that person.
 - Do not mention hotlines, helplines, crisis lines, or phone numbers, and do
@@ -438,13 +438,12 @@ Rules:
 - If the user asks about a specific plan, time, place, or fact not shown in the recent messages, say you don't remember or ask them to remind you. Never guess one.
 - Everything shared is completely private and stays between you and the user.
 - Output format: Write strictly plain text as a human would in a chat app.
-  * NO roleplay or stage directions: NEVER write actions in brackets like [glance at screen],
-    [sighs], [pauses], asterisks (*yawns*), or colon prefixes (e.g. "pauses, stretches:",
-    "typing slowly:", "softly:").
+  * NO roleplay or stage directions: NEVER write actions in brackets, parentheses (e.g. no (whisper), (quiet), (softly)),
+    asterisks (*yawns*), or colon prefixes. Write strictly plain text dialogue.
   * NO vertical one-word-per-line formatting: NEVER stack single words or fragments on separate
-    lines (e.g. "In.\\nAll.\\nThe.\\nDarkness."). Write 1 to 2 normal horizontal sentences.
-  * NO hallucinated time jumps or self-dialogue: Do not invent fake time gaps ("20 mins later",
-    "after 30 min") or simulate both sides of a conversation. Respond only to the latest message.
+    lines. Write 1 to 2 normal horizontal sentences.
+  * NO hallucinated time jumps or self-dialogue: Do not invent fake elapsed times or simulate both
+    sides of a conversation. Respond only to the latest message.
 - Emoji use: Never use emojis under any circumstances. Write in clean plain text without emojis or emoticons.
 """
 
@@ -500,7 +499,8 @@ def get_system_prompt(mode: str, personal_context: str = "", style_profile: str 
 
     if session_summaries:
         parts.append(
-            "\nSTOP — before answering, check this: you DO have memory of past "
+            "\n[FACTUAL MEMORY & ARCHIVE — USE TO ANSWER QUESTIONS]\n"
+            "STOP — before answering, check this: you DO have memory of past "
             "sessions with this user, provided as notes below. This overrides any "
             "default assumption you might have about not remembering past chats. "
             "When the user asks if you remember something, or references a past "
@@ -519,8 +519,11 @@ def get_system_prompt(mode: str, personal_context: str = "", style_profile: str 
 
     if personal_context:
         parts.append(build_anti_repetition_instruction(user_name))
-        parts.append(f"\nRelevant personal context:\n{personal_context}\n")
-    elif mode != "followup":
+        parts.append(
+            f"\n[FACTUAL MEMORY & ARCHIVE — USE TO ANSWER QUESTIONS]\n"
+            f"Relevant personal context:\n{personal_context}\n"
+        )
+    elif mode != "followup" and not session_summaries and not reference_context:
         parts.append(NO_CONTEXT_INSTRUCTION)
 
     if important_links:
@@ -561,7 +564,10 @@ def get_system_prompt(mode: str, personal_context: str = "", style_profile: str 
     # closer to the end of the prompt more heavily. Putting style preferences
     # last gives them that positional advantage.
     if style_profile:
-        parts.append(f"\nUser's preferred communication style (follow this closely):\n{style_profile}\n")
+        parts.append(
+            f"\n[STYLE EXAMPLES ONLY — DO NOT USE FOR FACTS]\n"
+            f"User's preferred communication style (follow this closely):\n{style_profile}\n"
+        )
 
     return "\n".join(parts)
 

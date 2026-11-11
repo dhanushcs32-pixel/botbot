@@ -35,10 +35,9 @@ machine (_followup_state), keyed by session_id:
   - Stage 0 -> 1 (first followup): fires ACTIVE_FIRST_DELAY_SECONDS
     (15 min) after the last message if classified active, or
     INACTIVE_FIRST_DELAY_SECONDS (30 min) if classified not active.
-  - Stage 1 -> 2: fires 30 min after the previous followup was sent.
-  - Stage 2 -> 3: fires 1h after the previous followup was sent.
-  - Stage 3+ : fires every 2h after the previous followup was sent,
-    indefinitely, until a new message resets the state.
+  - Stage 1: Exactly 1 unanswered followup is sent. No further
+    followups are sent until the user replies (capping at 1 to prevent
+    spamming).
 
 Only the single most-recently-active connected session is ever
 considered per tick (unchanged from prior behavior).
@@ -276,13 +275,24 @@ async def check_and_send_followups(
     session_id, last_active = result
     _prune_followup_state(active_connections, keep_session_id=session_id)
 
+    # Cap at 1 unanswered proactive followup per session: do not spam the user
+    import memory
+    count_unanswered_fn = getattr(memory, "count_unanswered_followups", None)
+    if count_unanswered_fn and count_unanswered_fn(session_id) >= 1:
+        return
+
+    get_last_user_ts_fn = getattr(memory, "get_last_user_message_timestamp", None)
+    last_user_active = get_last_user_ts_fn(session_id) if get_last_user_ts_fn else last_active
+    if last_user_active is None:
+        last_user_active = last_active
+
     now = time.time()
 
     # Enforce quiet hours: 11:00 PM to 8:00 AM local time
     if _is_quiet_hours(now):
         return
 
-    state = _get_or_reset_state(session_id, last_active, now)
+    state = _get_or_reset_state(session_id, last_user_active, now)
 
     # Cap at 1 unanswered proactive followup per session: do not spam the user
     if state["stage"] >= 1:

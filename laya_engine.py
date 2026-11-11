@@ -16,6 +16,7 @@ import os
 os.environ.setdefault("USE_TF", "0")
 
 import time
+import re
 import logging
 import threading
 from typing import Optional, List, Dict, Any, Tuple
@@ -223,11 +224,29 @@ _TRIVIAL_PHRASES = frozenset([
 ])
 
 
+def _get_confidence(resp: dict, default: float = 0.5) -> float:
+    """Helper to unify confidence key lookup across Laya and OpenVINO response shapes."""
+    if not isinstance(resp, dict):
+        return default
+    val = resp.get("answer_confidence", resp.get("confidence", default))
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return default
+
+
+def _matches_any_keyword(text: str, keywords: frozenset[str]) -> bool:
+    for kw in keywords:
+        pattern = rf"\b{re.escape(kw)}\b" if " " not in kw else rf"(?:\b|\s){re.escape(kw)}(?:\b|\s)"
+        if re.search(pattern, text, re.IGNORECASE):
+            return True
+    return False
+
+
 def _heuristic_classify_mode(text: str) -> str:
-    low = text.lower()
-    if any(k in low for k in _SUPPORTIVE_KEYWORDS):
+    if _matches_any_keyword(text, _SUPPORTIVE_KEYWORDS):
         return "supportive"
-    elif any(k in low for k in _GUIDANCE_KEYWORDS):
+    elif _matches_any_keyword(text, _GUIDANCE_KEYWORDS):
         return "guidance"
     return "conversational"
 
@@ -329,11 +348,11 @@ def classify_mode_and_retrieval(
     ret_ans = raw["answers"].get("retrieval", {})
 
     mode_choice = mode_ans.get("choice", _heuristic_classify_mode(user_message))
-    mode_conf = float(mode_ans.get("answer_confidence", mode_ans.get("confidence", 0.5)))
+    mode_conf = _get_confidence(mode_ans, 0.5)
     mode_probs = mode_ans.get("probabilities", {mode_choice: mode_conf})
 
     ret_choice = ret_ans.get("choice", "needs_personal_context")
-    ret_conf = float(ret_ans.get("answer_confidence", ret_ans.get("confidence", 0.5)))
+    ret_conf = _get_confidence(ret_ans, 0.5)
     ret_probs = ret_ans.get("probabilities", {ret_choice: ret_conf})
 
     return {
@@ -404,7 +423,7 @@ def rerank_and_filter_chunks(
     criteria = {}
     for i, c in enumerate(eval_candidates):
         text = c.get("text", c.get("content", c.get("doc", "")))
-        snippet = text[:200].replace("\n", " ").strip()
+        snippet = text[:500].replace("\n", " ").strip()
         criteria[f"excerpt_{i}"] = f"Excerpt {i+1}: {snippet}"
     criteria["none_relevant"] = "None of the candidate excerpts are relevant to the user query."
 
@@ -430,7 +449,7 @@ def rerank_and_filter_chunks(
         # Check if the model answered with standard per-chunk 3-way choices (e.g. from MockLayaModel)
         if "directly_relevant" in probs or ans.get("choice") in ("directly_relevant", "tangential_context", "irrelevant"):
             choice = ans.get("choice", "directly_relevant")
-            conf = float(ans.get("confidence", 0.5))
+            conf = _get_confidence(ans, 0.5)
             p_dir = probs.get("directly_relevant", 0.5 if choice == "directly_relevant" else 0.0)
             p_tan = probs.get("tangential_context", 0.5 if choice == "tangential_context" else 0.0)
             kept = (choice != "irrelevant") and ((p_dir + p_tan) >= relevance_threshold)
@@ -450,17 +469,19 @@ def rerank_and_filter_chunks(
                 if kept:
                     scored_chunks.append((comp, chunk))
         else:
-            # Single-pass multi-excerpt probability distribution
+            # Single-pass multi-excerpt probability distribution with normalized relative scoring
+            max_p = max((probs.get(f"excerpt_{i}", 0.0) for i in range(len(eval_candidates))), default=0.0)
             for idx, chunk in enumerate(eval_candidates):
                 p_chunk = probs.get(f"excerpt_{idx}", 0.0)
-                if p_chunk >= 0.12 or (p_chunk > p_none and p_chunk >= 0.08):
+                rel_ratio = (p_chunk / max_p) if max_p > 0 else 0.0
+                if p_chunk >= 0.12 or (p_chunk > p_none and p_chunk >= 0.08) or (rel_ratio >= 0.25 and p_chunk >= 0.03):
                     choice = "directly_relevant"
                     kept = True
-                    comp = round(p_chunk, 3)
-                elif p_chunk >= 0.04 and p_chunk >= (p_none * 0.25):
+                    comp = round(rel_ratio, 3) if max_p > 0 else round(p_chunk, 3)
+                elif p_chunk >= 0.04 or (rel_ratio >= 0.15 and p_chunk >= 0.02):
                     choice = "tangential_context"
                     kept = True
-                    comp = round(p_chunk * 0.7, 3)
+                    comp = round(rel_ratio * 0.7, 3) if max_p > 0 else round(p_chunk * 0.7, 3)
                 else:
                     choice = "irrelevant"
                     kept = False
@@ -527,7 +548,7 @@ def rerank_and_filter_chunks(
 # ---------------------------------------------------------------------------
 
 SUFFICIENCY_MIN_CONFIDENCE = 0.55
-SUFFICIENCY_DIGEST_CHARS = 1400
+SUFFICIENCY_DIGEST_CHARS = 3600
 
 
 def assess_context_sufficiency(
@@ -540,8 +561,8 @@ def assess_context_sufficiency(
 
     Token-budget awareness:
     Assembled context across personal and reference data can exceed 512 tokens (up to ~3000+ chars).
-    If assembled_context exceeds ~1400 chars, creates a concise digest across all excerpts so the
-    entire context is represented within Laya's 512-token limit without silent right-truncation.
+    If assembled_context exceeds ~3600 chars, creates a concise digest across all excerpts so the
+    entire context is represented within Laya's token limit without silent right-truncation.
     """
     t0 = time.perf_counter()
     if not assembled_context or not assembled_context.strip():
@@ -569,10 +590,9 @@ def assess_context_sufficiency(
             "used_fallback": True,
         }
 
-    # Format context within Laya's 512-token budget (~1400 chars digest).
-    # Every excerpt gets an equal share, so later excerpts are never silently
-    # dropped by a hard cut on the joined string (that made the judge say
-    # "insufficient" when the answer was in an excerpt it never saw).
+    # Format context within Laya's budget (~3600 chars digest).
+    # Every excerpt gets at least 450-600 chars share, so later excerpts are never silently
+    # dropped by a hard cut on the joined string.
     if len(assembled_context) <= SUFFICIENCY_DIGEST_CHARS:
         context_digest = assembled_context.strip()
     else:
@@ -580,13 +600,13 @@ def assess_context_sufficiency(
         if len(paragraphs) > 1:
             sep = "\n---\n"
             per_part_budget = max(
-                40, (SUFFICIENCY_DIGEST_CHARS - len(sep) * (len(paragraphs) - 1)) // len(paragraphs)
+                450, (SUFFICIENCY_DIGEST_CHARS - len(sep) * (len(paragraphs) - 1)) // len(paragraphs)
             )
             digest_parts = [
                 p[:per_part_budget].rstrip() + ("..." if len(p) > per_part_budget else "")
                 for p in paragraphs
             ]
-            context_digest = sep.join(digest_parts)[:SUFFICIENCY_DIGEST_CHARS + 200]
+            context_digest = sep.join(digest_parts)
         else:
             context_digest = assembled_context[:SUFFICIENCY_DIGEST_CHARS].rstrip() + "..."
 
@@ -626,7 +646,7 @@ def assess_context_sufficiency(
 
     ans = raw["answers"]["sufficiency"]
     raw_choice = ans.get("choice", "sufficient")
-    conf = float(ans.get("confidence", 0.5))
+    conf = _get_confidence(ans, 0.5)
     raw_probs = ans.get("probabilities", {})
 
     # Map calibrated choices to canonical status

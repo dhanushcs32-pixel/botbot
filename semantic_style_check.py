@@ -51,7 +51,6 @@ SEED_PHRASES = {
         "That's a great question.",
         "I'd be happy to help with that.",
         "I hope this helps!",
-        "As an AI, I don't have personal experiences.",
         "It's important to note that everyone's situation is different.",
         "Let me know if you have any other questions.",
     ],

@@ -175,6 +175,55 @@ def _load_adapter_config(model_dir: str):
 adapter_config = _load_adapter_config(MODEL_DIR)
 
 
+def _get_eos_token_ids(model_dir: str) -> set[int]:
+    """Inspects generation_config.json, config.json, and tokenizer for EOS token IDs,
+    defaulting to {151645, 151643} if unresolvable."""
+    eos_ids = set()
+    gen_cfg_path = os.path.join(model_dir, "generation_config.json")
+    if os.path.isfile(gen_cfg_path):
+        try:
+            import json
+            with open(gen_cfg_path, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            val = cfg.get("eos_token_id")
+            if isinstance(val, list):
+                eos_ids.update(int(x) for x in val)
+            elif isinstance(val, int):
+                eos_ids.add(val)
+        except Exception as e:
+            print(f"[npu_server] Could not read {gen_cfg_path}: {e}")
+
+    cfg_path = os.path.join(model_dir, "config.json")
+    if os.path.isfile(cfg_path):
+        try:
+            import json
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            val = cfg.get("eos_token_id")
+            if isinstance(val, list):
+                eos_ids.update(int(x) for x in val)
+            elif isinstance(val, int):
+                eos_ids.add(val)
+        except Exception as e:
+            print(f"[npu_server] Could not read {cfg_path}: {e}")
+
+    if pipe is not None:
+        try:
+            tok = pipe.get_tokenizer()
+            if hasattr(tok, "get_eos_token_id"):
+                tok_eos = tok.get_eos_token_id()
+                if isinstance(tok_eos, int) and tok_eos >= 0:
+                    eos_ids.add(tok_eos)
+                elif isinstance(tok_eos, (list, set, tuple)):
+                    eos_ids.update(int(x) for x in tok_eos)
+        except Exception:
+            pass
+
+    if not eos_ids:
+        eos_ids = {151645, 151643}
+    return eos_ids
+
+
 def _clean_reply_text(text: str) -> str:
     """Strips any stray <think>...</think> reasoning blocks from standard /api/chat replies."""
     if not text:
@@ -220,7 +269,7 @@ def _build_pipeline(path, device, **kwargs):
 # that actually needs it. Compiling it eagerly would mean holding two
 # full compiled model copies in memory at all times, and this
 # machine's RAM is already known to be tight (~15.4GB, see the
-# OllamaThrottle rationale in main.py). Lazy compilation means the
+# NPU throttle rationale in main.py). Lazy compilation means the
 # common case (prompts fitting on NPU) never pays that memory cost at
 # all — only the rare overflow case does, once, and then it stays
 # warm for the rest of the process lifetime.
@@ -262,6 +311,7 @@ class ChatRequest(BaseModel):
     messages: List[Dict[str, str]]
     stream: Optional[bool] = False
     options: Optional[Dict[str, Any]] = None
+    is_cot: Optional[bool] = False
 
 @app.on_event("startup")
 def startup_event():
@@ -595,11 +645,13 @@ async def chat(payload: ChatRequest):
     config.max_new_tokens = 250  # Default matching main.py's num_predict limit
 
     # Enforce explicit stop strings and EOS token IDs for Qwen models
+    eos_token_ids = _get_eos_token_ids(MODEL_DIR)
+    primary_eos = min(eos_token_ids) if eos_token_ids else 151645
     try:
-        config.set_eos_token_id(151645)
+        config.set_eos_token_id(primary_eos)
     except Exception:
-        config.eos_token_id = 151645
-    config.stop_token_ids = {151645, 151643}
+        config.eos_token_id = primary_eos
+    config.stop_token_ids = set(eos_token_ids)
     config.stop_strings = {
         "<|im_end|>",
         "<|endoftext|>",
@@ -608,8 +660,6 @@ async def chat(payload: ChatRequest):
         "\nYou:",
         "\nuser:",
         "\nassistant:",
-        "User:",
-        "You:",
     }
     config.include_stop_str_in_output = False
 
@@ -688,12 +738,7 @@ async def chat(payload: ChatRequest):
             prompt = _format_chatml(messages)
 
     # Native no-think instruct mode for Qwen 4B when not in explicit diagnostic reasoning mode
-    active_content = ""
-    if messages:
-        sys_content = messages[0].get("content", "") if messages[0].get("role") == "system" else ""
-        latest_content = messages[-1].get("content", "")
-        active_content = sys_content + "\n" + latest_content
-    is_cot_request = "<reasoning>" in active_content
+    is_cot_request = bool(payload.is_cot or (payload.options and payload.options.get("is_cot")))
     if not is_cot_request and prompt.endswith("<|im_start|>assistant\n"):
         prompt += "<think>\n\n</think>\n\n"
 
@@ -758,7 +803,7 @@ async def chat(payload: ChatRequest):
         "device": target_device,
     })
     
-    # Return response mirroring Ollama's format
+    # Return response mirroring API format
     return {
         "message": {
             "role": "assistant",
