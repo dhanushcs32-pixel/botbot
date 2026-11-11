@@ -97,21 +97,38 @@ EMOJI_PATTERN = re.compile(
     "\U00002600-\U000027BF"
     "\U0001F1E6-\U0001F1FF"
     "\U00002190-\U000021FF"
+    "\U00002300-\U000023FF"
+    "\U00002B00-\U00002BFF"
+    "\U0001F000-\U0001F2FF"
+    "\uFE0F\u20E3"  # variation selector-16 / keycap: otherwise left behind as an invisible stray char
     "]+",
     flags=re.UNICODE,
 )
 
+# Only phrases that are essentially never part of a good companion reply.
+# (The bare "i understand" used to be here and deleted whole sentences like
+# "As I understand it, you never told me a time." and "I understand how heavy
+# that feels." -- plain empathy and honest hedging, exactly what the
+# anti-hallucination prompt asks for. The canned "totally okay/normal",
+# "remember, it's okay" and "good luck with" were removed for the same reason.)
 AI_TELL_PHRASES = [
-    "i understand", "great question", "certainly!", "i'd be happy to",
+    "i understand how you feel", "great question", "certainly!", "i'd be happy to",
     "feel free to", "let me know if you have any other questions",
     "i hope this helps", "as an ai", "it's important to note that",
     "sure thing!", "got it!", "no problem at all", "you're welcome!",
-    "don't hesitate to reach out", "totally okay", "totally normal",
-    "good luck with", "remember, it's okay",
+    "don't hesitate to reach out",
 ]
 
 RP_VERB_PREFIX_PATTERN = re.compile(
     r"(?im)^[ \t]*(?:pauses|sighs|stretches|glances|typing slowly|softly|quietly|whispers|smiles|laughs|nods|shrugs|looks|stares)[^:\n]{0,20}:\s*"
+)
+
+# *sighs*, *looks at you softly*, *takes a deep breath* ... but NOT ordinary
+# emphasis like "I *really* mean it" (that is handled by bold_emphasis).
+ASTERISK_ACTION_PATTERN = re.compile(
+    r"(?i)\*(?:sighs?|pauses?|smiles?|laughs?|nods?|shrugs?|looks?|glances?|yawns?|stretche?s?|"
+    r"whispers?|grins?|hugs?|giggles?|chuckles?|blinks?|frowns?|winks?|sniffs?|takes?|leans?|"
+    r"waits?|tilts?|breathes?|exhales?|inhales?)\b[a-z\s,.'-]{0,35}\*\s*"
 )
 
 STRUCTURE_RULES = [
@@ -123,6 +140,11 @@ STRUCTURE_RULES = [
     {
         "name": "header",
         "pattern": re.compile(r"^\s{0,3}#{1,6}\s+", re.MULTILINE),
+        "action": "strip",
+    },
+    {
+        "name": "asterisk_action",
+        "pattern": ASTERISK_ACTION_PATTERN,
         "action": "strip",
     },
     {
@@ -138,12 +160,7 @@ STRUCTURE_RULES = [
     },
     {
         "name": "bracket_stage_direction",
-        "pattern": re.compile(r"\[[^\]\n]{1,80}\]\s*"),
-        "action": "strip",
-    },
-    {
-        "name": "asterisk_action",
-        "pattern": re.compile(r"(?i)\*[a-z\s,.'-]{1,40}\*\s*"),
+        "pattern": re.compile(r"\[[^\]\n]{1,80}\](?!\()\s*"),
         "action": "strip",
     },
     {
@@ -240,6 +257,14 @@ def check_style_violations(text: str) -> list[str]:
     return violations
 
 
+HELPLINE_PATTERN = re.compile(
+    r"\b(?:988\d*|14416|tele[\s-]?manas|helplines?|hotlines?|crisis\s+(?:lifeline|line|text)|"
+    r"suicide\s+(?:prevention|hotline|lifeline)|aasra|vandrevala|icall|samaritans)\b",
+    re.IGNORECASE,
+)
+HELPLINE_FALLBACK_REPLY = "I'm right here with you. Tell me what's going on."
+
+
 def scrub_reply(text: str, session_id: str = "", mode: str = "", is_crisis: bool = False) -> str:
     if not text:
         return text
@@ -271,10 +296,10 @@ def scrub_reply(text: str, session_id: str = "", mode: str = "", is_crisis: bool
             text = rule["pattern"].sub(rule["repl"], text)
 
     # Strip bracketed actions/stage directions like [glance at phone screen], [sighs], [pauses]
-    text = re.sub(r"\[[^\]\n]{1,80}\]\s*", "", text)
+    text = re.sub(r"\[[^\]\n]{1,80}\](?!\()\s*", "", text)
 
     # Strip asterisk action markers like *sighs*, *looks around*
-    text = re.sub(r"(?i)\*[a-z\s,.'-]{1,40}\*\s*", "", text)
+    text = ASTERISK_ACTION_PATTERN.sub("", text)
 
     # Strip leading colon stage-direction prefixes using the targeted RP verb pattern
     text = RP_VERB_PREFIX_PATTERN.sub("", text)
@@ -301,16 +326,15 @@ def scrub_reply(text: str, session_id: str = "", mode: str = "", is_crisis: bool
     except Exception as e:
         print(f"[semantic_style_check] error, skipping: {e}")
 
-    # Strip out unsolicited helpline numbers / clinical hotline scripts if the model generated any
+    # Bot Bot is a companion, not a referral service: never let hotline /
+    # helpline names or numbers through. Remove only the offending sentences;
+    # if that would leave nothing (e.g. the whole reply was a helpline line),
+    # replace it with a present, companion-style line instead of letting the
+    # helpline text slip through.
     sentences = re.split(r"(?<=[.!?])\s+", text)
-    cleaned_sentences = [
-        s for s in sentences
-        if not re.search(r"\b(?:988\d*|14416|helpline|lifeline|tele-manas|hotline)\b", s, re.IGNORECASE)
-    ]
-    if cleaned_sentences:
-        text = " ".join(cleaned_sentences).strip()
-    elif not text.strip() and raw_cleaned:
-        text = "I hear you, and I'm right here with you. What's on your mind?"
+    cleaned_sentences = [s for s in sentences if not HELPLINE_PATTERN.search(s)]
+    if len(cleaned_sentences) != len(sentences):
+        text = " ".join(cleaned_sentences).strip() or HELPLINE_FALLBACK_REPLY
 
     # Fallback: if scrub_reply completely wiped the text, fall back to cleaned raw reply
     if not text.strip() and raw_cleaned:
@@ -611,7 +635,8 @@ async def _followup_loop():
         await asyncio.sleep(FOLLOWUP_CHECK_INTERVAL_SECONDS)
         try:
             await check_and_send_followups(
-                push_message_to_session, active_connections, _call_npu_once, scrub_reply
+                push_message_to_session, active_connections, _call_npu_once, scrub_reply,
+                is_guest_session=lambda sid: session_guest_status.get(sid, False),
             )
         except Exception as e:
             print(f"[followup loop] error: {e}")
@@ -890,21 +915,48 @@ def _prepare_prompt_sync(session_id: str, prompt_message: str, measure_tokens=No
                             f"Session '{mentioned_session}' (not yet summarized, recent turns):\n{turns_text}"
                         )
 
-    style_profile = get_style_profile()
-
-    # 3. Assess context sufficiency via Laya typed decisions BEFORE attaching static links
-    combined_rag_for_sufficiency = f"{personal_context}\n\n{reference_context}".strip()
-    sufficiency_res = assess_context_sufficiency(prompt_message, combined_rag_for_sufficiency)
-    sufficiency_state = sufficiency_res.get("decision") if combined_rag_for_sufficiency else "no_context"
-
-    important_links = get_important_links() if not is_guest else ""
-    if important_links:
-        if personal_context:
-            personal_context = f"{personal_context}\n\n{important_links}"
-        else:
-            personal_context = important_links
+    # The style profile is the owner's personal behavioural template; guests
+    # must not be shaped by it (or see its contents echoed back).
+    style_profile = "" if is_guest else get_style_profile()
 
     current_session_summary = get_current_session_summary(session_id) or ""
+
+    # 3. Assess context sufficiency via Laya typed decisions BEFORE attaching static links.
+    # The judge must see EVERYTHING the model is allowed to answer from
+    # (personal RAG, reference, session notes, a referenced session, and the
+    # rolling summary of this session). Otherwise it calls the context
+    # "insufficient" when the answer is only in the notes, and the abstain
+    # instruction then contradicts the "use your notes" instruction.
+    #
+    # It is also only meaningful for factual lookups. On supportive/guidance
+    # turns (and crisis turns) nothing "answers" the user, so the gate is
+    # skipped and the generic soft sufficiency instruction applies.
+    if is_crisis or mode in ("supportive", "guidance"):
+        sufficiency_res = {
+            "decision": "not_applicable",
+            "confidence": 1.0,
+            "probabilities": {},
+            "latency_ms": 0.0,
+            "used_fallback": True,
+        }
+        sufficiency_state = "not_applicable"
+    else:
+        combined_rag_for_sufficiency = "\n\n".join(
+            part for part in (
+                personal_context,
+                reference_context,
+                current_session_summary,
+                referenced_session_context,
+                session_summaries_text,
+            ) if part
+        ).strip()
+        sufficiency_res = assess_context_sufficiency(prompt_message, combined_rag_for_sufficiency)
+        sufficiency_state = sufficiency_res.get("decision") if combined_rag_for_sufficiency else "no_context"
+
+    # Passed to get_system_prompt() as its own block. Previously it was appended
+    # to personal_context, which wrapped it in the "style-only excerpts from other
+    # people's chats, never copy" framing and stopped the no-context rule firing.
+    important_links = get_important_links() if not is_guest else ""
 
     system_prompt = get_system_prompt(
         mode,
@@ -916,6 +968,7 @@ def _prepare_prompt_sync(session_id: str, prompt_message: str, measure_tokens=No
         sufficiency_state=sufficiency_state,
         user_name=user_name,
         is_crisis=is_crisis,
+        important_links=important_links,
         current_session_summary=current_session_summary,
     )
 
@@ -1011,6 +1064,7 @@ def _prepare_prompt_sync(session_id: str, prompt_message: str, measure_tokens=No
             sufficiency_state=sufficiency_state,
             user_name=user_name,
             is_crisis=is_crisis,
+            important_links=important_links,
             current_session_summary=current_session_summary,
         )
         trimmed = True
@@ -1035,6 +1089,7 @@ def _prepare_prompt_sync(session_id: str, prompt_message: str, measure_tokens=No
             sufficiency_state=sufficiency_state,
             user_name=user_name,
             is_crisis=is_crisis,
+            important_links=important_links,
             current_session_summary=current_session_summary,
         )
         trimmed = True

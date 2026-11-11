@@ -121,7 +121,10 @@ def _prune_followup_state(active_connections: Dict[str, object], keep_session_id
         del _followup_state[sid]
 
 
-def _get_latest_eligible_session(active_connections: Dict[str, object]) -> Optional[Tuple[str, float]]:
+def _get_latest_eligible_session(
+    active_connections: Dict[str, object],
+    is_guest_session: Optional[Callable[[str], bool]] = None,
+) -> Optional[Tuple[str, float]]:
     """
     Of all sessions that currently have a live WebSocket connection,
     return (session_id, last_active_timestamp) for the one with the
@@ -140,6 +143,10 @@ def _get_latest_eligible_session(active_connections: Dict[str, object]) -> Optio
         if session_id not in connected_ids:
             continue
         if is_test_session(session_id):
+            continue
+        # Proactive check-ins are for the owner only. A guest key must not get
+        # pushed messages generated with the owner's style profile.
+        if is_guest_session is not None and is_guest_session(session_id):
             continue
         return session_id, last_active
 
@@ -240,6 +247,7 @@ async def check_and_send_followups(
     active_connections: Dict[str, object],
     call_model: CallModelFn,
     scrub: ScrubFn,
+    is_guest_session: Optional[Callable[[str], bool]] = None,
 ) -> None:
     """
     Entry point called on a timer from main.py's _followup_loop().
@@ -260,7 +268,7 @@ async def check_and_send_followups(
     /chat request behind it too. See tests/verify_followup_runtime.py,
     which exercises the real _call_npu_once so this can't regress.
     """
-    result = _get_latest_eligible_session(active_connections)
+    result = _get_latest_eligible_session(active_connections, is_guest_session)
     if result is None:
         _prune_followup_state(active_connections, keep_session_id=None)
         return

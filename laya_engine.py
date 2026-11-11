@@ -526,6 +526,10 @@ def rerank_and_filter_chunks(
 # Typed Decision Helper 3: Context Sufficiency Assessment (Token-Budget Aware)
 # ---------------------------------------------------------------------------
 
+SUFFICIENCY_MIN_CONFIDENCE = 0.55
+SUFFICIENCY_DIGEST_CHARS = 1400
+
+
 def assess_context_sufficiency(
     query: str,
     assembled_context: str
@@ -565,18 +569,26 @@ def assess_context_sufficiency(
             "used_fallback": True,
         }
 
-    # Format context within Laya's 512-token budget (~1400 chars digest)
-    if len(assembled_context) <= 1400:
+    # Format context within Laya's 512-token budget (~1400 chars digest).
+    # Every excerpt gets an equal share, so later excerpts are never silently
+    # dropped by a hard cut on the joined string (that made the judge say
+    # "insufficient" when the answer was in an excerpt it never saw).
+    if len(assembled_context) <= SUFFICIENCY_DIGEST_CHARS:
         context_digest = assembled_context.strip()
     else:
-        # Build concise digest preserving parts from each excerpt
         paragraphs = [p.strip() for p in assembled_context.split("\n\n") if p.strip()]
         if len(paragraphs) > 1:
-            per_part_budget = max(180, 1400 // len(paragraphs))
-            digest_parts = [p[:per_part_budget].rstrip() + ("..." if len(p) > per_part_budget else "") for p in paragraphs]
-            context_digest = "\n---\n".join(digest_parts)[:1400]
+            sep = "\n---\n"
+            per_part_budget = max(
+                40, (SUFFICIENCY_DIGEST_CHARS - len(sep) * (len(paragraphs) - 1)) // len(paragraphs)
+            )
+            digest_parts = [
+                p[:per_part_budget].rstrip() + ("..." if len(p) > per_part_budget else "")
+                for p in paragraphs
+            ]
+            context_digest = sep.join(digest_parts)[:SUFFICIENCY_DIGEST_CHARS + 200]
         else:
-            context_digest = assembled_context[:1400].rstrip() + "..."
+            context_digest = assembled_context[:SUFFICIENCY_DIGEST_CHARS].rstrip() + "..."
 
     state = (
         f"User question: {query}\n\n"
@@ -628,6 +640,17 @@ def assess_context_sufficiency(
     }
     canonical_decision = choice_map.get(raw_choice, "sufficient_to_answer")
 
+    # Same idea as the 0.55 threshold used for mode classification: a low-
+    # confidence verdict is softened one step instead of being trusted. A weak
+    # "insufficient" becomes "partial" (hedge) and a weak "partial" becomes
+    # "sufficient" (the generic soft sufficiency instruction still applies).
+    raw_decision = canonical_decision
+    if conf < SUFFICIENCY_MIN_CONFIDENCE:
+        if canonical_decision == "insufficient_context_abstain":
+            canonical_decision = "partial_context_hedge_needed"
+        elif canonical_decision == "partial_context_hedge_needed":
+            canonical_decision = "sufficient_to_answer"
+
     canonical_probs = {
         "sufficient_to_answer": raw_probs.get("sufficient", raw_probs.get("sufficient_to_answer", 0.0)),
         "partial_context_hedge_needed": raw_probs.get("partial", raw_probs.get("partial_context_hedge_needed", 0.0)),
@@ -640,6 +663,8 @@ def assess_context_sufficiency(
         "decision": canonical_decision,
         "confidence": conf,
         "probabilities": canonical_probs,
+        "raw_decision": raw_decision,
+        "downgraded_for_low_confidence": raw_decision != canonical_decision,
         "latency_ms": round(dur_ms, 2),
         "used_fallback": False,
     }

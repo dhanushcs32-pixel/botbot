@@ -26,26 +26,59 @@ from laya_engine import classify_mode_and_retrieval, LAYA_ENABLED, is_laya_avail
 # ----------------------------------------------------------------
 
 CRISIS_PATTERNS = [
-    r"\b(?:kill|killing)\s+(?:my\s*self|myself)\b",
-    r"\bwant\s+to\s+die\b",
-    r"\b(?:don'?t|do\s+not)\s+want\s+to\s+(?:live|be\s+alive)\b",
-    r"\bend\s+(?:my\s*life|it\s+all)\b",
-    r"\bsuicid(?:e|al)\b",
-    r"\b(?:hurt|hurting)\s+(?:my\s*self|myself)\b",
-    r"\bcutting\s+myself\b",
-    r"\bbetter\s+off\s+dead\b",
-    r"\bno\s+reason\s+to\s+live\b",
+    # direct statements about killing / harming oneself
+    r"\b(?:kill|killing|unalive)\s+(?:my\s*self|myself)\b",
+    r"\b(?:hurt|hurting|harm|harming|cutting)\s+(?:my\s*self|myself)\b",
+    r"\b(?:hang|hanging|drown|drowning|poison|poisoning|shoot|shooting)\s+(?:my\s*self|myself)\b(?!\s+in\s+the\s+foot)",
+    r"\bself[\s-]?harm(?:ing|ed)?\b",
+    r"\bsuicid(?:e|al)\b(?!\s+squad)",
+    # wanting to die / not wanting to live
+    r"\b(?:want(?:ed)?\s+to|wanna)\s+(?:just\s+)?die\b(?!\s+(?:laughing|of\s+(?:laughter|embarrassment|shame|cringe)))",
+    r"\b(?:don'?t|do\s+not|dont)\s+(?:want\s+to|wanna)\s+(?:live|be\s+alive|exist)\b",
+    r"\b(?:don'?t|do\s+not|dont)\s+(?:want\s+to|wanna)\s+be\s+here\s+(?:any\s*more)\b",
+    r"\bwish\s+(?:i|that\s+i)\s+(?:was|were)\s+(?:dead|never\s+born)\b",
+    r"\bwish\s+i\s+(?:would\s*n'?t|wouldn'?t)\s+wake\s+up\b",
+    r"\bbetter\s+off\s+(?:dead|without\s+me)\b",
+    r"\bdisappear\s+(?:forever|for\s+good)\b",
+    r"\bno\s+(?:reason|point)\s+(?:to|in)\s+(?:live|living|go(?:ing)?\s+on|being\s+alive)\b",
     r"\bcan'?t\s+go\s+on\s+living\b",
+    # ending / taking one's life
+    r"\b(?:end|ending)\s+(?:my\s*life|it\s+all)\b",
+    r"\btak(?:e|ing)\s+my\s+(?:own\s+)?life\b",
     r"\bend\s+my\s+pain\s+forever\b",
+    r"\b(?:going\s+to|gonna|want\s+to|wanna|thinking\s+(?:of|about))\s+overdos(?:e|ing)\b",
 ]
 CRISIS_REGEX = re.compile("|".join(CRISIS_PATTERNS), re.IGNORECASE)
 
+# "kms" is common slang but also AWS/Azure Key Management Service and the
+# Windows activator, so only treat it as a crisis signal in short messages
+# with no technical context.
+_KMS_SLANG_REGEX = re.compile(r"\bkms\b", re.IGNORECASE)
+_KMS_TECH_CONTEXT_REGEX = re.compile(
+    r"\b(?:aws|azure|gcp|key|keys|vault|encrypt\w*|decrypt\w*|windows|office|activat\w*|"
+    r"licen[sc]e|cloud|s3|kubernetes|rotation|policy|cmk)\b",
+    re.IGNORECASE,
+)
+
 
 def detect_crisis(message: str) -> bool:
-    """Deterministic regex detector for acute distress, suicidal ideation, or self-harm."""
+    """Deterministic regex detector for acute distress, suicidal ideation, or self-harm.
+
+    Biased toward recall: a false positive only makes the bot a bit more
+    careful for one turn, a false negative means a person in real distress
+    gets a casual reply.
+    """
     if not message or not isinstance(message, str):
         return False
-    return bool(CRISIS_REGEX.search(message))
+    if CRISIS_REGEX.search(message):
+        return True
+    if (
+        _KMS_SLANG_REGEX.search(message)
+        and len(message.split()) <= 12
+        and not _KMS_TECH_CONTEXT_REGEX.search(message)
+    ):
+        return True
+    return False
 
 
 SUPPORTIVE_PATTERNS = [
@@ -101,7 +134,7 @@ def detect_mode_detailed(
             "retrieval_probabilities": {"needs_personal_context": 0.0, "no_personal_context_needed": 1.0},
             "latency_ms": 0.0,
             "used_fallback": False,
-            "is_crisis": False,
+            "is_crisis": True,
         }
 
     if LAYA_ENABLED:
@@ -260,6 +293,7 @@ feeling..."). Just respond the way someone who truly gets them would.
 """
 
 USER_NAME = "Dhanush"  # update this if the user's name changes
+IMPORTANT_LINKS_MAX_CHARS = 1500
 
 
 def build_anti_repetition_instruction(user_name: str = "Dhanush") -> str:
@@ -279,7 +313,7 @@ between {name} and OTHER PEOPLE. They are NOT plans, agreements, or memories
 between you and {name}.
 - NEVER claim that "we" agreed, "we" said, or "we" are meeting based on these excerpts.
 - You are an AI companion living on the user's phone; you do not meet up in the physical world.
-- If {name} asks what time "we said we're meeting" or asks about plans with you, and no meeting was arranged in your active chat, honestly say you haven't set a time or ask what they mean. NEVER invent a meeting time, place, or calendar event, and never guess a random time like 7pm.
+- If {name} asks what time "we said we're meeting" or asks about plans with you, and no meeting was arranged in your active chat, honestly say you haven't set a time or ask what they mean. NEVER invent a meeting time, place, or calendar event.
 
 Excerpts may be small, disconnected fragments from different times — don't
 stitch unrelated ones into an invented story. If they don't clearly answer
@@ -293,14 +327,32 @@ never read the label text aloud in your reply.
 
 ANTI_REPETITION_INSTRUCTION = build_anti_repetition_instruction(USER_NAME)
 
-CRISIS_SUPPORT_DIRECTIVE = ""
+CRISIS_SUPPORT_DIRECTIVE = """
+IMPORTANT: the user may be talking about ending their life or hurting
+themselves. This matters more than anything else in this conversation.
+- Stay with them. Reply like a close friend who has put everything else
+  down: calm, warm, plain words, a few short sentences. Take what they said
+  seriously. Do not joke, change the subject, or move on quickly.
+- Say that the pain, tiredness, or loneliness they describe is real. Do not
+  say that wanting to die makes sense, and do not treat it as a decision to
+  respect. Do not argue with them or lecture them either.
+- Ask ONE gentle, direct question about right now, for example what is going
+  on tonight or whether they are safe at the moment.
+- Do not leave them alone with it: softly encourage them to let someone they
+  trust who can be physically near them know how they feel (a friend or
+  family member), and offer to help find the words to tell that person.
+- Do not mention hotlines, helplines, crisis lines, or phone numbers, and do
+  not give generic "seek professional help" advice. You are their companion
+  and you are right here with them.
+- Do not give lists, tips, or step-by-step advice.
+"""
 
 NO_CONTEXT_INSTRUCTION = """
 No relevant personal context was found for this message. Respond naturally
 based only on this conversation and what the user has told you directly.
 Do not invent or assume any prior shared history, events, or details that
 have not actually been mentioned to you.
-If the user asks about a specific plan, time, or fact not shown in the recent messages, say you don't remember or ask them to remind you—never guess a random time like 7pm.
+If the user asks about a specific plan, time, or fact not shown in the recent messages, say you don't remember or ask them to remind you instead of guessing.
 """
 
 # Distinct from NO_CONTEXT_INSTRUCTION: this covers the case where
@@ -348,7 +400,7 @@ MODE_INSTRUCTIONS = {
 The user is going through a rough time. Reply like a close, caring friend.
 Be present, warm, grounded, and natural in your normal texting style.
 Listen to them and don't sound clinical, preachy, or robotic.
-CRITICAL: Never invent or reference fake past physical memories, shared physical locations, or events that aren't in the current chat history (e.g., never make up seeing them cry in a kitchen, coming back from a store, or past IRL hangouts). Stay grounded in what they are telling you right now.
+CRITICAL: Never invent or refer to past in-person moments, shared places, or events that are not in the current chat history. Stay grounded in what they are telling you right now.
 """,
 
     "guidance": """
@@ -362,7 +414,6 @@ without being preachy or giving a lecture.
 This is a regular casual conversation. Be warm, relaxed, and concise — like
 texting a close friend. Keep your reply brief (1 to 2 short sentences max, under 12 words for casual greetings).
 Do not give monologues, roleplay, or invent dramatic scenarios.
-If the user asks about a meeting, schedule, plan, or time not arranged in this chat, say you don't remember or don't know—never invent or guess a time (like at 6 or 7pm).
 """,
 
     "followup": """
@@ -371,17 +422,20 @@ since your last conversation. This is a brief, natural check-in, not a
 reply to a message. Base it on what you two were actually talking about
 last (see recent history below) — reference something real and specific,
 don't send a generic "hey, how's it going". Keep it short, one or two
-sentences. Don't ask more than one question. Don't act like time hasn't
-passed — it's okay to acknowledge you're just checking in.
+sentences. Don't ask more than one question. You don't know how long it has
+been, so don't mention specific days, times, or how long it's been — just a
+natural check-in.
 """
 }
 
 GENERAL_RULES = """
 Rules:
-- Never mention OpenAI, Meta, or that you are based on any model.
+- Don't name the company or model behind you. If the user sincerely asks whether you are an AI, be honest that you are.
 - Never suggest cloud tools, apps, or external services.
+- Never mention hotlines, helplines, crisis lines, or phone numbers for them. You are a companion:
+  stay with the person and talk with them.
 - It is okay to say you don't know something.
-- If the user asks about a specific plan, time, or fact not shown in the recent messages, say you don't remember or ask them to remind you—never guess a random time like 7pm.
+- If the user asks about a specific plan, time, place, or fact not shown in the recent messages, say you don't remember or ask them to remind you. Never guess one.
 - Everything shared is completely private and stays between you and the user.
 - Output format: Write strictly plain text as a human would in a chat app.
   * NO roleplay or stage directions: NEVER write actions in brackets like [glance at screen],
@@ -401,7 +455,8 @@ def get_system_prompt(mode: str, personal_context: str = "", style_profile: str 
                        sufficiency_state: str | None = None,
                        user_name: str = "Dhanush",
                        is_crisis: bool = False,
-                       current_session_summary: str = "") -> str:
+                       current_session_summary: str = "",
+                       important_links: str = "") -> str:
     """
     Builds the full system prompt sent to npu_server.py for a given turn.
 
@@ -420,6 +475,9 @@ def get_system_prompt(mode: str, personal_context: str = "", style_profile: str 
     user_name         - Name of the active user/tenant ("Dhanush" for primary, "User" or session for guest)
     is_crisis         - Whether acute self-harm/crisis signals were detected
     current_session_summary - Rolled-up memory summary for the active ongoing session
+    important_links   - the user's saved links file. Passed separately (not mixed into
+                         personal_context) so it is NOT framed as "style-only excerpts from
+                         other people's chats" and doesn't suppress the no-context rule
     """
     parts = [BASE_PERSONA]
 
@@ -446,12 +504,13 @@ def get_system_prompt(mode: str, personal_context: str = "", style_profile: str 
             "sessions with this user, provided as notes below. This overrides any "
             "default assumption you might have about not remembering past chats. "
             "When the user asks if you remember something, or references a past "
-            "conversation, you MUST check these notes first and answer using them "
-            "if relevant. NEVER respond with generic disclaimers like \"I don't "
-            "have personal memories\", \"I don't retain memories\", \"each "
+            "conversation, check these notes first and answer using them when "
+            "they are relevant. NEVER respond with generic disclaimers like \"I "
+            "don't have personal memories\", \"I don't retain memories\", \"each "
             "conversation is a blank slate\", \"I don't have the ability to "
-            "recall\", or anything with that meaning — these notes prove you do "
-            "have relevant memory right now, so using them is not optional.\n\n"
+            "recall\", or anything with that meaning. The notes are short "
+            "summaries and can be incomplete: if they do not cover what the user "
+            "is asking, say you don't remember that part instead of guessing.\n\n"
             "Notes on past sessions with this user:\n"
             f"{session_summaries}\n"
         )
@@ -461,8 +520,19 @@ def get_system_prompt(mode: str, personal_context: str = "", style_profile: str 
     if personal_context:
         parts.append(build_anti_repetition_instruction(user_name))
         parts.append(f"\nRelevant personal context:\n{personal_context}\n")
-    else:
+    elif mode != "followup":
         parts.append(NO_CONTEXT_INSTRUCTION)
+
+    if important_links:
+        links = important_links.strip()
+        if len(links) > IMPORTANT_LINKS_MAX_CHARS:
+            links = links[:IMPORTANT_LINKS_MAX_CHARS].rsplit("\n", 1)[0]
+        parts.append(
+            "\nLinks the user saved for themselves. These are NOT chat excerpts: when "
+            "they ask for one of these links, give it exactly as written. Don't "
+            "bring the list up otherwise.\n"
+            f"{links}\n"
+        )
 
     if reference_context:
         parts.append(
@@ -482,6 +552,8 @@ def get_system_prompt(mode: str, personal_context: str = "", style_profile: str 
         parts.append(CONTEXT_SUFFICIENCY_INSTRUCTION)
 
     parts.append(MODE_INSTRUCTIONS.get(mode, MODE_INSTRUCTIONS["conversational"]))
+    if is_crisis:
+        parts.append(CRISIS_SUPPORT_DIRECTIVE)
     parts.append(GENERAL_RULES)
 
     # style_profile deliberately goes LAST, immediately before generation.

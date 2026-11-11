@@ -47,6 +47,18 @@ confirm, leave it out of the summary entirely rather than repeating it
 as fact.
 """
 
+# _consolidate_segments() used to reuse SUMMARY_INSTRUCTION, which is written
+# for a raw "User:/Bot Bot:" transcript and doesn't describe its input
+# (already-written summary segments).
+CONSOLIDATE_SEGMENTS_INSTRUCTION = """
+You will be given several partial summaries ("Segments") of ONE long
+conversation, in time order. Merge them into a single summary of 3-6
+sentences. Write in third person, factually, as private notes for future
+reference, not as a message to the user. Keep important facts, emotions, goals,
+and plans, and prefer later segments if two segments conflict. Only use what
+the segments actually say. Do not add, guess, or infer anything new.
+"""
+
 ROLLUP_SUMMARY_INSTRUCTION = """
 You are maintaining a rolling summary of an ongoing conversation. You will be
 given the existing summary so far (if any) and a new batch of turns that
@@ -264,7 +276,10 @@ def _combine_segments_for_consolidation(segments: list[str], max_chars: int) -> 
     """
     combined = "\n\n".join(f"Segment {i + 1}: {s}" for i, s in enumerate(segments))
     if len(combined) > max_chars:
-        combined = combined[:max_chars] + "... [earlier segments truncated]"
+        # Keep the TAIL: the most recent segments matter most. The old code kept
+        # the head (dropping the newest content) while labelling the cut
+        # "[earlier segments truncated]".
+        combined = "[earlier segments truncated] ..." + combined[-max_chars:]
     return combined
 
 
@@ -279,7 +294,7 @@ async def _consolidate_segments(segments: list[str], npu_lock=None) -> str:
     """
     combined = _combine_segments_for_consolidation(segments, MAX_CHARS_PER_SUMMARY_BATCH)
     messages = [
-        {"role": "system", "content": SUMMARY_INSTRUCTION},
+        {"role": "system", "content": CONSOLIDATE_SEGMENTS_INSTRUCTION},
         {"role": "user", "content": combined},
     ]
     return await _call_npu(messages, npu_lock)
