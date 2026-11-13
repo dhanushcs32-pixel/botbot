@@ -1,5 +1,43 @@
-﻿personal_data/
+personal_data/
 lora data/
 *.db
 *.db-wal
 *.db-shm
+
+# Tests
+tests/
+
+# Botbot App & Environment
+node_modules/
+build/
+dist/
+coverage/
+.DS_Store
+*.log
+.env*
+!.env.example
+
+# Secrets & State
+secret_key.py
+secret_key.example.py
+vault.ps1
+.vault_hash
+key_state.json
+context_sufficiency_log.jsonl
+memory.db.bak*
+
+# Models, Caches, & Stores
+chroma_store/
+.npu_cache/
+lora_adapter/
+old 7b LoRa/
+qwen-4b-int4-ov/
+__pycache__/
+
+# Dependencies & Project Meta
+requirements.txt
+PROJECT_INFO.md
+PROJECT_STATE.txt
+.aiignore
+.clineignore
+.cursorignore
