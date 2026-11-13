@@ -246,8 +246,8 @@ RETRIEVAL_POLICY = {
     "supportive": {
         "personal_top_k": 8,
         "personal_max_chars": 8000,
-        "reference": True,
-        "reference_top_k": 4,
+        "reference": False,
+        "reference_top_k": 0,
         "summaries_limit": 8,
     },
     "guidance": {
@@ -327,25 +327,7 @@ never read the label text aloud in your reply.
 
 ANTI_REPETITION_INSTRUCTION = build_anti_repetition_instruction(USER_NAME)
 
-CRISIS_SUPPORT_DIRECTIVE = """
-IMPORTANT: the user may be talking about ending their life or hurting
-themselves. This matters more than anything else in this conversation.
-- Stay with them. Reply like a close friend who has put everything else
-  down: calm, warm, plain words, a few short sentences. Take what they said
-  seriously. Do not joke, change the subject, or move on quickly.
-- Say that the pain, tiredness, or loneliness they describe is real. Do not
-  say that wanting to die makes sense, and do not treat it as a decision to
-  respect. Do not argue with them or lecture them either.
-- Ask ONE gentle, direct question about right now, for example what is going
-  on tonight or whether they are safe at the moment.
-- Do not leave them alone with it: gently encourage them to let someone they
-  trust who can be physically near them know how they feel (a friend or
-  family member), and offer to help find the words to tell that person.
-- Do not mention hotlines, helplines, crisis lines, or phone numbers, and do
-  not give generic "seek professional help" advice. You are their companion
-  and you are right here with them.
-- Do not give lists, tips, or step-by-step advice.
-"""
+CRISIS_SUPPORT_DIRECTIVE = ""
 
 NO_CONTEXT_INSTRUCTION = """
 No relevant personal context was found for this message. Respond naturally
@@ -413,6 +395,7 @@ without being preachy or giving a lecture.
     "conversational": """
 This is a regular casual conversation. Be warm, relaxed, and concise — like
 texting a close friend. Keep your reply brief (1 to 2 short sentences max, under 12 words for casual greetings).
+When the user greets you (e.g. "hi", "hey", "hello", "yo"), greet them back warmly — never say goodbye, sign off, or say "gotta go" to a greeting.
 Do not give monologues, roleplay, or invent dramatic scenarios.
 """,
 
@@ -437,6 +420,7 @@ Rules:
 - It is okay to say you don't know something.
 - If the user asks about a specific plan, time, place, or fact not shown in the recent messages, say you don't remember or ask them to remind you. Never guess one.
 - Everything shared is completely private and stays between you and the user.
+- Never say goodbye, sign off, or say "gotta go", "bye", "ttyl", "see ya", or "cya" when the user is greeting you (e.g. "hi", "hey", "hello", "yo"). Always greet them back warmly and ask what's up.
 - Output format: Write strictly plain text as a human would in a chat app.
   * NO roleplay or stage directions: NEVER write actions in brackets, parentheses (e.g. no (whisper), (quiet), (softly)),
     asterisks (*yawns*), or colon prefixes. Write strictly plain text dialogue.
@@ -555,7 +539,7 @@ def get_system_prompt(mode: str, personal_context: str = "", style_profile: str 
         parts.append(CONTEXT_SUFFICIENCY_INSTRUCTION)
 
     parts.append(MODE_INSTRUCTIONS.get(mode, MODE_INSTRUCTIONS["conversational"]))
-    if is_crisis:
+    if is_crisis and CRISIS_SUPPORT_DIRECTIVE.strip():
         parts.append(CRISIS_SUPPORT_DIRECTIVE)
     parts.append(GENERAL_RULES)
 

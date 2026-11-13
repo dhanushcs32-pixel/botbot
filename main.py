@@ -290,9 +290,9 @@ HELPLINE_PATTERN = re.compile(
 HELPLINE_FALLBACK_REPLY = "I'm right here with you. Tell me what's going on."
 
 
-def scrub_reply(text: str, session_id: str = "", mode: str = "", is_crisis: bool = False) -> str:
-    if not text:
-        return text
+def scrub_reply(text: str, session_id: str = "", mode: str = "", is_crisis: bool = False, prompt_message: str = "") -> str:
+    if not text or not text.strip():
+        return ""
 
     raw_cleaned = text.strip()
 
@@ -316,7 +316,7 @@ def scrub_reply(text: str, session_id: str = "", mode: str = "", is_crisis: bool
             lowered = text.lower()
 
     for rule in STRUCTURE_RULES:
-        if rule["name"] == "bullet_list" and (mode in ("guidance", "supportive", "rag", "coding") or re.search(r"^\s*\d{1,3}\.", text, re.MULTILINE)):
+        if rule["name"] == "bullet_list" and mode in ("guidance", "supportive", "rag", "coding"):
             continue
         if rule["action"] == "strip" or rule["action"] == "remove_line":
             text = rule["pattern"].sub("", text)
@@ -339,6 +339,12 @@ def scrub_reply(text: str, session_id: str = "", mode: str = "", is_crisis: bool
 
     # Strip parenthetical stage/tone directions like (quiet), (whisper), (softly), (pauses)
     text = strip_parenthetical_stage_directions(text)
+
+    # Strip degenerate comma-stutters: e.g. "i'm, i'm, i'm", "you're not, you're not", "word, word, word"
+    text = re.sub(r'(\b[\w\'\s]{1,20}\b)(?:,\s*\1){2,}(?:,\s*[\w\']*)*', r'\1', text, flags=re.IGNORECASE)
+
+    # Strip hallucinated looping/poetry fragments: "in the wind", "in the ripples"
+    text = re.sub(r'(?i)[^.\n!?]*\b(?:in the ripples|in the wind)\b[^.\n!?]*[.!?\n]?', '', text)
 
     # Strip persistent poisoned looping lines like "still here. not fixed."
     if re.search(r'(?i)^\s*(?:still here\.?\s*)+not fixed\.?\s*$', text):
@@ -376,8 +382,20 @@ def scrub_reply(text: str, session_id: str = "", mode: str = "", is_crisis: bool
     if len(cleaned_sentences) != len(sentences):
         text = " ".join(cleaned_sentences).strip() or HELPLINE_FALLBACK_REPLY
 
-    # Fallback: if scrub_reply completely wiped the text, return mode-appropriate text
-    if not text.strip():
+    # Block premature sign-offs when the user message is a greeting
+    is_greeting = bool(prompt_message and re.match(r"^\s*(?:hi|hey|hello|yo|sup|hiya|howdy)\b[!?.]*\s*$", prompt_message, re.IGNORECASE))
+    if is_greeting:
+        signoff_pattern = re.compile(
+            r"(?i)\b(?:gotta go|have to go|must go|bye|goodbye|cya|see ya|ttyl|talk to you later|catch you later|take care)\b[.!]*"
+        )
+        if signoff_pattern.search(text):
+            text = signoff_pattern.sub("", text).strip()
+            # If reply became empty or stripped down to fragment, provide warm greeting
+            if not text or len(text.split()) < 2:
+                text = "hey! what's up?"
+
+    # Fallback: if scrub_reply completely wiped non-empty text, return mode-appropriate text
+    if raw_cleaned and not text.strip():
         fallbacks = {
             "supportive": "i'm right here with you, what's on your mind?",
             "guidance": "what would you like to explore?",
@@ -466,7 +484,7 @@ async def _call_npu_once(messages: list, num_predict: int = 250, is_cot: bool = 
                                 "num_predict": num_predict,
                                 "temperature": 0.45,
                                 "top_p": 0.85,
-                                "repeat_penalty": 1.12,
+                                "repeat_penalty": 1.05,
                                 "is_cot": is_cot,
                             }
                         }
@@ -974,7 +992,12 @@ def _prepare_prompt_sync(session_id: str, prompt_message: str, measure_tokens=No
             max_result_chars=policy["personal_max_chars"]
         )
         if policy["reference"]:
-            reference_context = search_reference_data(prompt_message, top_k=policy["reference_top_k"])
+            is_explicit_ref = any(
+                kw in prompt_message.lower()
+                for kw in ("book", "document", "technique", "therapy", "cbt", "act", "reference", "manual", "chapter", "quote", "according to")
+            )
+            if is_explicit_ref or (mode not in ("conversational", "supportive")):
+                reference_context = search_reference_data(prompt_message, top_k=policy["reference_top_k"])
 
     session_summaries_text = ""
     referenced_session_context = ""
@@ -1096,7 +1119,7 @@ def _prepare_prompt_sync(session_id: str, prompt_message: str, measure_tokens=No
 
     HARD_CAP_CHARS_PER_TOKEN = 1.5
     HARD_CAP_TARGET_CHARS = int(target_tokens * HARD_CAP_CHARS_PER_TOKEN)
-    HISTORY_PROTECTED_FLOOR_TURNS = 4
+    HISTORY_PROTECTED_FLOOR_TURNS = 20
 
     def _total_prompt_chars(sp: str, hist: list, pm: str) -> int:
         return len(sp) + sum(len(h["content"]) for h in hist) + len(pm)
@@ -1333,10 +1356,17 @@ async def generate_reply(session_id: str, prompt_message: str, history_message: 
             or laya_no_retrieval
             or not (prep.get("personal_context") or prep.get("reference_context"))
         )
-    predict_tokens = 75 if is_casual_short else 250
+    if is_casual_short:
+        predict_tokens = 75
+    elif mode in ("conversational", "supportive") and not is_crisis:
+        predict_tokens = 90
+    else:
+        predict_tokens = 250
 
     raw_reply = await _call_npu_once(prep["messages"], num_predict=predict_tokens)
-    bot_reply = await asyncio.to_thread(scrub_reply, raw_reply, session_id=session_id, mode=mode, is_crisis=is_crisis)
+    bot_reply = await asyncio.to_thread(
+        scrub_reply, raw_reply, session_id=session_id, mode=mode, is_crisis=is_crisis, prompt_message=prompt_message
+    )
     if is_casual_short:
         sentences = re.split(r"(?<=[.!?])\s+", bot_reply)
         if len(sentences) > 2:
@@ -1513,7 +1543,8 @@ async def chat_upload(
 
 
 @app.get("/history/{session_id}")
-async def history(session_id: str, limit: int = Query(default=50, ge=1, le=500), key_info: dict = Depends(verify_api_key)):
+@app.get("/api/history/{session_id}")
+async def history(session_id: str, limit: int = Query(default=200, ge=1, le=500), key_info: dict = Depends(verify_api_key)):
     _enforce_session_scope(key_info, session_id)
     turns = get_full_session_history(session_id, limit=limit)
     return {"session_id": session_id, "messages": turns}
@@ -1835,19 +1866,42 @@ async def websocket_chat(websocket: WebSocket, session_id: str = Query("default"
 
     # 1. Drain pending queued messages
     queue = list(pending_messages[session_id])
+    drained_ids = set()
     for payload in queue:
         try:
             await websocket.send_json(payload)
-            print(f"[ws] drained queued message {payload['id']} to session '{session_id}'")
+            drained_ids.add(payload.get("id"))
+            print(f"[ws] drained queued message {payload.get('id')} to session '{session_id}'")
         except Exception:
             break
+    if drained_ids:
+        pending_messages[session_id] = [m for m in pending_messages[session_id] if m.get("id") not in drained_ids]
 
     # 2. Main incoming message loop
     try:
         while True:
             try:
-                data = await websocket.receive_json()
+                raw_text = await websocket.receive_text()
+            except WebSocketDisconnect:
+                print(f"[ws] session '{session_id}' disconnected")
+                break
+            except RuntimeError as e:
+                err_msg = str(e).lower()
+                if "disconnect" in err_msg or "cannot call \"receive\"" in err_msg or "cannot call 'receive'" in err_msg:
+                    print(f"[ws] session '{session_id}' disconnected (RuntimeError)")
+                    break
+                raise
             except Exception as e:
+                err_msg = str(e).lower()
+                if "disconnect" in err_msg or "cannot call \"receive\"" in err_msg or "cannot call 'receive'" in err_msg or "connection closed" in err_msg:
+                    print(f"[ws] session '{session_id}' disconnected ({e})")
+                    break
+                print(f"[ws] receive error in session '{session_id}': {e}")
+                break
+
+            try:
+                data = json.loads(raw_text)
+            except (json.JSONDecodeError, ValueError, TypeError) as e:
                 print(f"[ws] invalid message format in session '{session_id}': {e}")
                 continue
 
@@ -1928,8 +1982,12 @@ async def websocket_chat(websocket: WebSocket, session_id: str = Query("default"
                     _process_ws_chat_message(session_id, prompt_message, history_message, msg_id=msg_id)
                 )
 
-    except WebSocketDisconnect:
+    except (WebSocketDisconnect, RuntimeError):
         print(f"[ws] session '{session_id}' disconnected")
+    except Exception as e:
+        print(f"[ws] loop exception in session '{session_id}': {e}")
     finally:
         if active_connections.get(session_id) is websocket:
             del active_connections[session_id]
+        if session_id in session_guest_status:
+            del session_guest_status[session_id]

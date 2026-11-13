@@ -668,7 +668,7 @@ async def chat(payload: ChatRequest):
     temp = 0.45
     top_p = 0.85
     top_k = 20
-    rep_penalty = 1.12
+    rep_penalty = 1.05
 
     if payload.options:
         opts = payload.options

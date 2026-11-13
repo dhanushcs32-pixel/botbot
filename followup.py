@@ -199,6 +199,27 @@ def _get_or_reset_state(session_id: str, last_active: float, now: float) -> dict
     return state
 
 
+def _is_fallback_or_loopbroken_reply(content: str) -> bool:
+    """Detects fallback or loop-broken replies that should suppress follow-ups."""
+    if not content:
+        return False
+    lower = content.lower().strip()
+    fallback_phrases = [
+        "right here with you",
+        "what would you like to explore",
+        "having trouble",
+        "error occurred",
+        "still here",
+        "(quiet)",
+        "(whisper)",
+        "in the ripples",
+        "in the wind",
+        "i'm here, what's up?",
+        "yeah?",
+    ]
+    return any(p in lower for p in fallback_phrases)
+
+
 async def _ask_model_for_followup(
     session_id: str,
     call_model: CallModelFn,
@@ -215,6 +236,14 @@ async def _ask_model_for_followup(
         # Nothing to follow up on — no prior turns for this session.
         return None
 
+    # Never fire follow-up if last assistant turn was a fallback or loop-broken reply
+    for turn in reversed(history):
+        if turn.get("role") == "assistant":
+            if _is_fallback_or_loopbroken_reply(turn.get("content", "")):
+                _log(f"[followup] skipping session '{session_id}': last assistant turn was fallback/loop-broken")
+                return None
+            break
+
     style_profile = get_style_profile()
 
     system_prompt = get_system_prompt(
@@ -228,11 +257,22 @@ async def _ask_model_for_followup(
 
     messages = [{"role": "system", "content": system_prompt}] + history
 
-    raw_reply = await call_model(messages)
+    try:
+        raw_reply = await call_model(messages, num_predict=35)
+    except TypeError:
+        raw_reply = await call_model(messages)
     if not raw_reply:
         return None
 
-    return scrub(raw_reply, session_id)
+    cleaned = scrub(raw_reply, session_id)
+    if cleaned and len(cleaned) > 120:
+        truncated = cleaned[:120]
+        last_punct = max(truncated.rfind(". "), truncated.rfind("? "), truncated.rfind("! "))
+        if last_punct > 40:
+            cleaned = truncated[:last_punct + 1].strip()
+        else:
+            cleaned = truncated.rsplit(" ", 1)[0].strip()
+    return cleaned
 
 
 def _is_quiet_hours(now_ts: Optional[float] = None) -> bool:

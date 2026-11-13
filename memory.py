@@ -489,29 +489,23 @@ def deduplicate_assistant_turns(turns: list[dict]) -> list[dict]:
     return filtered
 
 
-def get_recent_history(session_id: str, limit: int = 40, max_tokens: int = 2200) -> list[dict]:
+def get_recent_history(session_id: str, limit: int = 40, max_tokens: int = 2200, min_turns: int = 24) -> list[dict]:
     """
     Returns recent turns formatted for direct use in the OpenVINO NPU messages array.
-    Rows already folded into any rolling-summary chunk are excluded.
+    Preserves recent prompt history (at least min_turns, up to limit) directly from
+    conversations without cutting off at rolling summary boundaries.
     Consecutive duplicate or near-duplicate assistant replies are filtered out.
     """
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT MAX(upto_turn_id) FROM rolling_summaries WHERE session_id = ?",
-            (session_id,)
-        )
-        row = cursor.fetchone()
-        upto_turn_id = row[0] if row and row[0] is not None else 0
-
-        cursor.execute(
             """
             SELECT role, content FROM conversations
-            WHERE session_id = ? AND id > ?
+            WHERE session_id = ?
             ORDER BY id DESC
             LIMIT ?
             """,
-            (session_id, upto_turn_id, 200)
+            (session_id, max(limit, min_turns))
         )
         rows = cursor.fetchall()
 
@@ -521,7 +515,7 @@ def get_recent_history(session_id: str, limit: int = 40, max_tokens: int = 2200)
         if len(selected) >= limit:
             break
         turn_tokens = _estimate_tokens(content)
-        if selected and token_total + turn_tokens > max_tokens:
+        if len(selected) >= min_turns and (token_total + turn_tokens > max_tokens):
             break
         selected.append((role, content))
         token_total += turn_tokens

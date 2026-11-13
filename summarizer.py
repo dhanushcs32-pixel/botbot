@@ -177,6 +177,28 @@ def _chunk_turns_by_chars(turns: list, max_chars: int) -> list[list]:
     return chunks
 
 
+def _is_corrupted_or_glitched_turn(content: str) -> bool:
+    """Detects corrupted/glitched assistant turns (comma stutters, loops, hallucinated poetry)."""
+    if not content:
+        return False
+    lower = content.lower()
+    glitched_phrases = [
+        "still here. not fixed",
+        "(quiet)",
+        "(whisper)",
+        "in the ripples",
+        "in the wind",
+        "you're not, you're not",
+        "i'm, i'm, i'm",
+        "yes, yes, yes",
+    ]
+    if any(p in lower for p in glitched_phrases):
+        return True
+    if re.search(r'(\b[\w\'\s]{1,20}\b)(?:,\s*\1){2,}', lower):
+        return True
+    return False
+
+
 async def summarize_session(
     session_id: str,
     force: bool = False,
@@ -227,6 +249,9 @@ async def summarize_session(
         return None
 
     turns = get_all_turns(session_id)
+    if not turns:
+        return None
+    turns = [t for t in turns if not (t.get("role") == "assistant" and _is_corrupted_or_glitched_turn(t.get("content", "")))]
     if not turns:
         return None
 
@@ -322,12 +347,26 @@ async def _call_npu(messages: list, npu_lock=None) -> str:
                 json={
                     "model": MODEL_NAME,
                     "messages": messages,
-                    "stream": False
+                    "stream": False,
+                    "options": {
+                        "num_predict": 150,
+                        "temperature": 0.3,
+                        "top_p": 0.85,
+                        "repeat_penalty": 1.05,
+                    },
                 }
             )
             response.raise_for_status()
             data = response.json()
-            return data["message"]["content"].strip()
+            content = data["message"]["content"].strip()
+            if len(content) > 500:
+                truncated = content[:500]
+                last_period = max(truncated.rfind(". "), truncated.rfind(".\n"))
+                if last_period > 200:
+                    content = truncated[:last_period + 1].strip()
+                else:
+                    content = truncated.rstrip() + "..."
+            return content
 
     if npu_lock is not None:
         async with npu_lock:
@@ -353,6 +392,10 @@ async def summarize_turns_batch(existing_summary: str, turns: list, npu_lock) ->
 
     Raises on HTTP/parsing failure rather than swallowing it.
     """
+    if not turns:
+        return existing_summary
+
+    turns = [t for t in turns if not (t.get("role") == "assistant" and _is_corrupted_or_glitched_turn(t.get("content", "")))]
     if not turns:
         return existing_summary
 
