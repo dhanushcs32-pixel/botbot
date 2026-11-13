@@ -377,28 +377,16 @@ have details for the rest. Do not extrapolate, guess, or invent missing facts.
 """
 
 
+FLUID_PERSONA_INSTRUCTION = """You are texting your close friend. Read what they are actually saying right now and respond naturally, directly, and relevantly in your normal casual texting style.
+- Pay close attention to the context of the conversation: if they ask how you are, talk about the chat itself, joke around, vent, or ask a question, respond directly to their actual point instead of using generic filler lines.
+- Match the length and energy of the moment naturally—short and casual for quick texts, or thoughtful and grounded when they are sharing something real.
+- Stay grounded in what is actually in this chat history; don't invent fake real-life locations or memories."""
+
+
 MODE_INSTRUCTIONS = {
-    "supportive": """
-The user is going through a rough time. Reply like a close, caring friend.
-Be present, warm, grounded, and natural in your normal texting style.
-Listen to them and don't sound clinical, preachy, or robotic.
-CRITICAL: Never invent or refer to past in-person moments, shared places, or events that are not in the current chat history. Stay grounded in what they are telling you right now.
-""",
-
-    "guidance": """
-Right now, the user is thinking through a decision, goal, or direction in
-their life. Help them think clearly. Ask focused questions that help them
-see their own thoughts more clearly. Be direct but kind. Offer structure
-without being preachy or giving a lecture.
-""",
-
-    "conversational": """
-This is a regular casual conversation. Be warm, relaxed, and concise — like
-texting a close friend. Keep your reply brief (1 to 2 short sentences max, under 12 words for casual greetings).
-When the user greets you (e.g. "hi", "hey", "hello", "yo"), greet them back warmly — never say goodbye, sign off, or say "gotta go" to a greeting.
-Do not give monologues, roleplay, or invent dramatic scenarios.
-""",
-
+    "supportive": FLUID_PERSONA_INSTRUCTION,
+    "guidance": FLUID_PERSONA_INSTRUCTION,
+    "conversational": FLUID_PERSONA_INSTRUCTION,
     "followup": """
 You're reaching out first, unprompted — the user hasn't said anything new
 since your last conversation. This is a brief, natural check-in, not a
@@ -507,8 +495,6 @@ def get_system_prompt(mode: str, personal_context: str = "", style_profile: str 
             f"\n[FACTUAL MEMORY & ARCHIVE — USE TO ANSWER QUESTIONS]\n"
             f"Relevant personal context:\n{personal_context}\n"
         )
-    elif mode != "followup" and not session_summaries and not reference_context:
-        parts.append(NO_CONTEXT_INSTRUCTION)
 
     if important_links:
         links = important_links.strip()
@@ -530,15 +516,7 @@ def get_system_prompt(mode: str, personal_context: str = "", style_profile: str 
             f"{reference_context}\n"
         )
 
-    # Condition context sufficiency instruction based on Laya's assessment
-    if sufficiency_state == "insufficient_context_abstain":
-        parts.append(CONTEXT_INSUFFICIENT_ABSTAIN_INSTRUCTION)
-    elif sufficiency_state == "partial_context_hedge_needed":
-        parts.append(CONTEXT_PARTIAL_HEDGE_INSTRUCTION)
-    elif personal_context or reference_context:
-        parts.append(CONTEXT_SUFFICIENCY_INSTRUCTION)
-
-    parts.append(MODE_INSTRUCTIONS.get(mode, MODE_INSTRUCTIONS["conversational"]))
+    parts.append(MODE_INSTRUCTIONS.get(mode, FLUID_PERSONA_INSTRUCTION))
     if is_crisis and CRISIS_SUPPORT_DIRECTIVE.strip():
         parts.append(CRISIS_SUPPORT_DIRECTIVE)
     parts.append(GENERAL_RULES)

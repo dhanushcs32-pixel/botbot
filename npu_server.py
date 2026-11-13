@@ -81,7 +81,7 @@ def _log_free_ram(context: str) -> None:
 # For Qwen 4B (hidden_size=2560), lora_A in_features must be 2560.
 ADAPTER_DIR = "./lora_adapter"
 ADAPTER_PATH = os.path.join(ADAPTER_DIR, "adapter_model.safetensors")
-LORA_ALPHA = float(os.getenv("LORA_ALPHA", "0.28"))
+LORA_ALPHA = float(os.getenv("LORA_ALPHA", "0.08"))
 ADAPTER_ALPHA = LORA_ALPHA
 CACHE_DIR = "./.npu_cache"
 os.makedirs(CACHE_DIR, exist_ok=True)
@@ -141,7 +141,7 @@ def _load_adapter_config(model_dir: str):
     if _cached_adapter_config is not None:
         return _cached_adapter_config
 
-    LORA_ALPHA = float(os.getenv("LORA_ALPHA", "0.28"))
+    LORA_ALPHA = float(os.getenv("LORA_ALPHA", "0.08"))
     ADAPTER_ALPHA = LORA_ALPHA
 
     hidden_size = _get_model_hidden_size(model_dir)
@@ -642,7 +642,7 @@ async def chat(payload: ChatRequest):
 
     # Setup OpenVINO GenAI GenerationConfig
     config = ov_genai.GenerationConfig()
-    config.max_new_tokens = 250  # Default matching main.py's num_predict limit
+    config.max_new_tokens = 256  # Default matching main.py's num_predict limit
 
     # Enforce explicit stop strings and EOS token IDs for Qwen models
     eos_token_ids = _get_eos_token_ids(MODEL_DIR)
@@ -665,8 +665,8 @@ async def chat(payload: ChatRequest):
 
     # Default sampling parameters tuned for Qwen 4B with LoRA
     # (prevents dreamy wandering and random memory drift)
-    temp = 0.45
-    top_p = 0.85
+    temp = 0.55
+    top_p = 0.90
     top_k = 20
     rep_penalty = 1.05
 

@@ -1057,6 +1057,22 @@ def should_bypass_personal_retrieval(query: str, laya_routing: dict | None = Non
         if detect_mentioned_person(query, known_people) is None:
             return True
 
+    query_lower = query.lower()
+    # Casual check-ins and meta-conversation about the chat itself
+    casual_or_meta_phrases = [
+        "how r u", "how are you", "how you doing", "hows it going", "how's it going",
+        "u just started", "you just started", "going crazy", "werent there", "weren't there",
+        "needed help", "trying to share", "share my difficulties",
+    ]
+    if any(p in query_lower for p in casual_or_meta_phrases):
+        if known_people is None:
+            try:
+                known_people = get_known_people()
+            except Exception:
+                known_people = set()
+        if detect_mentioned_person(query, known_people) is None:
+            return True
+
     if laya_routing and not laya_routing.get("used_fallback"):
         ret_dec = laya_routing.get("retrieval_decision")
         ret_conf = laya_routing.get("retrieval_confidence", 0.0)
@@ -1090,15 +1106,17 @@ def parse_date_reference(message: str) -> tuple[date, date] | None:
     msg = message.lower().strip()
     today = date.today()
 
-    # Guard against casual conversational phrases using "today"
-    casual_today_patterns = [
-        r"^how\s+(?:r|are)\s+u\s+today\b",
-        r"^how\s+(?:r|are)\s+you\s+today\b",
-        r"^how\s+is\s+it\s+going\s+today\b",
-        r"^how\s+was\s+your\s+day\b",
-        r"^what'?s\s+up\s+today\b",
+    # Guard against casual conversational phrases using "today" or conversational "yesterday"
+    casual_date_patterns = [
+        r"\bhow\s+(?:r|are)\s+u\s+today\b",
+        r"\bhow\s+(?:r|are)\s+you\s+today\b",
+        r"\bhow\s+is\s+it\s+going\s+today\b",
+        r"\bhow\s+was\s+your\s+day\b",
+        r"\bwhat'?s\s+up\s+today\b",
+        r"\byesterday\s+(?:when\s+)?(?:i\s+tried|i\s+was|you|u\s+just|u\s+started|we\s+talked|you\s+went|u\s+went)\b",
+        r"\bu\s+(?:weren'?t|were\s+not|went|just\s+started)\b",
     ]
-    if any(re.search(p, msg) for p in casual_today_patterns):
+    if any(re.search(p, msg) for p in casual_date_patterns):
         return None
 
     if "day before yesterday" in msg:

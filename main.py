@@ -294,121 +294,22 @@ def scrub_reply(text: str, session_id: str = "", mode: str = "", is_crisis: bool
     if not text or not text.strip():
         return ""
 
-    raw_cleaned = text.strip()
+    # 1. Strip raw model control tags: <think>...</think>, <|im_end|>, <|endoftext|>, <|im_start|>
+    text = re.sub(r'(?s)<think>.*?</think>', '', text)
+    text = re.sub(r'<\|im_end\|>|<\|endoftext\|>|<\|im_start\|>', '', text)
 
-    violations = check_style_violations(text)
-    if violations:
-        print(f"[style_check] session '{session_id}': violations found — {violations}")
-        debug_logger.info(f"[style_check] session '{session_id}': violations found — {violations}")
+    # 2. Strip leading role prefixes if the model accidentally emits "Assistant:" or "Bot:" at index 0
+    text = re.sub(r'^(?:assistant|bot|bot bot)\s*:\s*', '', text, flags=re.IGNORECASE)
 
-    text = EMOJI_PATTERN.sub("", text)
-
-    lowered = text.lower()
-    for phrase in AI_TELL_PHRASES:
-        pattern = phrase if (phrase.startswith(r"\b") or "\\" in phrase) else re.escape(phrase)
-        if re.search(pattern, lowered):
-            text = re.sub(
-                rf"[^.\n!?]*{pattern}[^.\n!?]*[.!?\n]?",
-                "",
-                text,
-                flags=re.IGNORECASE,
-            )
-            lowered = text.lower()
-
-    for rule in STRUCTURE_RULES:
-        if rule["name"] == "bullet_list" and mode in ("guidance", "supportive", "rag", "coding"):
-            continue
-        if rule["action"] == "strip" or rule["action"] == "remove_line":
-            text = rule["pattern"].sub("", text)
-        elif rule["action"] == "replace":
-            text = rule["pattern"].sub(rule["repl"], text)
-
-    # Strip bracketed actions/stage directions like [glance at phone screen], [sighs], [pauses]
+    # 3. Trim genuine 4x consecutive comma/word stutters at the tail of a generation
     text = re.sub(
-        r"(?i)\[(?:sighs?|laughs?|pauses?|smiles?|looks?|glances?|nods?|shrugs?|"
-        r"chuckles?|giggles?|whispers?|stares?|takes?|leans?|blinks?|frowns?|winks?)[^\]\n]{0,80}\]\s*",
-        "",
+        r'(\b[\w\']+(?:\s+[\w\']+){0,3}\b)(?:[,.]\s*\1){3,}[,.\s\w\']*',
+        r'\1.',
         text,
+        flags=re.IGNORECASE
     )
 
-    # Strip asterisk action markers like *sighs*, *looks around*
-    text = ASTERISK_ACTION_PATTERN.sub("", text)
-
-    # Strip leading colon stage-direction prefixes using the targeted RP verb pattern
-    text = RP_VERB_PREFIX_PATTERN.sub("", text)
-
-    # Strip parenthetical stage/tone directions like (quiet), (whisper), (softly), (pauses)
-    text = strip_parenthetical_stage_directions(text)
-
-    # Strip degenerate comma-stutters: e.g. "i'm, i'm, i'm", "you're not, you're not", "word, word, word"
-    text = re.sub(r'(\b[\w\'\s]{1,20}\b)(?:,\s*\1){2,}(?:,\s*[\w\']*)*', r'\1', text, flags=re.IGNORECASE)
-
-    # Strip hallucinated looping/poetry fragments: "in the wind", "in the ripples"
-    text = re.sub(r'(?i)[^.\n!?]*\b(?:in the ripples|in the wind)\b[^.\n!?]*[.!?\n]?', '', text)
-
-    # Strip persistent poisoned looping lines like "still here. not fixed."
-    if re.search(r'(?i)^\s*(?:still here\.?\s*)+not fixed\.?\s*$', text):
-        text = ""
-
-    # Collapse pathological 1-2 word newline stacking
-    text = collapse_vertical_stacking(text)
-
-    # Collapse looped/repeating sentences
-    text = collapse_repetitive_phrases(text)
-
-    text = re.sub(r"[ \t]{2,}", " ", text).strip()
-
-    try:
-        text, semantic_findings = strip_semantic_violations(text, session_id=session_id, mode=mode)
-        if semantic_findings:
-            summary = [
-                f"{f['category']}:{f['score']}{'*' if f['enforce'] else ''}"
-                for f in semantic_findings
-            ]
-            print(f"[semantic_style_check] session '{session_id}': {summary} (* = stripped)")
-            debug_logger.info(
-                f"[semantic_style_check] session '{session_id}': {semantic_findings}"
-            )
-    except Exception as e:
-        print(f"[semantic_style_check] error, skipping: {e}")
-
-    # Bot Bot is a companion, not a referral service: never let hotline /
-    # helpline names or numbers through. Remove only the offending sentences;
-    # if that would leave nothing (e.g. the whole reply was a helpline line),
-    # replace it with a present, companion-style line instead of letting the
-    # helpline text slip through.
-    sentences = re.split(r"(?<=[.!?])\s+", text)
-    cleaned_sentences = [s for s in sentences if not HELPLINE_PATTERN.search(s)]
-    if len(cleaned_sentences) != len(sentences):
-        text = " ".join(cleaned_sentences).strip() or HELPLINE_FALLBACK_REPLY
-
-    # Block premature sign-offs when the user message is a greeting
-    is_greeting = bool(prompt_message and re.match(r"^\s*(?:hi|hey|hello|yo|sup|hiya|howdy)\b[!?.]*\s*$", prompt_message, re.IGNORECASE))
-    if is_greeting:
-        signoff_pattern = re.compile(
-            r"(?i)\b(?:gotta go|have to go|must go|bye|goodbye|cya|see ya|ttyl|talk to you later|catch you later|take care)\b[.!]*"
-        )
-        if signoff_pattern.search(text):
-            text = signoff_pattern.sub("", text).strip()
-            # If reply became empty or stripped down to fragment, provide warm greeting
-            if not text or len(text.split()) < 2:
-                text = "hey! what's up?"
-
-    # Fallback: if scrub_reply completely wiped non-empty text, return mode-appropriate text
-    if raw_cleaned and not text.strip():
-        fallbacks = {
-            "supportive": "i'm right here with you, what's on your mind?",
-            "guidance": "what would you like to explore?",
-            "followup": "hey, just checking in on you.",
-            "conversational": "yeah?",
-            "concise": "yeah?",
-            "rambling": "yeah, what's up?",
-            "coding": "what would you like help with?",
-            "rag": "what would you like to know?",
-        }
-        text = fallbacks.get(mode, "i'm here, what's up?")
-
-    return text
+    return text.strip()
 
 
 app = FastAPI(title="Bot Bot Backend")
@@ -455,15 +356,15 @@ def create_background_task(coro) -> asyncio.Task:
     return task
 
 
-async def _call_npu_once(messages: list, num_predict: int = 250, is_cot: bool = False) -> str:
+async def _call_npu_once(messages: list, num_predict: int = 256, is_cot: bool = False) -> str:
     global _last_npu_release
-    # num_predict defaults to 250 — the normal chat path's value. The CoT
+    # num_predict defaults to 256 — the normal chat path's value. The CoT
     # diagnostic endpoint passes a larger budget; with the default, the
     # request body is byte-for-byte what the normal path has always sent.
-    # HTTP timeout scales with the output budget: 240s covers the 250-token
+    # HTTP timeout scales with the output budget: 240s covers the 256-token
     # normal path (observed worst ~130s); large budgets get 900s (700
     # tokens at the observed ~1 tok/s ≈ 700s worst case).
-    timeout_s = 240 if num_predict <= 300 else 900
+    timeout_s = 240 if num_predict <= 320 else 900
     try:
         async with npu_lock:
             try:
@@ -482,8 +383,8 @@ async def _call_npu_once(messages: list, num_predict: int = 250, is_cot: bool = 
                             "stream": False,
                             "options": {
                                 "num_predict": num_predict,
-                                "temperature": 0.45,
-                                "top_p": 0.85,
+                                "temperature": 0.55,
+                                "top_p": 0.90,
                                 "repeat_penalty": 1.05,
                                 "is_cot": is_cot,
                             }
@@ -1012,7 +913,8 @@ def _prepare_prompt_sync(session_id: str, prompt_message: str, measure_tokens=No
             if summaries_limit == 0 and any(kw in prompt_message.lower() for kw in MEMORY_RECALL_KEYWORDS):
                 summaries_limit = 3
 
-            summaries = get_recent_summaries(
+            is_bot_feedback = any(p in prompt_message.lower() for p in ("u just started", "you just started", "going crazy", "werent there", "weren't there", "not helping"))
+            summaries = [] if is_bot_feedback else get_recent_summaries(
                 exclude_session_id=session_id, limit=summaries_limit, query=prompt_message
             )
             session_summaries_text = "\n".join(f"- {s}" for s in summaries) if summaries else ""
@@ -1341,81 +1243,52 @@ async def generate_reply(session_id: str, prompt_message: str, history_message: 
 
     mode = prep["mode"]
     is_crisis = prep.get("is_crisis", False)
-    word_count = len(prompt_message.strip().split())
-    laya_no_retrieval = (
-        prep.get("laya_routing", {}).get("retrieval_decision") == "no_personal_context_needed"
-    )
-
-    # In supportive mode or acute crisis, never cap at short/cold replies
-    if mode in ("supportive", "guidance") or is_crisis:
-        is_casual_short = False
-    else:
-        is_casual_short = (
-            word_count < 15
-            or (mode == "conversational" and (word_count < 25 or laya_no_retrieval))
-            or laya_no_retrieval
-            or not (prep.get("personal_context") or prep.get("reference_context"))
-        )
-    if is_casual_short:
-        predict_tokens = 75
-    elif mode in ("conversational", "supportive") and not is_crisis:
-        predict_tokens = 90
-    else:
-        predict_tokens = 250
+    predict_tokens = 320 if mode in ("guidance", "coding") else 256
 
     raw_reply = await _call_npu_once(prep["messages"], num_predict=predict_tokens)
     bot_reply = await asyncio.to_thread(
         scrub_reply, raw_reply, session_id=session_id, mode=mode, is_crisis=is_crisis, prompt_message=prompt_message
     )
-    if is_casual_short:
-        sentences = re.split(r"(?<=[.!?])\s+", bot_reply)
-        if len(sentences) > 2:
-            bot_reply = " ".join(sentences[:2]).strip()
-        if word_count <= 5 and len(bot_reply.split()) > 15 and len(sentences) > 1:
-            bot_reply = sentences[0].strip()
 
-    # Fallback Loop Breaker: check against the last assistant turn in this session
+    # Repetition recovery: Only trigger if the reply contains an actual hardware token stutter
+    # (the exact same 1–4 word sequence repeated 4+ times consecutively, e.g. "i'm, i'm, i'm, i'm"),
+    # OR if the reply is 95%+ character-for-character identical to the immediately preceding assistant turn (and > 15 chars).
     last_assistant_turn = None
     for msg in reversed(prep["messages"]):
         if msg.get("role") == "assistant":
-            last_assistant_turn = msg.get("content", "")
+            last_assistant_turn = msg.get("content", "").strip()
             break
 
-    norm_reply = re.sub(r"[^a-z0-9]", "", bot_reply.lower())
-    is_loop = False
-    if last_assistant_turn:
-        norm_last = re.sub(r"[^a-z0-9]", "", last_assistant_turn.lower())
-        if norm_reply and norm_last:
-            if norm_reply == norm_last:
-                is_loop = True
-            else:
-                shorter = min(len(norm_reply), len(norm_last))
-                longer = max(len(norm_reply), len(norm_last))
-                if shorter > 0 and longer > 0 and (shorter / longer) >= 0.7:
-                    import difflib
-                    ratio = difflib.SequenceMatcher(None, norm_reply, norm_last).ratio()
-                    if ratio >= 0.8:
-                        is_loop = True
+    is_stutter_or_loop = False
+    stutter_match = re.search(r'(\b[\w\']+(?:\s+[\w\']+){0,3}\b)(?:[,.]\s*\1){3,}', bot_reply, re.IGNORECASE)
+    if stutter_match:
+        is_stutter_or_loop = True
 
-    if "stillhere" in norm_reply and "notfixed" in norm_reply:
-        is_loop = True
+    if not is_stutter_or_loop and last_assistant_turn and len(bot_reply) > 15:
+        import difflib
+        ratio = difflib.SequenceMatcher(None, bot_reply.strip().lower(), last_assistant_turn.lower()).ratio()
+        if ratio >= 0.95:
+            is_stutter_or_loop = True
 
-    if is_loop:
-        print(f"[loop_breaker] session '{session_id}': repetitive reply detected ({bot_reply!r}). Breaking loop with contextual reply...")
-        lowered_prompt = prompt_message.lower()
-        if is_crisis or mode in ("supportive", "guidance") or any(w in lowered_prompt for w in ["break down", "need u", "going wrong", "help", "alone", "sad", "crying"]):
-            bot_reply = "i'm right here with you. take a breath — tell me what happened, what's going on?"
-        elif any(prompt_message.strip().lower().startswith(g) for g in ["hi", "hey", "hello", "yo"]):
-            bot_reply = "hey! what's up?"
-        else:
-            fallbacks = {
-                "supportive": "i'm right here with you, what's on your mind?",
-                "guidance": "what would you like to explore?",
-                "followup": "hey, just checking in on you.",
-                "conversational": "yeah, what's up?",
-                "coding": "what would you like help with?",
-            }
-            bot_reply = fallbacks.get(mode, "i'm here, what's up?")
+    if is_stutter_or_loop:
+        # If there is a clean prefix before the stutter, keep it if substantive
+        if stutter_match and stutter_match.start() > 20:
+            clean_prefix = bot_reply[:stutter_match.start()].rstrip(" ,.:;")
+            if len(clean_prefix.split()) >= 3:
+                bot_reply = clean_prefix
+                is_stutter_or_loop = False
+
+    if is_stutter_or_loop:
+        print(f"[loop_recovery] session '{session_id}': re-sampling dynamically (reply was {bot_reply!r})")
+        system_msg = prep["messages"][0] if prep["messages"] and prep["messages"][0].get("role") == "system" else {"role": "system", "content": prep.get("system_prompt", "")}
+        recent_turns = [m for m in prep["messages"][1:] if m.get("role") in ("user", "assistant")][-6:]
+        resample_messages = [system_msg] + recent_turns
+        try:
+            resampled_raw = await _call_npu_once(resample_messages, num_predict=256)
+            bot_reply = await asyncio.to_thread(scrub_reply, resampled_raw, session_id=session_id, mode=mode, prompt_message=prompt_message)
+            raw_reply = resampled_raw
+        except Exception as e:
+            print(f"[loop_recovery] re-sample failed: {e}")
 
     try:
         context_present = bool(prep["personal_context"]) or bool(prep["reference_context"])
@@ -1495,17 +1368,20 @@ async def chat(payload: ChatRequest, key_info: dict = Depends(verify_api_key)):
             if len(data_b64) > (MAX_UPLOAD_BYTES * 4 // 3):
                 raise HTTPException(status_code=413, detail=f"Attachment '{att.get('name', 'file')}' exceeds 10MB limit")
         extracted_parts = await asyncio.gather(*[
-            asyncio.to_thread(decode_app_attachment, att) for att in payload.attachments
+            asyncio.to_thread(decode_app_attachment, att, user_message=payload.message, session_id=payload.session_id) for att in payload.attachments
         ])
         file_names = [att.get("name", "file") for att in payload.attachments]
 
         extracted_text = "\n\n".join(extracted_parts)
         prompt_message = f"{payload.message}\n\n{extracted_text}".strip()
-        excerpt = extracted_text[:500].strip()
-        if excerpt:
-            history_message = f"[Sent file(s): {', '.join(file_names)}\nExcerpt: {excerpt}] {payload.message}".strip()
+        if any("[IMAGE CONTENT —" in p for p in extracted_parts):
+            history_message = f"{extracted_text}\n{payload.message}".strip()
         else:
-            history_message = f"[Sent file(s): {', '.join(file_names)}] {payload.message}".strip()
+            excerpt = extracted_text[:500].strip()
+            if excerpt:
+                history_message = f"[Sent file(s): {', '.join(file_names)}\nExcerpt: {excerpt}] {payload.message}".strip()
+            else:
+                history_message = f"[Sent file(s): {', '.join(file_names)}] {payload.message}".strip()
 
     bot_reply, mode = await generate_reply(payload.session_id, prompt_message, history_message=history_message, is_guest=is_guest)
     return ChatResponse(reply=bot_reply, mode=mode)
@@ -1523,20 +1399,23 @@ async def chat_upload(
     file_bytes = await file.read()
     if len(file_bytes) > MAX_UPLOAD_BYTES:
         raise HTTPException(status_code=413, detail="File exceeds 10MB limit")
-    extracted = await asyncio.to_thread(process_uploaded_file, file.filename, file_bytes)
+    extracted = await asyncio.to_thread(process_uploaded_file, file.filename, file_bytes, user_message=message, session_id=session_id)
 
     if message.strip():
         prompt_message = f"{message.strip()}\n\n{extracted}"
     else:
         prompt_message = extracted
 
-    excerpt = extracted[:500].strip()
-    if excerpt:
-        history_message = f"[Sent a file: {file.filename}\nExcerpt: {excerpt}]"
+    if "[IMAGE CONTENT —" in extracted:
+        history_message = f"{extracted}\n{message.strip()}".strip()
     else:
-        history_message = f"[Sent a file: {file.filename}]"
-    if message.strip():
-        history_message += f" {message.strip()}"
+        excerpt = extracted[:500].strip()
+        if excerpt:
+            history_message = f"[Sent a file: {file.filename}\nExcerpt: {excerpt}]"
+        else:
+            history_message = f"[Sent a file: {file.filename}]"
+        if message.strip():
+            history_message += f" {message.strip()}"
 
     bot_reply, mode = await generate_reply(session_id, prompt_message, history_message=history_message, is_guest=is_guest)
     return ChatResponse(reply=bot_reply, mode=mode)
@@ -1955,7 +1834,7 @@ async def websocket_chat(websocket: WebSocket, session_id: str = Query("default"
 
                     try:
                         extracted_parts = await asyncio.gather(*[
-                            asyncio.to_thread(decode_app_attachment, att) for att in attachments
+                            asyncio.to_thread(decode_app_attachment, att, user_message=raw_message, session_id=session_id) for att in attachments
                         ])
                     except Exception as e:
                         print(f"[ws] attachment decode failed for {msg_id} in '{session_id}': {e}")
@@ -1969,11 +1848,14 @@ async def websocket_chat(websocket: WebSocket, session_id: str = Query("default"
                     file_names = [att.get("name", "file") for att in attachments]
                     extracted_text = "\n\n".join(extracted_parts)
                     prompt_message = f"{raw_message}\n\n{extracted_text}".strip()
-                    excerpt = extracted_text[:500].strip()
-                    if excerpt:
-                        history_message = f"[Sent file(s): {', '.join(file_names)}\nExcerpt: {excerpt}] {raw_message}".strip()
+                    if any("[IMAGE CONTENT —" in p for p in extracted_parts):
+                        history_message = f"{extracted_text}\n{raw_message}".strip()
                     else:
-                        history_message = f"[Sent file(s): {', '.join(file_names)}] {raw_message}".strip()
+                        excerpt = extracted_text[:500].strip()
+                        if excerpt:
+                            history_message = f"[Sent file(s): {', '.join(file_names)}\nExcerpt: {excerpt}] {raw_message}".strip()
+                        else:
+                            history_message = f"[Sent file(s): {', '.join(file_names)}] {raw_message}".strip()
 
                 if msg_id:
                     _mark_message_inflight(session_id, msg_id)

@@ -256,61 +256,13 @@ def _caption_image(image: Image.Image) -> str:
         return ""
 
 
-def process_image(file_bytes: bytes) -> str:
+def process_image(file_bytes: bytes, user_message: str = "", session_id: str = "default") -> str:
     """
-    Processes an uploaded image and returns a text description ready
-    to inject into the chat message. OCR runs first since it's fast;
-    if it finds text with high enough confidence, this is probably a
-    screenshot or photographed document, so captioning is skipped
-    entirely. Low-confidence OCR (real but error-prone - e.g. small
-    or blurry text) is still shown but explicitly labeled so the model
-    doesn't treat garbled extraction as authoritative. If OCR finds
-    little/no trustworthy text, this is probably a real photo, so a
-    caption is generated instead to describe what's shown.
+    Processes an uploaded image via Cactus Mirage (22MB), face tagging/recognition,
+    and lazy-loaded BLIP fallback via vision_memory.
     """
-    try:
-        image = Image.open(io.BytesIO(file_bytes)).convert("RGB")
-    except Exception as e:
-        return f"[Could not open image: {e}]"
-
-    image = _resize_if_oversized(image)
-
-    ocr_text, ocr_conf = _best_ocr(image)
-
-    ocr_confident = len(ocr_text) >= 15 and ocr_conf >= OCR_CONFIDENCE_THRESHOLD
-    ocr_low_conf = (
-        len(ocr_text) >= 15
-        and OCR_LOW_CONFIDENCE_FLOOR <= ocr_conf < OCR_CONFIDENCE_THRESHOLD
-    )
-    nl = chr(10)
-    if ocr_confident:
-        return f"[Image contains the following text, extracted via OCR:]{nl}{_truncate_ocr_text(ocr_text)}"
-
-    if ocr_low_conf:
-        # Real-looking text below the confidence bar: show it but say so -
-        # presenting low-confidence extraction as clean fact was how garbled
-        # OCR used to reach the model.
-        return (f"[Image may contain this partially legible text "
-                f"(low OCR confidence - words may be wrong):]"
-                f"{nl}{_truncate_ocr_text(ocr_text)}")
-
-
-    if _enough_memory_for_captioning():
-        caption = _caption_image(image)
-    else:
-        caption = ""
-
-    remnant = ""
-    if ocr_text and len(ocr_text) < 15 and ocr_conf >= OCR_CONFIDENCE_THRESHOLD:
-        remnant = f" Some additional text detected: {ocr_text}"
-
-    if caption:
-        return f"[Image shows: {caption}.{remnant}]"
-
-    if ocr_text and ocr_conf >= OCR_CONFIDENCE_THRESHOLD:
-        return f"[Image contains the following text, extracted via OCR:]\n{_truncate_ocr_text(ocr_text)}"
-
-    return "[An image was sent, but no readable text or clear description could be extracted from it.]"
+    from vision_memory import process_uploaded_image
+    return process_uploaded_image(file_bytes, user_message=user_message, session_id=session_id)
 
 
 def process_pdf(file_bytes: bytes) -> str:
@@ -365,7 +317,7 @@ def process_text(file_bytes: bytes) -> str:
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif"}
 
 
-def process_uploaded_file(filename: str, file_bytes: bytes) -> str:
+def process_uploaded_file(filename: str, file_bytes: bytes, user_message: str = "", session_id: str = "default") -> str:
     """
     Dispatches an uploaded file to the right processor based on its
     extension, and returns plain text describing/containing its
@@ -375,7 +327,7 @@ def process_uploaded_file(filename: str, file_bytes: bytes) -> str:
     ext = Path(filename).suffix.lower()
 
     if ext in IMAGE_EXTENSIONS:
-        return process_image(file_bytes)
+        return process_image(file_bytes, user_message=user_message, session_id=session_id)
     elif ext == ".pdf":
         return process_pdf(file_bytes)
     elif ext == ".docx":
@@ -386,7 +338,7 @@ def process_uploaded_file(filename: str, file_bytes: bytes) -> str:
         return f"[Unsupported file type: {ext or 'unknown'}. Supported: images (jpg/png/webp/etc), PDF, DOCX, TXT.]"
 
 
-def decode_app_attachment(attachment: dict) -> str:
+def decode_app_attachment(attachment: dict, user_message: str = "", session_id: str = "default") -> str:
     """
     Converts one attachment dict sent by the Android app's /chat JSON
     payload into extracted text. Handles data URLs (base64) for all
@@ -402,7 +354,7 @@ def decode_app_attachment(attachment: dict) -> str:
         try:
             b64_part = raw.split(",", 1)[1] if "," in raw else raw
             file_bytes = base64.b64decode(b64_part)
-            return process_uploaded_file(name, file_bytes)
+            return process_uploaded_file(name, file_bytes, user_message=user_message, session_id=session_id)
         except Exception as e:
             return f"[Could not decode attachment '{name}': {e}]"
 
@@ -414,6 +366,6 @@ def decode_app_attachment(attachment: dict) -> str:
 
     try:
         file_bytes = base64.b64decode(raw)
-        return process_uploaded_file(name, file_bytes)
+        return process_uploaded_file(name, file_bytes, user_message=user_message, session_id=session_id)
     except Exception as e:
         return f"[Could not decode attachment '{name}': {e}]"
