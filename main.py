@@ -301,13 +301,25 @@ def scrub_reply(text: str, session_id: str = "", mode: str = "", is_crisis: bool
     # 2. Strip leading role prefixes if the model accidentally emits "Assistant:" or "Bot:" at index 0
     text = re.sub(r'^(?:assistant|bot|bot bot)\s*:\s*', '', text, flags=re.IGNORECASE)
 
-    # 3. Trim genuine 4x consecutive comma/word stutters at the tail of a generation
+    # 3. Strip vertical dot trails, standalone punctuation lines, and spaced dot chains
+    text = re.sub(r'(?:\r?\n\s*[.\-_*?]+\s*)+', '\n', text)
+    text = re.sub(r'(?:\.\s+){2,}\.?', '.', text)
+    text = re.sub(r'\bJust\.\s*\.*', '', text, flags=re.IGNORECASE)
+
+    # 4. Strip leading "Aah, I see." filler if the model emits it
+    text = re.sub(r'^Aah,\s*(?:I\s+see[.,!]?\s*)?', '', text, flags=re.IGNORECASE)
+
+    # 5. Collapse 2x+ consecutive repeated phrases/clauses (e.g. "I'm here. I'm here.")
     text = re.sub(
-        r'(\b[\w\']+(?:\s+[\w\']+){0,3}\b)(?:[,.]\s*\1){3,}[,.\s\w\']*',
+        r'(\b[\w\']+(?:\s+[\w\']+){0,5}\b)(?:[,.!]+\s*\1\b)+',
         r'\1.',
         text,
         flags=re.IGNORECASE
     )
+
+    # 6. Collapse multi-line vertical stacking into clean horizontal sentences
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip() and not re.fullmatch(r'[.\-_*?\s]+', ln.strip())]
+    text = " ".join(lines)
 
     return text.strip()
 
@@ -382,12 +394,13 @@ async def _call_npu_once(messages: list, num_predict: int = 256, is_cot: bool = 
                             "messages": messages,
                             "stream": False,
                             "options": {
-                                "num_predict": num_predict,
-                                "temperature": 0.55,
-                                "top_p": 0.90,
-                                "repeat_penalty": 1.05,
-                                "is_cot": is_cot,
-                            }
+                                    "num_predict": num_predict,
+                                    "temperature": 0.55,
+                                    "top_p": 0.90,
+                                    "repeat_penalty": 1.08,
+                                    "stop": [chr(10) + "." + chr(10), "." + chr(10) + ".", ". . .", "I'm here. I'm here"],
+                                    "is_cot": is_cot,
+                                }
                         }
                     )
                     response.raise_for_status()
@@ -1873,3 +1886,7 @@ async def websocket_chat(websocket: WebSocket, session_id: str = Query("default"
             del active_connections[session_id]
         if session_id in session_guest_status:
             del session_guest_status[session_id]
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)

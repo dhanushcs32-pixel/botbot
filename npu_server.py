@@ -81,7 +81,7 @@ def _log_free_ram(context: str) -> None:
 # For Qwen 4B (hidden_size=2560), lora_A in_features must be 2560.
 ADAPTER_DIR = "./lora_adapter"
 ADAPTER_PATH = os.path.join(ADAPTER_DIR, "adapter_model.safetensors")
-LORA_ALPHA = float(os.getenv("LORA_ALPHA", "0.08"))
+LORA_ALPHA = float(os.getenv("LORA_ALPHA", "0.0"))
 ADAPTER_ALPHA = LORA_ALPHA
 CACHE_DIR = "./.npu_cache"
 os.makedirs(CACHE_DIR, exist_ok=True)
@@ -141,7 +141,7 @@ def _load_adapter_config(model_dir: str):
     if _cached_adapter_config is not None:
         return _cached_adapter_config
 
-    LORA_ALPHA = float(os.getenv("LORA_ALPHA", "0.08"))
+    LORA_ALPHA = float(os.getenv("LORA_ALPHA", "0.0"))
     ADAPTER_ALPHA = LORA_ALPHA
 
     hidden_size = _get_model_hidden_size(model_dir)
