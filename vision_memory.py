@@ -23,9 +23,10 @@ from PIL import Image, ImageOps
 
 # Base directories
 BASE_DIR = Path(__file__).resolve().parent
-DB_PATH = BASE_DIR / "memory.db"
-SAVED_IMAGES_DIR = BASE_DIR / "personal_data" / "saved_images"
-FACES_DIR = BASE_DIR / "personal_data" / "faces"
+PERSONAL_DATA_DIR = Path(os.getenv("PERSONAL_DATA_DIR", BASE_DIR / "personal_data"))
+DB_PATH = Path(os.getenv("DB_PATH", PERSONAL_DATA_DIR / "memory.db"))
+SAVED_IMAGES_DIR = PERSONAL_DATA_DIR / "saved_images"
+FACES_DIR = PERSONAL_DATA_DIR / "faces"
 
 # Ensure directories exist
 SAVED_IMAGES_DIR.mkdir(parents=True, exist_ok=True)

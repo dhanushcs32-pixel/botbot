@@ -10,20 +10,22 @@ Everything runs 100% locally — embeddings are generated on-device
 using sentence-transformers, no cloud calls involved.
 """
 
+import math
 import os
 import re
 import time
 from pathlib import Path
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from dateutil import parser as dateutil_parser
 import chromadb
 from chromadb.utils import embedding_functions
 from rank_bm25 import BM25Okapi
 from laya_engine import rerank_and_filter_chunks, LAYA_ENABLED, is_laya_available
+from memory import compute_recency_score
 
 
-PERSONAL_DATA_DIR = Path(__file__).parent / "personal_data"
-CHROMA_STORE_DIR = Path(__file__).parent / "chroma_store"
+PERSONAL_DATA_DIR = Path(os.getenv("PERSONAL_DATA_DIR", Path(__file__).parent / "personal_data"))
+CHROMA_STORE_DIR = Path(os.getenv("CHROMA_PATH", PERSONAL_DATA_DIR / "chroma_store"))
 
 # Finished bot sessions get exported here (summary header + full transcript,
 # one .txt per session) by conversation_export.py, and indexed into the same
@@ -51,6 +53,147 @@ MAX_EXPANDED_SESSION_CHARS = 6000   # cap per expanded full bot_conversation ses
 WHATSAPP_LINE_PATTERN = re.compile(
     r"^(\d{1,2}/\d{1,2}/\d{2,4}),\s*(\d{1,2}:\d{2}(?:\s*[APap][Mm])?)\s*-\s"
 )
+
+# ----------------------------------------------------------------------
+# PHASE 5: RETRIEVAL GATE, POISON FILTER & RECENCY WEIGHTING
+# ----------------------------------------------------------------------
+ENABLE_RETRIEVAL_GATE = os.environ.get("ENABLE_RETRIEVAL_GATE", "1").lower() in ("1", "true", "yes")
+
+ATTRACTOR_REGEX = re.compile(
+    r"\b(not fixing|just here|let me just be|not going anywhere|aah, i see|hold space|sit with you)\b",
+    re.IGNORECASE,
+)
+LOOP_PERIOD_REGEX = re.compile(r"(\.\s*){4,}")
+LOOP_DOTS_REGEX = re.compile(r"(?:\.\s+){2,}\.|\.\s*[\r\n]+\s*\.|(?:\.{2,}\s*){2,}")
+LOOP_REPEATED_CLAUSE_REGEX = re.compile(r"(.{8,40}?)\s*(?:and\s+)?\1\s*(?:and\s+)?\1", re.IGNORECASE)
+
+
+def is_poisoned_chunk(text: str) -> bool:
+    """
+    Checks if a candidate chunk contains attractor phrases or loop/repetition patterns.
+    Poisoned chunks are blocked from entering the context.
+    """
+    if not text:
+        return False
+    if ATTRACTOR_REGEX.search(text):
+        return True
+    if LOOP_PERIOD_REGEX.search(text) or LOOP_DOTS_REGEX.search(text) or LOOP_REPEATED_CLAUSE_REGEX.search(text):
+        return True
+    return False
+
+
+def format_background_facts(items: list[str]) -> str:
+    """
+    Formats retrieved items strictly as background facts (Phase 5).
+    """
+    if not items:
+        return ""
+    bullet_items = []
+    for it in items:
+        clean_it = it.strip()
+        if not clean_it:
+            continue
+        if not clean_it.startswith("-"):
+            clean_it = f"- {clean_it}"
+        bullet_items.append(clean_it)
+    if not bullet_items:
+        return ""
+    body = "\n".join(bullet_items)
+    return f"[Background facts about the user (Dhanush) — these happened to the USER, not to you; reference casually only if relevant, do not copy wording:\n{body}\n]"
+
+
+def score_and_filter_memories(
+    candidates: list[dict],
+    query: str,
+    max_items: int = 3,
+    max_words: int = 120,
+    now: datetime | None = None
+) -> list[dict]:
+    """
+    Scores, filters, and caps candidate memories (Phase 5):
+    1. Poison Filter: blocks chunks matching attractor or loop patterns.
+    2. Recency Weighting: final_score = 0.80 * sim_score + 0.20 * exp(-days_old / 30.0).
+    3. Stale Down-ranking: down-rank (* 0.5) if tagged [past event] or [stale] unless asking about the past.
+    4. Capping: selects top candidates (max_items <= 3) and trims to max_words <= 120 words total.
+    """
+    if not candidates:
+        return []
+
+    now_dt = now or datetime.now(timezone.utc)
+    now_ts = now_dt.timestamp()
+
+    PAST_KEYWORDS = ("remember", "past", "last year", "back then", "ago", "earlier", "previously", "history", "old", "used to")
+    asks_about_past = any(kw in query.lower() for kw in PAST_KEYWORDS)
+
+    scored_cands = []
+    for cand in candidates:
+        doc = cand.get("doc", "")
+        if not doc or is_poisoned_chunk(doc):
+            continue
+
+        meta = cand.get("meta") or {}
+        sim_score = float(cand.get("sim_score", 0.5))
+
+        # Determine age in days
+        chunk_ts = meta.get("date_end_epoch") or meta.get("date_start_epoch")
+        if chunk_ts is None and "date" in meta:
+            try:
+                dt = dateutil_parser.parse(str(meta["date"]))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                chunk_ts = dt.timestamp()
+            except Exception:
+                chunk_ts = None
+
+        if chunk_ts is not None:
+            days_old = max(0.0, (now_ts - float(chunk_ts)) / 86400.0)
+        elif "days_old" in cand:
+            days_old = float(cand["days_old"])
+        else:
+            days_old = 30.0  # default neutral decay
+
+        final_score = compute_recency_score(sim_score, days_old)
+
+        # Stale down-ranking
+        is_stale = (
+            "[past event]" in doc.lower() or
+            "[stale]" in doc.lower() or
+            bool(meta.get("stale")) or
+            bool(meta.get("past_event"))
+        )
+        if is_stale and not asks_about_past:
+            final_score = round(final_score * 0.5, 4)
+
+        scored = dict(cand)
+        scored["final_score"] = final_score
+        scored_cands.append(scored)
+
+    # Sort descending by final_score
+    scored_cands.sort(key=lambda c: c["final_score"], reverse=True)
+
+    # Select top max_items
+    selected = scored_cands[:max_items]
+
+    # Cap to max_words total across selected items
+    result = []
+    words_remaining = max_words
+    for item in selected:
+        doc_words = item["doc"].split()
+        if not doc_words:
+            continue
+        if len(doc_words) <= words_remaining:
+            result.append(item)
+            words_remaining -= len(doc_words)
+        else:
+            if words_remaining >= 5:
+                trimmed_item = dict(item)
+                trimmed_item["doc"] = " ".join(doc_words[:words_remaining]) + "..."
+                result.append(trimmed_item)
+            break
+        if words_remaining <= 0:
+            break
+
+    return result
 
 # ----------------------------------------------------------------------
 # LAZY LOADING SYSTEM
@@ -328,22 +471,24 @@ _style_cache = {"mtime": None, "content": ""}
 
 
 def get_style_profile() -> str:
-    """Reads the user's personality template to constrain the bot's behavior."""
+    """Reads the user's personality template to shape the bot's behavior."""
     base_dir = Path(__file__).parent
-    template_path = base_dir / "personal_data" / "my_style_template.txt"
+    style_path = base_dir / "personal_data" / "my_style.txt"
+    if not style_path.exists():
+        style_path = base_dir / "personal_data" / "my_style_template.txt"
     
-    if not template_path.exists():
-        print(f"[warning] Style profile not found at {template_path}")
+    if not style_path.exists():
+        print(f"[warning] Style profile not found at {style_path}")
         return ""
     
     try:
-        with open(template_path, "r", encoding="utf-8") as f:
+        with open(style_path, "r", encoding="utf-8") as f:
             content = f.read().strip()
             if content:
-                return f"### BEHAVIORAL RULES ###\n{content}\n"
+                return f"### BEHAVIORAL GUIDELINES ###\n{content}\n"
             return ""
     except Exception as e:
-        print(f"[warning] Failed to read my_style_template.txt: {e}")
+        print(f"[warning] Failed to read style profile: {e}")
         return ""
 
 
@@ -835,10 +980,22 @@ def search_reference_data(query: str, top_k: int = 3) -> str:
     if not documents:
         return ""
 
-    tagged = [f"[{build_reference_excerpt_label(meta)}]\n{doc}" for doc, meta in zip(documents, metadatas)]
+    # Phase 5: Poison filter & cap to at most 3 items and max ~120 words total
+    clean_docs = []
+    clean_metas = []
+    for doc, meta in zip(documents, metadatas):
+        if not is_poisoned_chunk(doc):
+            clean_docs.append(doc)
+            clean_metas.append(meta)
+
+    if not clean_docs:
+        return ""
+
+    tagged = [f"[{build_reference_excerpt_label(meta)}]\n{doc}" for doc, meta in zip(clean_docs[:3], clean_metas[:3])]
     combined = "\n---\n".join(tagged)
-    if len(combined) > MAX_REFERENCE_RESULT_CHARS:
-        combined = combined[:MAX_REFERENCE_RESULT_CHARS] + "\n[...reference excerpt truncated...]"
+    words = combined.split()
+    if len(words) > 120:
+        combined = " ".join(words[:120]) + "..."
     return combined
 
 
@@ -1036,14 +1193,111 @@ def is_meta_memory_question(message: str) -> bool:
     return any(p in msg for p in META_MEMORY_PATTERNS)
 
 
+REACTIVE_OR_GREETING_WORDS = {
+    "lol", "lmao", "rofl", "haha", "hahaha", "yea", "yeah", "yep", "yes", "true",
+    "alr", "alright", "ok", "okay", "k", "kk", "cool", "nice", "wbu", "hbu",
+    "good", "fine", "same", "got it", "thanks", "thank you", "ty", "thx",
+    "hey", "yo", "sup", "hi", "hello", "gm", "gn", "good morning", "good night",
+    "morning", "night", "bye", "see ya", "sure", "nope", "nah"
+}
+
+REACTIVE_PHRASES = {
+    "yea true", "yeah true", "haha okay", "haha ok", "lol true", "sounds good",
+    "makes sense", "fair enough", "no worries", "all good", "you too", "u too"
+}
+
+
+def should_retrieve(message: str, signals: dict | None = None) -> bool:
+    """
+    Fast Retrieval Gate (Phase 5):
+    Determines whether the incoming message warrants personal/reference RAG retrieval.
+    Returns False (skip retrieval) for short reactive turns (<= 3 words with no named entities/queries),
+    simple greetings, or pure acknowledgments.
+    """
+    if not ENABLE_RETRIEVAL_GATE:
+        return True
+
+    msg_clean = message.strip()
+    if not msg_clean:
+        return False
+
+    # Check for question marks
+    if "?" in msg_clean:
+        return True
+
+    words = re.findall(r"\b\w+\b", msg_clean.lower())
+    if not words:
+        return False
+
+    norm_text = " ".join(words)
+
+    # Simple greetings or acknowledgments
+    if norm_text in REACTIVE_OR_GREETING_WORDS or msg_clean.lower() in REACTIVE_OR_GREETING_WORDS:
+        return False
+
+    if norm_text in REACTIVE_PHRASES:
+        return False
+
+    # Check known people or entities
+    try:
+        known_people = get_known_people()
+    except Exception:
+        known_people = set()
+
+    if detect_mentioned_person(msg_clean, known_people) is not None:
+        return True
+
+    if parse_date_reference(msg_clean) is not None:
+        return True
+
+    # Check interrogatives or memory triggers
+    INTERROGATIVES = {"who", "what", "where", "when", "why", "how", "which", "whose", "remember", "recall"}
+    if any(w in INTERROGATIVES for w in words):
+        return True
+
+    # If <= 3 words and no entities/question, check if it's reactive/trivial words
+    if len(words) <= 3:
+        if all(w in REACTIVE_OR_GREETING_WORDS or len(w) <= 2 for w in words):
+            return False
+        COMMON_REACTIVE_WORDS = REACTIVE_OR_GREETING_WORDS | {
+            "dude", "bro", "man", "mate", "bruh", "omg", "ikr", "idk", "idc", "smh", "tbh",
+            "fr", "frfr", "dead", "welp", "damn", "dang", "aww", "wow", "ooh", "oh", "ah",
+            "really", "totally", "definitely", "maybe", "probably", "actually", "so", "and",
+            "well", "like", "just", "now", "then", "there", "here", "too"
+        }
+        if all(w in COMMON_REACTIVE_WORDS for w in words):
+            return False
+
+    # Check for explicit memory or substantive query indicators
+    MEMORY_TRIGGERS = (
+        "remember", "talked about", "earlier", "last time", "yesterday", "we said",
+        "who is", "what is", "where is", "when did", "how was", "tell me about",
+        "trip", "college", "project", "exam", "doctor", "meeting", "flight"
+    )
+    if any(trig in msg_clean.lower() for trig in MEMORY_TRIGGERS):
+        return True
+
+    # If message is longer (>= 4 words)
+    if len(words) >= 4:
+        if signals and signals.get("is_venting") and not any(trig in msg_clean.lower() for trig in MEMORY_TRIGGERS):
+            return False
+        return True
+
+    return False
+
+
 def should_bypass_personal_retrieval(query: str, laya_routing: dict | None = None, known_people: set[str] | None = None) -> bool:
     """
     Checks whether personal RAG retrieval should be bypassed:
-    1. Standard trivial messages ("ok", "lol", "hey, good morning", etc.).
-    2. Vague scheduling questions with the bot ("what time are we meeting?") where no person is mentioned.
-    3. Laya classified as 'no_personal_context_needed' with confidence (>= 0.60)
+    1. Fast retrieval gate (short reactive turns, greetings, acknowledgments).
+    2. Standard trivial messages ("ok", "lol", "hey, good morning", etc.).
+    3. Vague scheduling questions with the bot ("what time are we meeting?") where no person is mentioned.
+    4. Laya classified as 'no_personal_context_needed' with confidence (>= 0.60)
        AND no known person or date reference is detected in the query.
     """
+    if not should_retrieve(query):
+        return True
+
     if is_trivial_message(query):
         return True
 
@@ -1231,11 +1485,26 @@ def search_personal_data(query: str, top_k: int = 6, max_result_chars: int = MAX
                 print(f"[rag] Laya chunk filtering failed (meta-memory): {e}")
 
         expanded = expand_bot_conversation_matches(documents, metadatas)
-        tagged = [f"[{build_excerpt_label(meta)}]\n{text}" for text, meta in expanded]
-        combined = "\n---\n".join(tagged)
-        if len(combined) > max_result_chars:
-            combined = combined[:max_result_chars] + "\n[...personal context truncated...]"
-        return combined
+        # Phase 5: Filter poisoned chunks, cap to 3 items and max ~120 words total
+        clean_expanded = [(doc, meta) for doc, meta in expanded if not is_poisoned_chunk(doc)]
+        if not clean_expanded:
+            return ""
+        items = []
+        words_remaining = 120
+        for doc, meta in clean_expanded[:3]:
+            doc_words = doc.split()
+            if not doc_words:
+                continue
+            if len(doc_words) <= words_remaining:
+                items.append(doc)
+                words_remaining -= len(doc_words)
+            else:
+                if words_remaining >= 5:
+                    items.append(" ".join(doc_words[:words_remaining]) + "...")
+                break
+            if words_remaining <= 0:
+                break
+        return format_background_facts(items)
 
     date_range = parse_date_reference(query)
 
@@ -1308,14 +1577,24 @@ def search_personal_data(query: str, top_k: int = 6, max_result_chars: int = MAX
         except Exception as e:
             print(f"[rag] Laya chunk filtering failed (personal): {e}")
 
-    tagged = []
-    for doc, meta in zip(documents, metadatas):
-        tagged.append(f"[{build_excerpt_label(meta)}]\n{doc}")
+    # Phase 5: Score, filter, and cap personal memories
+    candidates = []
+    for i, (doc, meta) in enumerate(zip(documents, metadatas)):
+        dist = distances[i] if distances and i < len(distances) else 0.5
+        sim_score = max(0.0, 1.0 - dist)
+        candidates.append({"doc": doc, "meta": meta, "sim_score": sim_score})
 
-    combined = "\n---\n".join(tagged)
-    if len(combined) > max_result_chars:
-        combined = combined[:max_result_chars] + "\n[...personal context truncated...]"
-    return combined
+    filtered_cands = score_and_filter_memories(candidates, query=query, max_items=3, max_words=120)
+    if not filtered_cands:
+        return ""
+
+    from time_utils import format_memory_dates_for_retrieval
+    item_texts = []
+    for cand in filtered_cands:
+        doc_text = format_memory_dates_for_retrieval(cand["doc"].strip())
+        item_texts.append(doc_text)
+
+    return format_background_facts(item_texts)
 
 
 if __name__ == "__main__":

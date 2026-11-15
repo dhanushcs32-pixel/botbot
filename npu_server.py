@@ -653,6 +653,10 @@ async def chat(payload: ChatRequest):
         config.eos_token_id = primary_eos
     config.stop_token_ids = set(eos_token_ids)
     config.stop_strings = {
+        "\n.\n",
+        ".\n.",
+        ". . .",
+        "I'm here. I'm here",
         "<|im_end|>",
         "<|endoftext|>",
         "<|im_start|>",
@@ -683,6 +687,14 @@ async def chat(payload: ChatRequest):
             rep_penalty = opts["repeat_penalty"]
         elif "repetition_penalty" in opts:
             rep_penalty = opts["repetition_penalty"]
+
+        if "no_repeat_ngram_size" in opts:
+            val = int(opts["no_repeat_ngram_size"])
+            if hasattr(config, "no_repeat_ngram_size"):
+                try:
+                    config.no_repeat_ngram_size = val
+                except Exception as e:
+                    print(f"[decode_guard] could not set no_repeat_ngram_size: {e}")
             
         if "presence_penalty" in opts:
             config.presence_penalty = float(opts["presence_penalty"])
@@ -737,10 +749,9 @@ async def chat(payload: ChatRequest):
             messages[-1]["content"] = messages[-1]["content"][:-excess_chars] + " [truncated]"
             prompt = _format_chatml(messages)
 
-    # Native no-think instruct mode for Qwen 4B when not in explicit diagnostic reasoning mode
+    # For Qwen3-4B-Instruct-2507, <think> is not in the model vocabulary or chat template.
+    # Non-existent <think> injection is disabled to prevent tokenizer fragmentation.
     is_cot_request = bool(payload.is_cot or (payload.options and payload.options.get("is_cot")))
-    if not is_cot_request and prompt.endswith("<|im_start|>assistant\n"):
-        prompt += "<think>\n\n</think>\n\n"
 
     # --- Route to NPU or GPU based on real estimated prompt size ---
     # NPU has a hard compiled MAX_PROMPT_LEN=6144 — exceeding it fails

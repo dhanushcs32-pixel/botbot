@@ -1,8 +1,13 @@
 import sqlite3
+import sys
+from pathlib import Path
 from datetime import datetime
 from collections import defaultdict
 
-conn = sqlite3.connect('memory.db')
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from memory import DB_PATH
+
+conn = sqlite3.connect(DB_PATH)
 rows = conn.execute(
     "SELECT session_id, timestamp FROM conversations WHERE role='user' ORDER BY session_id, id"
 ).fetchall()

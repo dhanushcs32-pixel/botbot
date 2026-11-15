@@ -16,6 +16,7 @@ past conversations (from RAG) must only inform STYLE, never be
 copied or repeated as actual response content.
 """
 
+import os
 import re
 from typing import Optional, List, Dict, Any
 from laya_engine import classify_mode_and_retrieval, LAYA_ENABLED, is_laya_available
@@ -275,21 +276,94 @@ def get_retrieval_policy(mode: str) -> dict:
 
 
 # ----------------------------------------------------------------
+# Named Sampling Profiles & Decode Guards (Phase 2)
+# ----------------------------------------------------------------
+
+ENABLE_DECODE_GUARDS = True
+
+SAMPLING_PROFILES = {
+    "casual": {
+        "temperature": 0.60,
+        "top_p": 0.90,
+        "top_k": 20,
+        "repeat_penalty": 1.08,
+        "repetition_penalty": 1.08,
+        "no_repeat_ngram_size": 3,
+        "num_predict": 90,
+    },
+    "playful": {
+        "temperature": 0.70,
+        "top_p": 0.92,
+        "top_k": 25,
+        "repeat_penalty": 1.08,
+        "repetition_penalty": 1.08,
+        "no_repeat_ngram_size": 3,
+        "num_predict": 90,
+    },
+    "supportive": {
+        "temperature": 0.50,
+        "top_p": 0.88,
+        "top_k": 20,
+        "repeat_penalty": 1.10,
+        "repetition_penalty": 1.10,
+        "no_repeat_ngram_size": 3,
+        "num_predict": 110,
+    },
+    "short": {
+        "temperature": 0.45,
+        "top_p": 0.85,
+        "top_k": 15,
+        "repeat_penalty": 1.08,
+        "repetition_penalty": 1.08,
+        "no_repeat_ngram_size": 3,
+        "num_predict": 50,
+    },
+}
+
+
+def get_sampling_profile(mode: str, message: str = "", time_bucket: str = "", gap_sec: float = 0.0) -> dict:
+    """
+    Returns named sampling profile parameters based on behavioral mode, user turn length,
+    and positive time cues (e.g. late night softer/shorter profile).
+    When ENABLE_DECODE_GUARDS is False, falls back to legacy general sampling.
+    """
+    if not ENABLE_DECODE_GUARDS:
+        return {
+            "temperature": 0.55,
+            "top_p": 0.90,
+            "top_k": 20,
+            "repeat_penalty": 1.08,
+            "repetition_penalty": 1.08,
+            "num_predict": 256,
+        }
+
+    mode_lower = (mode or "").lower()
+    if "support" in mode_lower or "crisis" in mode_lower:
+        profile = dict(SAMPLING_PROFILES["supportive"])
+    elif "play" in mode_lower or "joke" in mode_lower:
+        profile = dict(SAMPLING_PROFILES["playful"])
+    elif "short" in mode_lower or (message and len(message.strip().split()) <= 3 and mode_lower == "conversational"):
+        profile = dict(SAMPLING_PROFILES["short"])
+    else:
+        profile = dict(SAMPLING_PROFILES["casual"])
+
+    # Positive time-behavior profile cues:
+    # Late night hours: prefer softer, slightly shorter responses
+    if time_bucket == "late night":
+        profile["num_predict"] = min(profile.get("num_predict", 90), 65)
+        profile["temperature"] = round(max(0.40, min(profile.get("temperature", 0.60), 0.48)), 2)
+
+    return profile
+
+
+# ----------------------------------------------------------------
 # System prompt construction
 # ----------------------------------------------------------------
 
-BASE_PERSONA = """You are Bot Bot, a private and personal AI companion.
-You live entirely on the user's device — no cloud, no internet, no external services.
-You are not a generic assistant. You are a trusted presence — like a close friend who
-actually listens, remembers, and engages genuinely.
-"""
+BASE_PERSONA = """You are Bot Bot, a close friend and trusted companion texting privately on the user's phone. You listen, remember, and talk like a real friend."""
 
 EMOTIONAL_UNDERSTANDING_INSTRUCTION = """
-Read the emotional undertone of the user's message naturally — whether they sound
-happy, proud, worried, joyful, frustrated, nostalgic, excited, or anything in between,
-including mixed or subtle emotions. Let your tone genuinely reflect that understanding.
-Do not label, name, or announce the emotion you detected (never say "I sense you're
-feeling..."). Just respond the way someone who truly gets them would.
+Read the emotional undertone naturally — match the user's energy with warmth, calm, or playfulness, responding the way a close friend who truly understands would.
 """
 
 USER_NAME = "Dhanush"  # update this if the user's name changes
@@ -299,29 +373,8 @@ IMPORTANT_LINKS_MAX_CHARS = 4000
 def build_anti_repetition_instruction(user_name: str = "Dhanush") -> str:
     name = user_name.strip() if user_name and user_name.strip() else "the user"
     return f"""
-The excerpts below are for STYLE reference only (communication patterns,
-emotional tone) — never copy or closely mimic their exact phrases as reply
-content; always generate a fresh, original response.
-
-IDENTITY: you're talking to {name} right now. When "{name}" appears
-as a speaker in an excerpt, that IS the current user — don't narrate their
-own words back to them in third person.
-
-CRITICAL ANTI-HALLUCINATION GUARDRAIL:
-You were never present in these conversations — they are private messages
-between {name} and OTHER PEOPLE. They are NOT plans, agreements, or memories
-between you and {name}.
-- NEVER claim that "we" agreed, "we" said, or "we" are meeting based on these excerpts.
-- You are an AI companion living on the user's phone; you do not meet up in the physical world.
-- If {name} asks what time "we said we're meeting" or asks about plans with you, and no meeting was arranged in your active chat, honestly say you haven't set a time or ask what they mean. NEVER invent a meeting time, place, or calendar event.
-
-Excerpts may be small, disconnected fragments from different times — don't
-stitch unrelated ones into an invented story. If they don't clearly answer
-the question, say so honestly rather than guessing.
-
-Each excerpt is labeled with who it's from and its date, e.g.
-"[Chat with Surya | 12/06/2026]" — use this to identify who/when, but
-never read the label text aloud in your reply.
+Background context represents factual notes about {name}'s life — they happened to {name}, not to you.
+IDENTITY: You are talking with {name}. React in the present moment to what {name} actually said; never invent unverified past shared memories or past meetings.
 """
 
 
@@ -330,58 +383,27 @@ ANTI_REPETITION_INSTRUCTION = build_anti_repetition_instruction(USER_NAME)
 CRISIS_SUPPORT_DIRECTIVE = ""
 
 NO_CONTEXT_INSTRUCTION = """
-No relevant personal context was found for this message. Respond naturally
-based only on this conversation and what the user has told you directly.
-Do not invent or assume any prior shared history, events, or details that
-have not actually been mentioned to you.
-If the user asks about a specific plan, time, or fact not shown in the recent messages, say you don't remember or ask them to remind you instead of guessing.
+Respond naturally based on this conversation and what the user has shared directly with you. When asked about specific plans or unknown details, ask to be reminded or say you are not sure.
 """
 
-# Distinct from NO_CONTEXT_INSTRUCTION: this covers the case where
-# retrieval DID return something (personal_context and/or
-# reference_context is non-empty) but the excerpts don't actually
-# contain the answer to what the user is asking. Left unaddressed,
-# the model tends to fill that gap by confabulating — inventing a
-# name, date, or detail that sounds plausible given the excerpts'
-# general subject matter but was never actually stated in them. The
-# ANTI_REPETITION_INSTRUCTION note that excerpts may be small/
-# disconnected fragments already gestures at this, but doesn't state
-# it as its own rule — this makes it explicit and repeats it right
-# next to whichever context block was actually included, rather than
-# only appearing once further up the prompt.
 CONTEXT_SUFFICIENCY_INSTRUCTION = """
-Before answering from the context above, check whether it actually contains
-the specific answer the user is asking for. Retrieved context existing is
-not the same as it answering the question. If the excerpts are about a
-related topic but don't state the specific name, date, fact, or detail
-being asked about, say plainly that you don't have that specific
-information rather than filling the gap with a plausible-sounding guess.
-Never invent a name, date, or detail that isn't actually present in the
-context — an honest "I don't know" is always better than a fabricated
-answer.
+Check whether the context above contains the specific answer the user is asking for. If the excerpts do not state the detail, say plainly that you are not sure.
 """
 
 CONTEXT_INSUFFICIENT_ABSTAIN_INSTRUCTION = """
-CRITICAL EVALUATION ON CONTEXT: The retrieved context excerpts above were
-analyzed and determined NOT to contain the necessary facts, details, or answer
-to what the user is asking. Do NOT attempt to guess, extrapolate, or invent
-details from partial fragments. Explicitly, plainly, and honestly tell the
-user that you don't have that information.
+Tell the user plainly and honestly that you don't have that specific information.
 """
 
 CONTEXT_PARTIAL_HEDGE_INSTRUCTION = """
-CRITICAL EVALUATION ON CONTEXT: The retrieved context excerpts above only
-partially cover what the user is asking. Answer ONLY the specific part directly
-supported by the context, and clearly and honestly acknowledge that you do not
-have details for the rest. Do not extrapolate, guess, or invent missing facts.
+Answer the specific part directly supported by the context, and honestly share that you are unsure about the rest.
 """
 
 
-FLUID_PERSONA_INSTRUCTION = """You are texting your close friend Dhanush. Read what Dhanush is actually saying right now and respond naturally, directly, and relevantly in your normal casual lowercase texting style (1-2 short sentences).
-- SPEAKER IDENTITY RULE: The user texting you is Dhanush ('you'). You are his friend listening and replying to him. When referring to Dhanush's trip, Sampada, his friends, or his life events, ALWAYS use 'you' (e.g., 'you were tense avoiding sampada'), NEVER 'i'. Never roleplay as Dhanush or claim his memories happened to you.
-- BANNED FILLER & STUTTERING: NEVER start a message with 'Aah, I see', 'Aah,', or 'I'm here. I'm here.' Never repeat the same phrase twice in a message.
-- Pay close attention to the context of the conversation: respond directly to what he just said instead of using generic filler lines.
-- Stay strictly grounded in what is actually in this chat history; never invent extra scenes, clothes, trees, or fake real-life locations."""
+FLUID_PERSONA_INSTRUCTION = """You are texting your close friend Dhanush.
+- Speak like a close friend texting casually in normal lowercase text messages (1 short sentence, 8–20 words).
+- React directly to the specific people, events, or details Dhanush mentioned in the present moment.
+- The person texting you is Dhanush ('you'); you are his friend texting back. Dhanush's background facts belong to him, not to you; never invent unverified past shared meetings or shared memories.
+- Match Dhanush's energy: warm and steady when he is stressed, casual and playful when bantering."""
 
 
 MODE_INSTRUCTIONS = {
@@ -389,35 +411,16 @@ MODE_INSTRUCTIONS = {
     "guidance": FLUID_PERSONA_INSTRUCTION,
     "conversational": FLUID_PERSONA_INSTRUCTION,
     "followup": """
-You're reaching out first, unprompted — the user hasn't said anything new
-since your last conversation. This is a brief, natural check-in, not a
-reply to a message. Base it on what you two were actually talking about
-last (see recent history below) — reference something real and specific,
-don't send a generic "hey, how's it going". Keep it short, one or two
-sentences. Don't ask more than one question. You don't know how long it has
-been, so don't mention specific days, times, or how long it's been — just a
-natural check-in.
+You are checking in naturally with your friend based on what you were talking about last. Keep it short, one or two sentences, referencing something specific from your recent conversation.
 """
 }
 
 GENERAL_RULES = """
-Rules:
-- Don't name the company or model behind you. If the user sincerely asks whether you are an AI, be honest that you are.
-- Never suggest cloud tools, apps, or external services.
-- Never mention hotlines, helplines, crisis lines, or phone numbers for them. You are a companion:
-  stay with the person and talk with them.
-- It is okay to say you don't know something.
-- If the user asks about a specific plan, time, place, or fact not shown in the recent messages, say you don't remember or ask them to remind you. Never guess one.
-- Everything shared is completely private and stays between you and the user.
-- Never say goodbye, sign off, or say "gotta go", "bye", "ttyl", "see ya", or "cya" when the user is greeting you (e.g. "hi", "hey", "hello", "yo"). Always greet them back warmly and ask what's up.
-- Output format: Write strictly plain text as a human would in a chat app.
-  * NO roleplay or stage directions: NEVER write actions in brackets, parentheses (e.g. no (whisper), (quiet), (softly)),
-    asterisks (*yawns*), or colon prefixes. Write strictly plain text dialogue.
-  * NO vertical one-word-per-line formatting: NEVER stack single words or fragments on separate
-    lines. Write 1 to 2 normal horizontal sentences.
-  * NO hallucinated time jumps or self-dialogue: Do not invent fake elapsed times or simulate both
-    sides of a conversation. Respond only to the latest message.
-- Emoji use: Never use emojis under any circumstances. Write in clean plain text without emojis or emoticons.
+Texting guidelines:
+- Be honest, grounded, and stay present in the conversation with your friend.
+- When asked about unknown plans or facts, ask to be reminded or say you aren't sure.
+- Warmly greet when the user says hi or checks in.
+- Text strictly in clean, standard horizontal text messages (1–2 sentences).
 """
 
 
@@ -473,17 +476,9 @@ def get_system_prompt(mode: str, personal_context: str = "", style_profile: str 
     if session_summaries:
         parts.append(
             "\n[FACTUAL MEMORY & ARCHIVE — USE TO ANSWER QUESTIONS]\n"
-            "STOP — before answering, check this: you DO have memory of past "
-            "sessions with this user, provided as notes below. This overrides any "
-            "default assumption you might have about not remembering past chats. "
-            "When the user asks if you remember something, or references a past "
-            "conversation, check these notes first and answer using them when "
-            "they are relevant. NEVER respond with generic disclaimers like \"I "
-            "don't have personal memories\", \"I don't retain memories\", \"each "
-            "conversation is a blank slate\", \"I don't have the ability to "
-            "recall\", or anything with that meaning. The notes are short "
-            "summaries and can be incomplete: if they do not cover what the user "
-            "is asking, say you don't remember that part instead of guessing.\n\n"
+            "You have memory of past sessions with this user, summarized below. "
+            "Use these notes to recall past conversations and answer questions accurately. "
+            "If the notes do not cover a specific detail the user asks for, say you aren't sure instead of guessing.\n\n"
             "Notes on past sessions with this user:\n"
             f"{session_summaries}\n"
         )
@@ -492,10 +487,12 @@ def get_system_prompt(mode: str, personal_context: str = "", style_profile: str 
 
     if personal_context:
         parts.append(build_anti_repetition_instruction(user_name))
-        parts.append(
-            f"\n[FACTUAL MEMORY & ARCHIVE — USE TO ANSWER QUESTIONS]\n"
-            f"Relevant personal context:\n{personal_context}\n"
-        )
+        if "[Background facts" in personal_context:
+            parts.append(f"\n{personal_context}\n")
+        else:
+            parts.append(
+                f"\n[Background facts about the user (for context only — do not repeat wording):\n{personal_context}\n]"
+            )
 
     if important_links:
         links = important_links.strip()
@@ -509,15 +506,17 @@ def get_system_prompt(mode: str, personal_context: str = "", style_profile: str 
         )
 
     if reference_context:
-        parts.append(
-            "\nRelevant therapeutic/communication techniques you can draw on "
-            "(use naturally, in your own words — never mention 'techniques' or "
-            "sound clinical, never say something like 'according to CBT...', "
-            "just let it inform how you respond):\n"
-            f"{reference_context}\n"
-        )
+        if "[Background reference" in reference_context:
+            parts.append(f"\n{reference_context}\n")
+        else:
+            parts.append(
+                f"\n[Background reference context (for context only — do not repeat wording):\n{reference_context}\n]"
+            )
 
-    parts.append(MODE_INSTRUCTIONS.get(mode, FLUID_PERSONA_INSTRUCTION))
+    persona_inst = MODE_INSTRUCTIONS.get(mode, FLUID_PERSONA_INSTRUCTION)
+    if user_name and user_name != "Dhanush" and "Dhanush" in persona_inst:
+        persona_inst = persona_inst.replace("Dhanush", user_name)
+    parts.append(persona_inst)
     if is_crisis and CRISIS_SUPPORT_DIRECTIVE.strip():
         parts.append(CRISIS_SUPPORT_DIRECTIVE)
     parts.append(GENERAL_RULES)
@@ -533,4 +532,120 @@ def get_system_prompt(mode: str, personal_context: str = "", style_profile: str 
         )
 
     return "\n".join(parts)
+
+
+# ----------------------------------------------------------------
+# Structured Positive Plan (Phase 4)
+# ----------------------------------------------------------------
+
+ENABLE_STRUCTURED_PLAN = os.environ.get("ENABLE_STRUCTURED_PLAN", "1").lower() in ("1", "true", "yes")
+
+
+def extract_message_focus(message: str) -> str:
+    """
+    Extracts a concise 1-4 word focus topic or entity from the user message to anchor the reply.
+    """
+    clean = (message or "").strip()
+    if not clean:
+        return "general check-in"
+
+    # Strip common leading greetings/filler
+    stripped = re.sub(
+        r"^(?:hey|hi|hello|yo|man|bro|dude|wait|also|so|and|uh|umm)\b[,.!\s]*",
+        "", clean, flags=re.IGNORECASE
+    ).strip()
+    if not stripped or stripped.lower() in ("u up", "u up?", "you up", "you up?", "up", "up?", "alive", "alive?", "there", "there?", "sup", "sup?"):
+        return "user greeting"
+
+    # Check for capitalized proper names / entities
+    cap_words = re.findall(r"\b[A-Z][a-z]{2,}\b", stripped)
+    cap_words = [
+        w for w in cap_words
+        if w.lower() not in (
+            "what", "where", "when", "why", "how", "yeah", "nope",
+            "hope", "just", "that", "this", "they", "there", "good", "ready"
+        )
+    ]
+    if cap_words:
+        for w in cap_words:
+            m = re.search(rf"\b(?:\w+\s+){{0,2}}{re.escape(w)}(?:\s+\w+){{0,2}}\b", stripped)
+            if m:
+                return m.group(0).lower().strip()
+        return cap_words[0].lower()
+
+    # Look for key event / feeling / topic phrases
+    patterns = [
+        r"(?:fight with|talked with|meeting with|arguing with)\s+[\w\s]{2,15}",
+        r"(?:can't sleep|cannot sleep|awake at|insomnia|thoughts hitting)",
+        r"(?:exam|presentation|interview|flight|trip|vacation|party|wedding)",
+        r"(?:lunch|dinner|breakfast|food|hungry|eating|coffee)",
+        r"(?:feeling|felt)\s+[\w\s]{2,15}",
+        r"(?:work|job|boss|office|manager|project)",
+        r"(?:drive|driving|walk|walking|music|song)",
+    ]
+    for pat in patterns:
+        m = re.search(pat, stripped, re.IGNORECASE)
+        if m:
+            return m.group(0).lower().strip()
+
+    # Fallback to the first 3-4 content words
+    words = [
+        w for w in re.findall(r"\b\w+\b", stripped.lower())
+        if len(w) > 2 and w not in (
+            "the", "and", "that", "this", "with", "have", "been", "what", "your", "from", "for", "are", "you"
+        )
+    ]
+    if words:
+        return " ".join(words[:4])
+    return "user message"
+
+
+def build_structured_plan(
+    mode: str,
+    message: str,
+    time_bucket: str = "",
+    gap_sec: float = 0.0,
+    is_crisis: bool = False,
+    signals: dict | None = None,
+    tone_override: str | None = None
+) -> str:
+    """
+    Builds a single compact, positively written plan line:
+    [plan: tone=<casual|playful|warm|grounded> | length=<1 short sentence (8-20 words)|1-2 short sentences (15-30 words)> | time=<continue|greet after gap|late night soft> | focus=<topic>]
+    """
+    if not ENABLE_STRUCTURED_PLAN:
+        return ""
+
+    mode_lower = (mode or "").lower()
+    # 1. Tone mapping
+    if tone_override:
+        tone = tone_override
+    elif is_crisis or "support" in mode_lower or (signals and signals.get("is_venting")):
+        tone = "warm"
+    elif "play" in mode_lower or "joke" in mode_lower:
+        tone = "playful"
+    elif "guid" in mode_lower:
+        tone = "grounded"
+    else:
+        tone = "casual"
+
+    # 2. Length mapping
+    if is_crisis or "support" in mode_lower or (signals and signals.get("is_venting")) or tone in ("warm", "warm and grounded"):
+        length = "1-2 short sentences (15-30 words)"
+    else:
+        length = "1 short sentence (8-20 words)"
+
+    # 3. Time posture
+    if time_bucket == "late night":
+        time_posture = "late night soft"
+    elif gap_sec >= 86400:
+        time_posture = "greet after gap"
+    else:
+        time_posture = "continue"
+
+    # 4. Focus
+    focus = extract_message_focus(message)
+
+    return f"[plan: tone={tone} | length={length} | time={time_posture} | focus={focus}]"
+
 

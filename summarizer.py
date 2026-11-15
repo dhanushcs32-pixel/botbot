@@ -15,6 +15,7 @@ import re
 import httpx
 
 from memory import get_all_turns, save_session_summary, session_has_summary
+from time_utils import resolve_relative_dates_for_storage, parse_timestamp_safe
 
 NPU_SERVER_URL = "http://localhost:11435/api/chat"
 MODEL_NAME = "botbot"
@@ -292,6 +293,9 @@ async def summarize_session(
 
     start_ts = turns[0].get("timestamp") if turns and isinstance(turns[0], dict) else None
     end_ts = turns[-1].get("timestamp") if turns and isinstance(turns[-1], dict) else None
+    ref_dt = parse_timestamp_safe(end_ts)
+    summary = resolve_relative_dates_for_storage(summary, ref_now=ref_dt)
+
     if start_ts and end_ts:
         start_date = str(start_ts)[:10]
         end_date = str(end_ts)[:10]

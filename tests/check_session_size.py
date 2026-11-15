@@ -1,6 +1,11 @@
 import sqlite3
+import sys
+from pathlib import Path
 
-conn = sqlite3.connect("memory.db")
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from memory import DB_PATH
+
+conn = sqlite3.connect(DB_PATH)
 c = conn.cursor()
 
 sid = "session-7uyhn2917"

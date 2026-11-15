@@ -18,6 +18,7 @@ import json
 from datetime import datetime, timezone
 import logging
 from logging.handlers import RotatingFileHandler
+from pathlib import Path
 import httpx
 
 # Offline-first for HuggingFace loads: MiniLM (rag.py embeddings) and BLIP
@@ -32,18 +33,40 @@ import httpx
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 
 import memory
-from mode_router import detect_mode, detect_mode_detailed, get_system_prompt, get_retrieval_policy
+from few_shot_retriever import (
+    retrieve_few_shot_examples,
+    format_few_shot_block,
+    ENABLE_DYNAMIC_FEW_SHOT,
+)
+from mode_router import (
+    detect_mode,
+    detect_mode_detailed,
+    get_system_prompt,
+    get_retrieval_policy,
+    get_sampling_profile,
+    SAMPLING_PROFILES,
+    ENABLE_DECODE_GUARDS,
+    ENABLE_STRUCTURED_PLAN,
+    build_structured_plan,
+    extract_message_focus,
+)
 from memory import (
     save_turn, get_recent_history, get_recent_summaries, get_all_session_ids,
     get_summary_for_session, get_important_links, maybe_rollup_session,
     is_test_session, session_has_summary, get_sessions_with_last_activity,
     count_turns, save_bot_initiated_message, get_current_session_summary,
-    get_full_session_history, deduplicate_assistant_turns
+    get_full_session_history, deduplicate_assistant_turns, get_last_user_timestamp
 )
+from time_utils import (
+    time_note, human_gap, get_time_bucket, get_current_time, parse_timestamp_safe,
+    is_new_session, resolve_relative_dates_for_storage, format_memory_dates_for_retrieval
+)
+
+ENABLE_TIME_NOTE = os.environ.get("ENABLE_TIME_NOTE", "1").lower() in ("1", "true", "yes")
 from rag import (
     search_personal_data, get_style_profile, keyword_search, search_reference_data,
     is_trivial_message, should_bypass_personal_retrieval, get_known_people,
-    get_last_laya_filtered_count,
+    get_last_laya_filtered_count, should_retrieve, ENABLE_RETRIEVAL_GATE
 )
 from laya_engine import assess_context_sufficiency, LAYA_ENABLED, is_laya_available
 from semantic_style_check import strip_semantic_violations
@@ -51,6 +74,7 @@ from summarizer import summarize_session, summarize_turns_batch
 from media import process_uploaded_file, decode_app_attachment
 from secret_key import API_KEYS
 from followup import check_and_send_followups
+from tone_reader import orchestrate_turn, ENABLE_LIGHT_ORCHESTRATOR
 
 # --- Persistent debug logging --------------------------------------------
 debug_logger = logging.getLogger("botbot.debug")
@@ -70,10 +94,13 @@ def debug_log(msg: str):
 
 
 # --- Context-sufficiency field observation ---------------------------------
+PERSONAL_DATA_DIR = Path(os.getenv("PERSONAL_DATA_DIR", Path(__file__).parent / "personal_data"))
+SUFFICIENCY_LOG_PATH = Path(os.getenv("SUFFICIENCY_LOG_PATH", PERSONAL_DATA_DIR / "context_sufficiency_log.jsonl"))
+
 sufficiency_logger = logging.getLogger("botbot.sufficiency")
 sufficiency_logger.setLevel(logging.INFO)
 _sufficiency_file_handler = RotatingFileHandler(
-    "context_sufficiency_log.jsonl", maxBytes=5 * 1024 * 1024, backupCount=5, encoding="utf-8"
+    str(SUFFICIENCY_LOG_PATH), maxBytes=5 * 1024 * 1024, backupCount=5, encoding="utf-8"
 )
 _sufficiency_file_handler.setFormatter(logging.Formatter("%(message)s"))
 sufficiency_logger.addHandler(_sufficiency_file_handler)
@@ -298,6 +325,14 @@ def scrub_reply(text: str, session_id: str = "", mode: str = "", is_crisis: bool
     text = re.sub(r'(?s)<think>.*?</think>', '', text)
     text = re.sub(r'<\|im_end\|>|<\|endoftext\|>|<\|im_start\|>', '', text)
 
+    # 1b. Strip accidental timestamp/time-note/plan leaks
+    text = re.sub(r'(?i)\s*\[now:[^\]]*\]', '', text)
+    text = re.sub(r'(?i)\s*\[after[^\]]*gap\]', '', text)
+    text = re.sub(r'(?i)\s*\[you last spoke:[^\]]*\]', '', text)
+    text = re.sub(r'(?i)\s*\[plan:[^\]]*\]', '', text)
+    text = re.sub(r'(?i)\s*\[examples of how you text[^\]]*\]', '', text)
+    text = re.sub(r'[ \t]{2,}', ' ', text)
+
     # 2. Strip leading role prefixes if the model accidentally emits "Assistant:" or "Bot:" at index 0
     text = re.sub(r'^(?:assistant|bot|bot bot)\s*:\s*', '', text, flags=re.IGNORECASE)
 
@@ -321,7 +356,55 @@ def scrub_reply(text: str, session_id: str = "", mode: str = "", is_crisis: bool
     lines = [ln.strip() for ln in text.splitlines() if ln.strip() and not re.fullmatch(r'[.\-_*?\s]+', ln.strip())]
     text = " ".join(lines)
 
+    # 7. Strip roleplay asterisks and emojis via Python post-processing (Phase 4)
+    text = re.sub(r'\*[^*]+\*', '', text)
+    text = EMOJI_PATTERN.sub('', text)
+    text = re.sub(r'[ \t]{2,}', ' ', text)
+
     return text.strip()
+
+
+# --- Decode Guards Validation & Regeneration (Phase 2) -----------------------
+VALIDATE_ATTRACTOR_REGEX = re.compile(
+    r"(?i)\b(i'm just here|not fixing|let me just be|not going anywhere|aah,? i see|i was so full)\b"
+)
+VALIDATE_LOOP_PERIOD_REGEX = re.compile(r"(?:\.\s*\n){2,}")
+VALIDATE_LOOP_DOTS_REGEX = re.compile(r"(?:\.\s+){2,}\.|\.\s*[\r\n]+\s*\.|(?:\.{2,}\s*){2,}")
+VALIDATE_LOOP_REPEATED_CLAUSE_REGEX = re.compile(
+    r"(\b[\w\']+(?:\s+[\w\']+){0,3}\b)(?:[,.]\s*\1){2,}", re.IGNORECASE
+)
+VALIDATE_TIMESTAMP_LEAK_REGEX = re.compile(r"(?i)(\[now:|you last spoke:|\[gap:|\[plan:)")
+VALIDATE_NON_PUNCT_REGEX = re.compile(r"[a-zA-Z0-9]")
+
+regeneration_count = 0
+
+
+def validate_reply(text: str) -> tuple[bool, str]:
+    """
+    Validates model reply against attractor collapse, loops, timestamp leaks, and emptiness.
+    Returns (True, "ok") if valid, or (False, reason) if invalid.
+    """
+    if not text or not text.strip():
+        return False, "empty_reply"
+
+    chars = VALIDATE_NON_PUNCT_REGEX.findall(text)
+    if len(chars) < 2:
+        return False, "empty_or_too_short"
+
+    if VALIDATE_ATTRACTOR_REGEX.search(text):
+        return False, "attractor_phrase"
+
+    if VALIDATE_TIMESTAMP_LEAK_REGEX.search(text):
+        return False, "timestamp_leak"
+
+    if (
+        VALIDATE_LOOP_PERIOD_REGEX.search(text)
+        or VALIDATE_LOOP_DOTS_REGEX.search(text)
+        or VALIDATE_LOOP_REPEATED_CLAUSE_REGEX.search(text)
+    ):
+        return False, "loop_or_stutter"
+
+    return True, "ok"
 
 
 app = FastAPI(title="Bot Bot Backend")
@@ -368,15 +451,22 @@ def create_background_task(coro) -> asyncio.Task:
     return task
 
 
-async def _call_npu_once(messages: list, num_predict: int = 256, is_cot: bool = False) -> str:
+async def _call_npu_once(messages: list, num_predict: int = 256, is_cot: bool = False, options: Optional[dict] = None) -> str:
     global _last_npu_release
-    # num_predict defaults to 256 — the normal chat path's value. The CoT
-    # diagnostic endpoint passes a larger budget; with the default, the
-    # request body is byte-for-byte what the normal path has always sent.
-    # HTTP timeout scales with the output budget: 240s covers the 256-token
-    # normal path (observed worst ~130s); large budgets get 900s (700
-    # tokens at the observed ~1 tok/s ≈ 700s worst case).
-    timeout_s = 240 if num_predict <= 320 else 900
+    opts = {
+        "num_predict": num_predict,
+        "temperature": 0.55,
+        "top_p": 0.90,
+        "repeat_penalty": 1.08,
+        "repetition_penalty": 1.08,
+        "stop": [chr(10) + "." + chr(10), "." + chr(10) + ".", ". . .", "I'm here. I'm here"],
+        "is_cot": is_cot,
+    }
+    if options:
+        opts.update(options)
+
+    effective_num_predict = opts.get("num_predict", num_predict)
+    timeout_s = 240 if effective_num_predict <= 320 else 900
     try:
         async with npu_lock:
             try:
@@ -393,14 +483,7 @@ async def _call_npu_once(messages: list, num_predict: int = 256, is_cot: bool = 
                             "model": MODEL_NAME,
                             "messages": messages,
                             "stream": False,
-                            "options": {
-                                    "num_predict": num_predict,
-                                    "temperature": 0.55,
-                                    "top_p": 0.90,
-                                    "repeat_penalty": 1.08,
-                                    "stop": [chr(10) + "." + chr(10), "." + chr(10) + ".", ". . .", "I'm here. I'm here"],
-                                    "is_cot": is_cot,
-                                }
+                            "options": opts,
                         }
                     )
                     response.raise_for_status()
@@ -773,11 +856,13 @@ class TicketRequest(BaseModel):
 # Generic 401 for both "unknown key" and "disabled key" — no distinction
 # leaks to the client. Session mismatch is a separate 403.
 #
-# Immediate disable without restart: main re-checks key_state.json (next to
+# Immediate disable without restart: main re-checks key_state.json (in personal_data or next to
 # this file) whenever its mtime changes — {"disabled": {"guest-1": true}}
 # rejects that label on the very next request. Key MATERIAL rotation still
 # requires a restart (imported once).
-KEY_STATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "key_state.json")
+_personal_key_state = PERSONAL_DATA_DIR / "key_state.json"
+_root_key_state = Path(__file__).parent / "key_state.json"
+KEY_STATE_PATH = str(_personal_key_state if _personal_key_state.exists() else _root_key_state)
 _key_state_cache = {"mtime": None, "disabled": frozenset()}
 
 
@@ -880,21 +965,332 @@ def _trim_to_boundary(text: str, max_chars: int) -> str:
     return text[:max_chars].rstrip()
 
 
+def _format_history_turns(history: list[dict]) -> list[dict]:
+    """
+    Formats history turns for prompt inclusion:
+    - User turns with >= 1800s gap since previous turn are prefixed with '[after {human_gap(gap_sec)} gap] '.
+    - Strict anti-leak: NEVER annotate assistant turns, and strip any leaked time tags from assistant turns.
+    - Strips DB metadata (like timestamp) so only {"role", "content"} are sent to LLM.
+    """
+    formatted = []
+    prev_turn_ts = None
+    for turn in history:
+        role = turn.get("role")
+        content = turn.get("content", "")
+        turn_ts = parse_timestamp_safe(turn.get("timestamp"))
+
+        annotated_content = content
+        if role == "user":
+            if prev_turn_ts is not None and turn_ts is not None:
+                gap_sec = (turn_ts - prev_turn_ts).total_seconds()
+                if gap_sec >= 1800 and not content.startswith("[after "):
+                    gap_label = human_gap(gap_sec)
+                    annotated_content = f"[after {gap_label} gap] {content}"
+            if turn_ts is not None:
+                prev_turn_ts = turn_ts
+        elif role == "assistant":
+            # Strict anti-leak: NEVER annotate assistant turns
+            annotated_content = re.sub(r'\[now:[^\]]*\]\s*', '', annotated_content)
+            annotated_content = re.sub(r'\[after[^\]]*gap\]\s*', '', annotated_content)
+            annotated_content = re.sub(r'\[you last spoke:[^\]]*\]\s*', '', annotated_content)
+            annotated_content = annotated_content.strip()
+            if turn_ts is not None:
+                prev_turn_ts = turn_ts
+
+        formatted.append({"role": role, "content": annotated_content})
+    return formatted
+
+
+# ----------------------------------------------------------------------
+# PHASE 6: INPUT UNDERSTANDING & MULTI-FRAGMENT TURN MERGER
+# ----------------------------------------------------------------------
+APP_NOISE_REACTIONS = [
+    (re.compile(r"^(?:Liked|Loved|Disliked|Laughed at|Emphasized|Questioned)\s+[\"“].*?[\"”]$", re.IGNORECASE), "[reaction: liked]"),
+    (re.compile(r"^Liked\s+a\s+message$", re.IGNORECASE), "[reaction: liked]"),
+    (re.compile(r"^Loved\s+an?\s+(?:image|message|photo|video)$", re.IGNORECASE), "[reaction: loved]"),
+    (re.compile(r"^Reacted\s+(.*?)\s+to\s+(?:your\s+message|[\"“].*?[\"”])$", re.IGNORECASE), r"[reaction: \1]"),
+    (re.compile(r"^Unsent\s+a\s+message$", re.IGNORECASE), "[reaction: unsent]"),
+    (re.compile(r"^(?:<Media omitted>|\[Photo\]|\[Video\]|\[Audio\]|\[Sticker\])$", re.IGNORECASE), "[media]"),
+]
+
+APP_NOISE_PREFIX_REGEX = re.compile(
+    r"^(?:Liked|Loved|Disliked|Laughed at|Emphasized|Questioned|Reacted\s+.*?)\s+(?:a\s+message|an?\s+image|to\s+your\s+message|to\s+[\"“].*?[\"”]|[\"“].*?[\"”])[\r\n\s]+",
+    re.IGNORECASE
+)
+
+
+def clean_user_input(text: str) -> str:
+    """
+    Detects app-noise patterns and converts them into compact signals or strips boilerplate.
+    """
+    if not text:
+        return ""
+    stripped = text.strip()
+
+    # Check exact match for app reactions
+    for pattern, repl in APP_NOISE_REACTIONS:
+        if pattern.match(stripped):
+            return pattern.sub(repl, stripped)
+
+    # If text starts with an app reaction prefix followed by meaningful user text, strip the prefix
+    m = APP_NOISE_PREFIX_REGEX.match(stripped)
+    if m:
+        remaining = stripped[m.end():].strip()
+        if remaining:
+            return remaining
+
+    return stripped
+
+
+def merge_user_fragments(*args, **kwargs):
+    """
+    Multi-Fragment User Message Merger (Phase 6):
+    Merges rapid consecutive user messages (inter-message gap < threshold_seconds)
+    into a single clean logical user turn and deduplicates them from history.
+
+    Supports two calling conventions:
+    1. merge_user_fragments(incoming_message: str, history: list[dict], threshold_seconds=120.0, now=None)
+       -> (merged_message, deduplicated_history, fragment_count)
+    2. merge_user_fragments(turns: list[dict], threshold_seconds=120.0)
+       -> list[dict]
+    """
+    if not args and not kwargs:
+        return "", [], 1
+
+    first_arg = args[0] if args else kwargs.get("incoming_message") or kwargs.get("turns")
+
+    # Convention 2: list of turns passed
+    if isinstance(first_arg, list):
+        turns = first_arg
+        threshold_seconds = float(args[1] if len(args) > 1 else kwargs.get("threshold_seconds", 120.0))
+        if not turns:
+            return []
+
+        merged_turns = []
+        for turn in turns:
+            role = turn.get("role")
+            content = turn.get("content", "").strip()
+            ts = turn.get("timestamp")
+
+            if not merged_turns:
+                merged_turns.append(dict(turn))
+                continue
+
+            last = merged_turns[-1]
+            if role == "user" and last.get("role") == "user":
+                # Check gap between timestamps
+                gap = None
+                t1 = parse_timestamp_safe(last.get("timestamp"))
+                t2 = parse_timestamp_safe(ts)
+                if t1 and t2:
+                    gap = abs((t2 - t1).total_seconds())
+
+                if gap is None or gap < threshold_seconds:
+                    # Merge consecutive user turn
+                    sep = "\n" if "\n" in content or "\n" in last["content"] else ". "
+                    last["content"] = f"{last['content'].rstrip('.?!')}{sep}{content}"
+                    continue
+
+            merged_turns.append(dict(turn))
+        return merged_turns
+
+    # Convention 1: incoming_message (str) and history (list[dict])
+    incoming_message = str(first_arg) if first_arg is not None else ""
+    history = list(args[1] if len(args) > 1 else kwargs.get("history", []))
+    threshold_seconds = float(args[2] if len(args) > 2 else kwargs.get("threshold_seconds", 120.0))
+    now = args[3] if len(args) > 3 else kwargs.get("now", None)
+
+    cur_dt = get_current_time(now)
+    cur_epoch = cur_dt.astimezone(timezone.utc).timestamp()
+
+    # Look backwards from end of history for consecutive user turns
+    tail_user_turns = []
+    inspect_epoch = cur_epoch
+
+    for i in range(len(history) - 1, -1, -1):
+        turn = history[i]
+        if turn.get("role") != "user":
+            break
+
+        turn_ts = parse_timestamp_safe(turn.get("timestamp"))
+        if turn_ts:
+            turn_epoch = turn_ts.astimezone(timezone.utc).timestamp()
+            gap = inspect_epoch - turn_epoch
+            if gap < threshold_seconds:
+                tail_user_turns.append((i, turn["content"]))
+                inspect_epoch = turn_epoch
+            else:
+                break
+        else:
+            break
+
+    if not tail_user_turns:
+        return incoming_message, history, 1
+
+    tail_user_turns.reverse()
+    popped_indices = set(i for i, _ in tail_user_turns)
+    remaining_history = [h for i, h in enumerate(history) if i not in popped_indices]
+
+    fragments = [c.strip() for _, c in tail_user_turns if c.strip()]
+    if incoming_message.strip():
+        fragments.append(incoming_message.strip())
+
+    sep = "\n" if any("\n" in f for f in fragments) else ". "
+    merged_message = sep.join(f.rstrip(".?!") if sep == ". " else f for f in fragments)
+    fragment_count = len(fragments)
+
+    return merged_message, remaining_history, fragment_count
+
+
+def extract_input_signals(
+    message: str,
+    history: list[dict] | None = None,
+    gap_seconds: float = 0.0,
+    time_bucket: str = "afternoon",
+    fragment_count: int = 1
+) -> dict:
+    """
+    Lightweight Input Signals (Phase 6):
+    Extracts is_question, is_venting, fragment_count, needs_retrieval, time_bucket, and gap_seconds.
+    """
+    msg = (message or "").strip()
+    msg_lower = msg.lower()
+
+    # 1. is_question
+    is_q = "?" in msg or bool(re.search(
+        r"^(who|what|when|where|why|how|which|whose|is|are|am|do|does|did|can|could|would|should|will|won't|have|has|had|tell me|remember)\b",
+        msg, re.IGNORECASE
+    ))
+
+    # 2. is_venting
+    VENTING_LEXICON = {
+        "hate", "pissed", "angry", "crying", "exhausted", "furious", "overwhelmed",
+        "screwed", "hopeless", "depressed", "anxious", "panic", "broken", "terrible",
+        "horrible", "awful", "done with", "cant take", "can't take", "ruined", "breakdown",
+        "miserable", "hurts", "hurting", "fucking", "screaming"
+    }
+    PUSH_AWAY_LEXICON = (
+        "leave me alone", "nobody cares", "you don't get it", "you dont get it",
+        "you're just a bot", "youre just a bot", "stop talking", "shut up", "don't talk to me"
+    )
+    words = re.findall(r"\b\w+\b", msg_lower)
+    has_vent_word = any(w in VENTING_LEXICON for w in words)
+    has_push_away = any(p in msg_lower for p in PUSH_AWAY_LEXICON)
+    is_long_rant = (len(words) >= 25 and has_vent_word)
+    is_venting = has_vent_word or has_push_away or is_long_rant
+
+    # 3. needs_retrieval from Phase 5 gate
+    prelim_signals = {"is_question": is_q, "is_venting": is_venting}
+    needs_ret = should_retrieve(message, signals=prelim_signals)
+
+    return {
+        "is_question": is_q,
+        "is_venting": is_venting,
+        "fragment_count": fragment_count,
+        "needs_retrieval": needs_ret,
+        "time_bucket": time_bucket,
+        "gap_seconds": gap_seconds
+    }
+
+
 def _prepare_prompt_sync(session_id: str, prompt_message: str, measure_tokens=None,
-                         history_override=None, is_guest: bool = False, num_predict: int = 250):
+                         history_override=None, is_guest: bool = False, num_predict: int = 250,
+                         now_override: Optional[datetime] = None, last_user_ts_override: Optional[Any] = None):
     # Fetch recent history early so Laya routing has conversational context if needed
     history = (history_override if history_override is not None
                else get_recent_history(session_id))
     history = deduplicate_assistant_turns(history)
 
-    # 1. Behavioral Mode & Personal Retrieval Need via Laya
-    laya_routing = detect_mode_detailed(prompt_message, recent_turns=history)
-    mode = laya_routing["mode"]
-    is_crisis = laya_routing.get("is_crisis", False)
+    # Phase 6: App noise clean & Multi-fragment merger
+    cleaned_input = clean_user_input(prompt_message)
+    merged_message, history, fragment_count = merge_user_fragments(
+        cleaned_input, history, threshold_seconds=120.0, now=now_override
+    )
+    prompt_message = merged_message
+
+    # Determine last_user_ts
+    if last_user_ts_override is not None:
+        last_user_ts = last_user_ts_override
+    elif history_override is not None:
+        user_turns = [h for h in history if h.get("role") == "user" and h.get("timestamp")]
+        last_user_ts = user_turns[-1]["timestamp"] if user_turns else None
+    else:
+        last_user_ts = get_last_user_timestamp(session_id)
+
+    cur_dt = get_current_time(now_override)
+    t_bucket = get_time_bucket(cur_dt.hour)
+    if last_user_ts:
+        parsed_last = parse_timestamp_safe(last_user_ts)
+        gap_sec = (cur_dt.astimezone(timezone.utc) - parsed_last).total_seconds() if parsed_last else 0.0
+    else:
+        gap_sec = 0.0
+
+    # Phase 6: Input signals
+    signals = extract_input_signals(
+        message=prompt_message,
+        history=history,
+        gap_seconds=gap_sec,
+        time_bucket=t_bucket,
+        fragment_count=fragment_count
+    )
+
+    time_note_str = time_note(last_user_ts, now=now_override) if ENABLE_TIME_NOTE else ""
+
+    # Phase 7: Fast CPU Orchestrator (Tone Reader, Smoothed Profile Mixer & Distress Override)
+    orch = orchestrate_turn(session_id, prompt_message, signals=signals)
+    raw_tone_scores = orch["raw_tone_scores"]
+    smoothed_tone_scores = orch["smoothed_tone_scores"]
+    distress_flag = orch["distress_flag"]
+    chosen_profile = orch["chosen_profile"]
+    tone_condition = orch["tone_condition"]
+    plan_tone = orch["plan_tone"]
+
+    # Phase 4 & 7: Dynamic Few-Shot Retrieval (Anti-Echo, Diversity Filtered, Tone Conditioned)
+    few_shot_examples = []
+    few_shot_block = ""
+    if ENABLE_DYNAMIC_FEW_SHOT:
+        few_shot_examples = retrieve_few_shot_examples(
+            prompt_message, recent_history=history, k=4, tone_condition=tone_condition
+        )
+        few_shot_block = format_few_shot_block(few_shot_examples)
+
+    # 1. Behavioral Mode & Personal Retrieval Need via Laya + Orchestrator
+    if distress_flag:
+        mode = "supportive"
+        is_crisis = True
+        laya_routing = {
+            "mode": "supportive",
+            "is_crisis": True,
+            "mode_confidence": 1.0,
+            "retrieval_decision": "no_personal_context_needed",
+            "retrieval_confidence": 1.0,
+        }
+    else:
+        laya_routing = detect_mode_detailed(prompt_message, recent_turns=history)
+        mode = chosen_profile if ENABLE_LIGHT_ORCHESTRATOR else laya_routing["mode"]
+        is_crisis = laya_routing.get("is_crisis", False)
+
     policy = get_retrieval_policy(mode)
 
-    # 2. Check personal retrieval bypass (trivial phrases, or Laya high-confidence no-context, or guest session)
-    bypass_retrieval = is_guest or should_bypass_personal_retrieval(prompt_message, laya_routing=laya_routing)
+    # Phase 4 & 7: Structured Positive Plan
+    structured_plan = ""
+    if ENABLE_STRUCTURED_PLAN:
+        structured_plan = build_structured_plan(
+            mode=mode,
+            message=prompt_message,
+            time_bucket=t_bucket,
+            gap_sec=gap_sec,
+            is_crisis=is_crisis,
+            signals=signals,
+            tone_override=plan_tone
+        )
+
+    # 2. Phase 5: Fast Retrieval Gate + Legacy bypass checks
+    bypass_retrieval = (
+        is_guest or
+        (not signals["needs_retrieval"]) or
+        should_bypass_personal_retrieval(prompt_message, laya_routing=laya_routing)
+    )
     context_lookup_attempted = not bypass_retrieval
 
     personal_context = ""
@@ -1036,8 +1432,18 @@ def _prepare_prompt_sync(session_id: str, prompt_message: str, measure_tokens=No
     HARD_CAP_TARGET_CHARS = int(target_tokens * HARD_CAP_CHARS_PER_TOKEN)
     HISTORY_PROTECTED_FLOOR_TURNS = 20
 
+    dynamic_parts = []
+    if few_shot_block and ENABLE_DYNAMIC_FEW_SHOT:
+        dynamic_parts.append(few_shot_block)
+    if time_note_str and ENABLE_TIME_NOTE:
+        dynamic_parts.append(time_note_str)
+    if structured_plan and ENABLE_STRUCTURED_PLAN:
+        dynamic_parts.append(structured_plan)
+    dynamic_context_str = "\n\n".join(dynamic_parts)
+    dynamic_system_msg = [{"role": "system", "content": dynamic_context_str}] if dynamic_context_str else []
+
     def _total_prompt_chars(sp: str, hist: list, pm: str) -> int:
-        return len(sp) + sum(len(h["content"]) for h in hist) + len(pm)
+        return len(sp) + sum(len(h.get("content", "")) for h in hist) + len(dynamic_context_str) + len(pm)
 
     total_chars = _total_prompt_chars(system_prompt, history, prompt_message)
     trimmed = False
@@ -1057,7 +1463,8 @@ def _prepare_prompt_sync(session_id: str, prompt_message: str, measure_tokens=No
                  or target_tokens < PROMPT_TARGET_TOKENS)):
         probe = (
             [{"role": "system", "content": system_prompt}]
-            + history
+            + _format_history_turns(history)
+            + dynamic_system_msg
             + [{"role": "user", "content": prompt_message}]
         )
         measured_tokens = measure_tokens(probe)
@@ -1162,7 +1569,8 @@ def _prepare_prompt_sync(session_id: str, prompt_message: str, measure_tokens=No
         for _ in range(5):
             probe = (
                 [{"role": "system", "content": system_prompt}]
-                + history
+                + _format_history_turns(history)
+                + dynamic_system_msg
                 + [{"role": "user", "content": prompt_message}]
             )
             real_now = measure_tokens(probe)
@@ -1218,13 +1626,29 @@ def _prepare_prompt_sync(session_id: str, prompt_message: str, measure_tokens=No
             f"target was {budget_chars} chars, {len(history)} history turns remaining)"
         )
 
-    messages = [{"role": "system", "content": system_prompt}] + \
-        history + \
-        [{"role": "user", "content": prompt_message}]
+    formatted_history = _format_history_turns(history)
+
+    messages = (
+        [{"role": "system", "content": system_prompt}]
+        + formatted_history
+        + dynamic_system_msg
+        + [{"role": "user", "content": prompt_message}]
+    )
 
     return {
         "mode": mode,
         "messages": messages,
+        "time_note": time_note_str,
+        "few_shot_examples": few_shot_examples,
+        "few_shot_block": few_shot_block,
+        "structured_plan": structured_plan,
+        "last_user_ts": last_user_ts,
+        "signals": signals,
+        "raw_tone_scores": raw_tone_scores,
+        "smoothed_tone_scores": smoothed_tone_scores,
+        "distress_flag": distress_flag,
+        "chosen_profile": chosen_profile,
+        "orchestration": orch,
         "context_lookup_attempted": context_lookup_attempted,
         "personal_context": personal_context,
         "reference_context": reference_context,
@@ -1250,18 +1674,46 @@ async def generate_reply(session_id: str, prompt_message: str, history_message: 
     if history_message is None:
         history_message = prompt_message
 
+    cur_dt = get_current_time()
+    t_bucket = get_time_bucket(cur_dt.hour)
+    last_ts = get_last_user_timestamp(session_id)
+    g_sec = (cur_dt.astimezone(timezone.utc) - parse_timestamp_safe(last_ts)).total_seconds() if last_ts else 0.0
+
     prep = await asyncio.to_thread(
         _prepare_prompt_sync, session_id, prompt_message,
         _measure_prompt_tokens_sync, None, is_guest)
 
     mode = prep["mode"]
     is_crisis = prep.get("is_crisis", False)
-    predict_tokens = 320 if mode in ("guidance", "coding") else 256
 
-    raw_reply = await _call_npu_once(prep["messages"], num_predict=predict_tokens)
+    # Named sampling profile based on mode, user turn length, and positive time cues (Phase 2 & 3)
+    profile = get_sampling_profile(mode, prompt_message, time_bucket=t_bucket, gap_sec=g_sec)
+    if mode in ("guidance", "coding") and profile.get("num_predict", 160) < 320:
+        profile["num_predict"] = 320
+
+    raw_reply = await _call_npu_once(prep["messages"], options=profile)
     bot_reply = await asyncio.to_thread(
         scrub_reply, raw_reply, session_id=session_id, mode=mode, is_crisis=is_crisis, prompt_message=prompt_message
     )
+
+    # Post-generation validation & single-retry regeneration (Phase 2)
+    is_valid, invalid_reason = validate_reply(bot_reply)
+    if not is_valid:
+        global regeneration_count
+        regeneration_count += 1
+        print(f"[decode_guard] Validation failed ({invalid_reason}) on session '{session_id}'. Regenerating once with fallback profile...")
+        fallback_profile = dict(profile)
+        fallback_profile["temperature"] = round(min(1.0, fallback_profile.get("temperature", 0.55) + 0.15), 2)
+        fallback_profile["repeat_penalty"] = 1.12
+        fallback_profile["repetition_penalty"] = 1.12
+        try:
+            resampled_raw = await _call_npu_once(prep["messages"], options=fallback_profile)
+            bot_reply = await asyncio.to_thread(
+                scrub_reply, resampled_raw, session_id=session_id, mode=mode, is_crisis=is_crisis, prompt_message=prompt_message
+            )
+            raw_reply = resampled_raw
+        except Exception as e:
+            print(f"[decode_guard] single-retry regeneration failed: {e}")
 
     # Repetition recovery: Only trigger if the reply contains an actual hardware token stutter
     # (the exact same 1–4 word sequence repeated 4+ times consecutively, e.g. "i'm, i'm, i'm, i'm"),

@@ -9,6 +9,8 @@ Database file: memory.db (created automatically in C:\\botbot)
 """
 
 import hashlib
+import math
+import os
 import re
 import shutil
 import sqlite3
@@ -16,8 +18,9 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
-DB_PATH = Path(__file__).parent / "memory.db"
-LINKS_FILE_PATH = Path(__file__).parent / "personal_data" / "journals" / "Important links.txt"
+PERSONAL_DATA_DIR = Path(os.getenv("PERSONAL_DATA_DIR", Path(__file__).parent / "personal_data"))
+DB_PATH = Path(os.getenv("DB_PATH", PERSONAL_DATA_DIR / "memory.db"))
+LINKS_FILE_PATH = PERSONAL_DATA_DIR / "journals" / "Important links.txt"
 
 
 @contextmanager
@@ -500,7 +503,7 @@ def get_recent_history(session_id: str, limit: int = 40, max_tokens: int = 2200,
         cursor = conn.cursor()
         cursor.execute(
             """
-            SELECT role, content FROM conversations
+            SELECT role, content, timestamp FROM conversations
             WHERE session_id = ?
             ORDER BY id DESC
             LIMIT ?
@@ -511,17 +514,20 @@ def get_recent_history(session_id: str, limit: int = 40, max_tokens: int = 2200,
 
     selected = []
     token_total = 0
-    for role, content in rows:
+    for row in rows:
+        role = row[0]
+        content = row[1]
+        ts = row[2] if len(row) > 2 else None
         if len(selected) >= limit:
             break
         turn_tokens = _estimate_tokens(content)
         if len(selected) >= min_turns and (token_total + turn_tokens > max_tokens):
             break
-        selected.append((role, content))
+        selected.append((role, content, ts))
         token_total += turn_tokens
 
     selected.reverse()  # chronological order
-    turns = [{"role": role, "content": content} for role, content in selected]
+    turns = [{"role": role, "content": content, "timestamp": ts} for role, content, ts in selected]
     return deduplicate_assistant_turns(turns)
 
 
@@ -612,6 +618,8 @@ def save_session_summary(session_id: str, summary: str, known_people: set[str] |
     Saves or updates the summary for a given session, then tags it for
     person/activity retrieval (Step 2).
     """
+    from time_utils import resolve_relative_dates_for_storage
+    summary = resolve_relative_dates_for_storage(summary)
     now = datetime.now(timezone.utc).isoformat()
     with get_db_connection() as conn:
         cursor = conn.cursor()
@@ -936,10 +944,33 @@ def get_last_user_message_timestamp(session_id: str) -> float | None:
         if not row or not row[0]:
             return None
         try:
-            dt = datetime.fromisoformat(row[0])
+            dt = datetime.fromisoformat(row[0].replace("Z", "+00:00"))
             if dt.tzinfo is None:
                 dt = dt.replace(tzinfo=timezone.utc)
             return dt.timestamp()
+        except (TypeError, ValueError):
+            return None
+
+
+def get_last_user_timestamp(session_id: str) -> Optional[datetime]:
+    """
+    Returns the parsed UTC datetime of the previous user turn prior to the current turn,
+    or None if no previous user turn exists.
+    """
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT MAX(timestamp) FROM conversations WHERE session_id = ? AND role = 'user'",
+            (session_id,)
+        )
+        row = cursor.fetchone()
+        if not row or not row[0]:
+            return None
+        try:
+            dt = datetime.fromisoformat(row[0].replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt
         except (TypeError, ValueError):
             return None
 
@@ -963,6 +994,15 @@ def count_unanswered_followups(session_id: str) -> int:
         if role == "assistant" and mode in ("proactive", "followup"):
             unanswered += 1
     return unanswered
+
+
+def compute_recency_score(sim_score: float, days_old: float) -> float:
+    """
+    Computes time-decayed recency score (Phase 5):
+    final_score = 0.80 * sim_score + 0.20 * exp(-days_old / 30.0)
+    """
+    decay = math.exp(-max(0.0, float(days_old)) / 30.0)
+    return round(0.80 * float(sim_score) + 0.20 * decay, 4)
 
 
 # Initialize the database as soon as this module is imported

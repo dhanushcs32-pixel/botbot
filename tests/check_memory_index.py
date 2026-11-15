@@ -9,8 +9,10 @@ Run from C:\\botbot with:  python check_memory_index.py
 """
 import sqlite3
 import sys
+from pathlib import Path
 
-DB_PATH = "memory.db"
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from memory import DB_PATH
 
 def main():
     try:

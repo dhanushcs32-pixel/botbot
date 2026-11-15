@@ -4,6 +4,11 @@ Edit the QUERY and PARAMS below, then run:
     python query_memory.py
 """
 import sqlite3
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from memory import DB_PATH
 
 QUERY = """
 SELECT s.session_id, s.summary, s.created_at, t.tag_type, t.tag_value
@@ -14,7 +19,7 @@ ORDER BY s.created_at;
 """
 PARAMS = ("sharadhi",)
 
-conn = sqlite3.connect("memory.db")
+conn = sqlite3.connect(DB_PATH)
 cur = conn.cursor()
 cur.execute(QUERY, PARAMS)
 rows = cur.fetchall()

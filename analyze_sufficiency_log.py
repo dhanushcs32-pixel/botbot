@@ -86,7 +86,10 @@ def pct(n: int, d: int) -> str:
 
 
 def main():
-    path = sys.argv[1] if len(sys.argv) > 1 else "context_sufficiency_log.jsonl"
+    default_log = Path(os.getenv("PERSONAL_DATA_DIR", "personal_data")) / "context_sufficiency_log.jsonl"
+    if not default_log.exists() and Path("context_sufficiency_log.jsonl").exists():
+        default_log = Path("context_sufficiency_log.jsonl")
+    path = sys.argv[1] if len(sys.argv) > 1 else str(default_log)
 
     try:
         records = load_records(path)

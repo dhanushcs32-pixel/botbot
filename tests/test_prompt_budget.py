@@ -26,6 +26,8 @@ import memory
 import rag
 import main
 
+ORIGINAL_DB_PATH = memory.DB_PATH
+
 QWEN_DIR = (
     r"c:\botbot\qwen-4b-int4-ov"
     if os.path.isdir(r"c:\botbot\qwen-4b-int4-ov")
@@ -175,7 +177,7 @@ main._get_prompt_target_tokens = real_target_fn
 
 # Restore the real DB path and confirm the small-prompt fast path: a prompt
 # under the old conservative cap pays zero measurement overhead.
-memory.DB_PATH = Path(r"c:\botbot\memory.db")
+memory.DB_PATH = ORIGINAL_DB_PATH
 called = {"n": 0}
 def counting_measure(messages):
     called["n"] += 1
