@@ -65,6 +65,11 @@ SHORT_CASUAL_PATTERNS = {
 }
 
 
+DE_ESCALATION_REGEX = re.compile(
+    r"(?i)\b(i'?m (?:alr|alright|good|fine|okay|ok) now|feeling better|no stress|chill|not much support needed|all good now|all good|no worries)\b"
+)
+
+
 def analyze_tone(message: str, signals: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """
     Fast (< 10ms) rule-and-lexical CPU tone analyzer.
@@ -76,24 +81,28 @@ def analyze_tone(message: str, signals: Optional[Dict[str, Any]] = None) -> Dict
     words = re.findall(r"\b\w+\b", msg_lower)
     num_words = len(words)
 
+    # 0. Check explicit recovery/de-escalation cues
+    is_de_escalation = bool(DE_ESCALATION_REGEX.search(msg))
+
     # 1. Distress flag check
-    has_distress_trigger = any(trig in msg_lower for trig in DISTRESS_TRIGGERS)
+    has_distress_trigger = any(trig in msg_lower for trig in DISTRESS_TRIGGERS) and not is_de_escalation
 
     # 2. Venting score
-    vent_matches = sum(1 for w in words if w in VENTING_LEXICON)
+    vent_matches = sum(1 for w in words if w in VENTING_LEXICON) if not is_de_escalation else 0
     vent_score = 0.0
-    if vent_matches > 0:
-        vent_score += min(0.60, vent_matches * 0.25)
-    if signals and signals.get("is_venting"):
-        vent_score += 0.35
-    if has_distress_trigger:
-        vent_score += 0.45
-    if num_words >= 25 and vent_matches >= 1:
-        vent_score += 0.20
-    vent_score = min(1.0, max(0.0, vent_score))
+    if not is_de_escalation:
+        if vent_matches > 0:
+            vent_score += min(0.60, vent_matches * 0.25)
+        if signals and signals.get("is_venting"):
+            vent_score += 0.35
+        if has_distress_trigger:
+            vent_score += 0.45
+        if num_words >= 25 and vent_matches >= 1:
+            vent_score += 0.20
+        vent_score = min(1.0, max(0.0, vent_score))
 
     # Binary distress trigger
-    distress_flag = bool(has_distress_trigger or vent_score >= 0.65)
+    distress_flag = bool((has_distress_trigger or vent_score >= 0.65) and not is_de_escalation)
     if distress_flag:
         vent_score = max(vent_score, 0.85)
 
@@ -152,12 +161,14 @@ def analyze_tone(message: str, signals: Optional[Dict[str, Any]] = None) -> Dict
         "joking": round(joke_score, 3),
         "practical": round(pract_score, 3),
         "short_casual": round(casual_score, 3),
-        "distress_flag": distress_flag
+        "distress_flag": distress_flag,
+        "is_de_escalation": is_de_escalation
     }
 
 
-# Session tone tracking for EMA smoothing
+# Session tone tracking for EMA smoothing and multi-turn distress tracking
 _SESSION_TONE_STATE: Dict[str, Dict[str, float]] = {}
+_SESSION_DISTRESS_COUNT: Dict[str, int] = {}
 
 
 def get_session_smoothed_tone(session_id: str) -> Dict[str, float]:
@@ -178,9 +189,42 @@ def update_session_smoothed_tone(
     """
     Updates session smoothed tone state:
     - If distress_flag is True: BYPASSES smoothing completely and sets venting=1.0, joking=0.0.
+    - If is_de_escalation:
+        * Mild worry (distress_count < 2): instant reset to venting=0.0, short_casual=0.80.
+        * Sustained high-severity pain (distress_count >= 2): gradual EMA decay (venting=0.5 * prev).
     - Otherwise: applies smoothed[k] = 0.7 * prev[k] + 0.3 * curr[k].
     """
+    if current_scores.get("is_de_escalation"):
+        prior_distress = _SESSION_DISTRESS_COUNT.get(session_id, 0)
+        prev = get_session_smoothed_tone(session_id)
+        prev_venting = prev.get("venting", 0.0)
+
+        if prior_distress >= 2 and prev_venting >= 0.80:
+            # Sustained high-severity pain: gradual EMA decay
+            decayed_venting = round(0.50 * prev_venting, 4)
+            _SESSION_DISTRESS_COUNT[session_id] = max(0, prior_distress - 1)
+            decayed = {
+                "venting": decayed_venting,
+                "joking": 0.05,
+                "practical": 0.30,
+                "short_casual": round(max(0.0, 1.0 - decayed_venting - 0.35), 4)
+            }
+            _SESSION_TONE_STATE[session_id] = decayed
+            return dict(decayed)
+        else:
+            # Mild worry or single episode: instant reset
+            _SESSION_DISTRESS_COUNT[session_id] = 0
+            reset_val = {
+                "venting": 0.0,
+                "joking": 0.0,
+                "practical": 0.20,
+                "short_casual": 0.80
+            }
+            _SESSION_TONE_STATE[session_id] = reset_val
+            return dict(reset_val)
+
     if distress_flag:
+        _SESSION_DISTRESS_COUNT[session_id] = _SESSION_DISTRESS_COUNT.get(session_id, 0) + 1
         override = {
             "venting": 1.0,
             "joking": 0.0,
@@ -189,6 +233,10 @@ def update_session_smoothed_tone(
         }
         _SESSION_TONE_STATE[session_id] = override
         return dict(override)
+
+    # Normal turn: naturally decrement distress counter if present
+    if session_id in _SESSION_DISTRESS_COUNT and _SESSION_DISTRESS_COUNT[session_id] > 0:
+        _SESSION_DISTRESS_COUNT[session_id] -= 1
 
     prev = get_session_smoothed_tone(session_id)
     smoothed = {}
@@ -203,8 +251,8 @@ def update_session_smoothed_tone(
 
 def reset_session_tone(session_id: str) -> None:
     """Resets tone state for a session."""
-    if session_id in _SESSION_TONE_STATE:
-        del _SESSION_TONE_STATE[session_id]
+    _SESSION_TONE_STATE.pop(session_id, None)
+    _SESSION_DISTRESS_COUNT.pop(session_id, None)
 
 
 def orchestrate_turn(

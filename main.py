@@ -49,13 +49,16 @@ from mode_router import (
     ENABLE_STRUCTURED_PLAN,
     build_structured_plan,
     extract_message_focus,
+    STOCK_REGEX,
+    pick_opener,
 )
 from memory import (
     save_turn, get_recent_history, get_recent_summaries, get_all_session_ids,
     get_summary_for_session, get_important_links, maybe_rollup_session,
     is_test_session, session_has_summary, get_sessions_with_last_activity,
     count_turns, save_bot_initiated_message, get_current_session_summary,
-    get_full_session_history, deduplicate_assistant_turns, get_last_user_timestamp
+    get_full_session_history, deduplicate_assistant_turns, get_last_user_timestamp,
+    filter_clean_history,
 )
 from time_utils import (
     time_note, human_gap, get_time_bucket, get_current_time, parse_timestamp_safe,
@@ -378,10 +381,129 @@ VALIDATE_NON_PUNCT_REGEX = re.compile(r"[a-zA-Z0-9]")
 
 regeneration_count = 0
 
+# Multi-turn anti-collapse state (bans, idempotency, fatigue)
+_SESSION_BANS: Dict[str, set] = {}
+_IDEMPOTENCY_CACHE: Dict[str, Tuple[str, str, float]] = {}
 
-def validate_reply(text: str) -> tuple[bool, str]:
+BAN_USER_REGEX = re.compile(
+    r'(?i)\b(?:stop|quit|don\'t|dont)\s+(?:saying|repeating|using)\s+(?:the\s+(?:term|phrase|word)\s+)?["\']?([^"\'\n.!?]+)["\']?'
+)
+
+
+def extract_and_register_user_bans(session_id: str, message: str) -> set:
+    """Detects explicit user ban instructions and registers banned phrases for the session."""
+    if session_id not in _SESSION_BANS:
+        _SESSION_BANS[session_id] = set()
+    matches = BAN_USER_REGEX.findall(message or "")
+    for m in matches:
+        phrase = m.strip().lower()
+        if len(phrase) >= 2:
+            _SESSION_BANS[session_id].add(phrase)
+            print(f"[user_ban] Registered session ban for '{session_id}': '{phrase}'")
+    return _SESSION_BANS[session_id]
+
+
+def fatigued_ngrams(recent_bot: List[str], n: int = 3, min_count: int = 2) -> set:
+    """Extracts n-grams repeated min_count or more times across the last 8 bot replies."""
+    from collections import Counter
+    c = Counter()
+    for r in recent_bot[-8:]:
+        words = re.findall(r"\b\w+\b", (r or "").lower())
+        for i in range(len(words) - n + 1):
+            c[tuple(words[i:i+n])] += 1
+    return {ng for ng, count in c.items() if count >= min_count}
+
+
+def has_fatigue(reply: str, banned_ngrams: set, n: int = 3) -> bool:
+    """Checks if reply contains any fatigued n-grams."""
+    if not banned_ngrams:
+        return False
+    words = re.findall(r"\b\w+\b", (reply or "").lower())
+    for i in range(len(words) - n + 1):
+        if tuple(words[i:i+n]) in banned_ngrams:
+            return True
+    return False
+
+
+def has_repeated_opener(reply: str, recent_bot: List[str], max_first_word_repeats: int = 2) -> bool:
+    """Checks if reply's first word repeats in >= max_first_word_repeats of the last 5 bot replies."""
+    words = re.findall(r"\b\w+\b", (reply or "").lower())
+    if not words:
+        return False
+    first_word = words[0]
+    count = 0
+    for r in recent_bot[-5:]:
+        rw = re.findall(r"\b\w+\b", (r or "").lower())
+        if rw and rw[0] == first_word:
+            count += 1
+    return count >= max_first_word_repeats
+
+
+def bad_reply(
+    reply: str,
+    recent_bot_replies: Optional[List[str]] = None,
+    session_bans: Optional[set] = None,
+    thr: float = 0.50
+) -> Tuple[bool, str]:
     """
-    Validates model reply against attractor collapse, loops, timestamp leaks, and emptiness.
+    Checks if reply contains explicit user bans, fatigued openers, fatigued n-grams,
+    stock phrases, duplicates prior replies, or has > thr Jaccard token overlap with
+    any of the last 5 bot replies.
+    Returns (True, reason) if bad, or (False, "ok") if clean.
+    """
+    if not reply or not reply.strip():
+        return True, "empty_reply"
+
+    reply_lower = reply.lower()
+
+    # 1. Reject explicit user-banned phrases
+    if session_bans:
+        for banned in session_bans:
+            if banned and banned in reply_lower:
+                return True, f"banned_phrase:{banned}"
+
+    # 2. Reject repeated openers (first word appears in >= 2 of last 5 replies)
+    if recent_bot_replies and has_repeated_opener(reply, recent_bot_replies, max_first_word_repeats=2):
+        words = re.findall(r"\b\w+\b", reply_lower)
+        fw = words[0] if words else ""
+        return True, f"fatigued_opener:{fw}"
+
+    # 3. Reject dynamic fatigue n-grams (3-grams appearing >= 2 times in last 8 bot replies)
+    if recent_bot_replies:
+        banned_ng = fatigued_ngrams(recent_bot_replies, n=3, min_count=2)
+        if has_fatigue(reply, banned_ng, n=3):
+            return True, "fatigued_ngram"
+
+    # 4. Reject stock phrases
+    if STOCK_REGEX.search(reply):
+        return True, "stock_phrase"
+
+    # 5. Cross-turn duplicate / high-overlap check
+    if recent_bot_replies:
+        rep_words = set(re.findall(r"\b\w+\b", reply_lower))
+        for prev in recent_bot_replies[-5:]:
+            if not prev:
+                continue
+            prev_lower = prev.lower()
+            if reply_lower == prev_lower:
+                return True, "exact_duplicate_reply"
+            prev_words = set(re.findall(r"\b\w+\b", prev_lower))
+            if rep_words and prev_words:
+                jaccard = len(rep_words & prev_words) / len(rep_words | prev_words)
+                if jaccard > thr:
+                    return True, f"high_consecutive_overlap:{jaccard:.2f}"
+
+    return False, "ok"
+
+
+def validate_reply(
+    text: str,
+    recent_bot_replies: Optional[List[str]] = None,
+    session_bans: Optional[set] = None
+) -> tuple[bool, str]:
+    """
+    Validates model reply against attractor collapse, loops, timestamp leaks, stock phrases,
+    user-banned phrases, and cross-turn repetition.
     Returns (True, "ok") if valid, or (False, reason) if invalid.
     """
     if not text or not text.strip():
@@ -403,6 +525,10 @@ def validate_reply(text: str) -> tuple[bool, str]:
         or VALIDATE_LOOP_REPEATED_CLAUSE_REGEX.search(text)
     ):
         return False, "loop_or_stutter"
+
+    is_bad, reason = bad_reply(text, recent_bot_replies, session_bans)
+    if is_bad:
+        return False, reason
 
     return True, "ok"
 
@@ -1199,7 +1325,7 @@ def _prepare_prompt_sync(session_id: str, prompt_message: str, measure_tokens=No
     # Fetch recent history early so Laya routing has conversational context if needed
     history = (history_override if history_override is not None
                else get_recent_history(session_id))
-    history = deduplicate_assistant_turns(history)
+    history = filter_clean_history(history, max_assistant_turns=3)
 
     # Phase 6: App noise clean & Multi-fragment merger
     cleaned_input = clean_user_input(prompt_message)
@@ -1674,6 +1800,18 @@ async def generate_reply(session_id: str, prompt_message: str, history_message: 
     if history_message is None:
         history_message = prompt_message
 
+    # Idempotency check: prevent duplicate sends within 10s window on identical prompt
+    now_ts = time.time()
+    cached = _IDEMPOTENCY_CACHE.get(session_id)
+    if cached:
+        c_msg, c_reply, c_ts = cached
+        if c_msg.strip().lower() == prompt_message.strip().lower() and (now_ts - c_ts) < 10.0:
+            print(f"[idempotency] Returning cached reply for duplicate prompt on session '{session_id}'")
+            return c_reply, "cached"
+
+    # Register any explicit user ban commands for this session
+    session_bans = extract_and_register_user_bans(session_id, prompt_message)
+
     cur_dt = get_current_time()
     t_bucket = get_time_bucket(cur_dt.hour)
     last_ts = get_last_user_timestamp(session_id)
@@ -1691,29 +1829,51 @@ async def generate_reply(session_id: str, prompt_message: str, history_message: 
     if mode in ("guidance", "coding") and profile.get("num_predict", 160) < 320:
         profile["num_predict"] = 320
 
+    # Fix 1: Let the model write its own opener by default (no pre-fill on first attempt).
+    # Opener pre-fill is reserved as a fallback only if regeneration is required.
+    recent_bot_replies = [h.get("content", "") for h in prep["messages"] if h.get("role") == "assistant"]
+    profile.pop("prefill_opener", None)
+
     raw_reply = await _call_npu_once(prep["messages"], options=profile)
     bot_reply = await asyncio.to_thread(
         scrub_reply, raw_reply, session_id=session_id, mode=mode, is_crisis=is_crisis, prompt_message=prompt_message
     )
 
-    # Post-generation validation & single-retry regeneration (Phase 2)
-    is_valid, invalid_reason = validate_reply(bot_reply)
+    # Post-generation validation & single-retry regeneration (Phase 2, Step 2 & Fix 1/3)
+    is_valid, invalid_reason = validate_reply(bot_reply, recent_bot_replies, session_bans)
     if not is_valid:
         global regeneration_count
         regeneration_count += 1
-        print(f"[decode_guard] Validation failed ({invalid_reason}) on session '{session_id}'. Regenerating once with fallback profile...")
+        print(f"[decode_guard] Validation failed ({invalid_reason}) on session '{session_id}'. Regenerating once with fallback profile & opener...")
         fallback_profile = dict(profile)
         fallback_profile["temperature"] = round(min(1.0, fallback_profile.get("temperature", 0.55) + 0.15), 2)
         fallback_profile["repeat_penalty"] = 1.12
         fallback_profile["repetition_penalty"] = 1.12
+
+        # Pick fallback opener by message type (Fix 1)
+        from mode_router import detect_message_type
+        msg_type = detect_message_type(prompt_message)
+        fallback_opener = pick_opener(recent_bot_replies, profile=mode, message_type=msg_type)
+        fallback_profile["prefill_opener"] = fallback_opener
+
+        import random
+        fallback_profile["rng_seed"] = random.randrange(2**31)
         try:
             resampled_raw = await _call_npu_once(prep["messages"], options=fallback_profile)
             bot_reply = await asyncio.to_thread(
                 scrub_reply, resampled_raw, session_id=session_id, mode=mode, is_crisis=is_crisis, prompt_message=prompt_message
             )
             raw_reply = resampled_raw
+            still_valid, still_reason = validate_reply(bot_reply, recent_bot_replies, session_bans)
+            if not still_valid:
+                print(f"[decode_guard] Fallback retry still failed ({still_reason}). Using clean grounded reaction.")
+                if session_bans and any(b in prompt_message.lower() for b in session_bans):
+                    bot_reply = "fair enough, my bad on that. what's on your mind?"
+                else:
+                    bot_reply = "fair enough, what's on your mind?"
         except Exception as e:
             print(f"[decode_guard] single-retry regeneration failed: {e}")
+            bot_reply = "fair enough, what's on your mind?"
 
     # Repetition recovery: Only trigger if the reply contains an actual hardware token stutter
     # (the exact same 1–4 word sequence repeated 4+ times consecutively, e.g. "i'm, i'm, i'm, i'm"),
@@ -1817,6 +1977,7 @@ async def generate_reply(session_id: str, prompt_message: str, history_message: 
     await asyncio.to_thread(save_turn, session_id, history_message, bot_reply, mode)
     create_background_task(_background_rollup(session_id))
 
+    _IDEMPOTENCY_CACHE[session_id] = (prompt_message, bot_reply, time.time())
     return bot_reply, mode
 
 

@@ -22,6 +22,80 @@ from typing import Optional, List, Dict, Any
 from laya_engine import classify_mode_and_retrieval, LAYA_ENABLED, is_laya_available
 
 
+STOCK_REGEX = re.compile(
+    r"(?i)\b(still here|just here|still with you|i'?m here|not fixing|let me just be|not going anywhere|aah,? i see|aight|quiet|stillness|breath|soft echo|hold space)\b"
+)
+
+# Curated opener pools by message type & profile (strictly excluding "aight")
+OPENER_POOLS: Dict[str, List[str]] = {
+    "question": ["hmm", "honestly", "well", "let's see", "yeah"],
+    "news": ["oh nice", "wait really", "whoa", "damn", "no way"],
+    "goodbye": ["catch ya", "later", "take care", "peace", "cya"],
+    "venting": ["man", "honestly", "that sounds rough", "oof", "i get that", "yeah"],
+    "casual": ["yeah", "honestly", "fair", "haha", "bro", "lowkey", "ngl", "true"],
+    "supportive": ["yeah", "man", "honestly", "oof", "hey", "fair enough", "i get that"],
+}
+
+CASUAL_OPENERS = OPENER_POOLS["casual"]
+SUPPORTIVE_OPENERS = OPENER_POOLS["supportive"]
+
+QUESTION_START_REGEX = re.compile(
+    r"^(?:what|why|how|when|where|who|which|whose|whom|is|are|am|can|could|would|should|do|does|did|will|won'?t|have|has|had)\b",
+    re.IGNORECASE
+)
+GOODBYE_REGEX = re.compile(
+    r"(?i)\b(?:bye|goodbye|see ya|cya|later|take care|good night|gn|heading out|catch you later|talk to you later)\b"
+)
+NEWS_REGEX = re.compile(
+    r"(?i)\b(?:guess what|i got|i just|found out|passed|won|accepted|promoted|finished|made it)\b"
+)
+
+
+def detect_message_type(message: str, signals: Optional[Dict[str, Any]] = None) -> str:
+    """Classifies user message type into 'goodbye', 'venting', 'news', 'question', or 'casual'."""
+    msg = (message or "").strip()
+    if GOODBYE_REGEX.search(msg):
+        return "goodbye"
+    if signals and signals.get("is_venting"):
+        return "venting"
+    if NEWS_REGEX.search(msg):
+        return "news"
+    if "?" in msg or QUESTION_START_REGEX.search(msg):
+        return "question"
+    return "casual"
+
+
+def pick_opener(
+    recent_bot_replies: Optional[List[str]] = None,
+    profile: str = "casual",
+    message_type: Optional[str] = None
+) -> str:
+    """
+    Selects a code-controlled opener pre-fill matching message type / profile,
+    strictly excluding 'aight' and excluding any opener whose first word
+    matches the first word of any of the last 5 bot replies.
+    """
+    if message_type and message_type in OPENER_POOLS:
+        pool = OPENER_POOLS[message_type]
+    elif profile == "supportive":
+        pool = OPENER_POOLS["supportive"]
+    else:
+        pool = OPENER_POOLS.get(profile, OPENER_POOLS["casual"])
+
+    recent_first_words = set()
+    if recent_bot_replies:
+        for r in recent_bot_replies[-5:]:
+            words = re.findall(r"\b\w+\b", (r or "").lower())
+            if words:
+                recent_first_words.add(words[0])
+
+    candidates = [op for op in pool if op.split()[0].lower() not in recent_first_words and op.lower() != "aight"]
+    if not candidates:
+        candidates = [op for op in pool if op.lower() != "aight"]
+    import random
+    return random.choice(candidates) if candidates else "yeah"
+
+
 # ----------------------------------------------------------------
 # Crisis Detection & Behavioral mode patterns
 # ----------------------------------------------------------------
@@ -554,7 +628,13 @@ def extract_message_focus(message: str) -> str:
         r"^(?:hey|hi|hello|yo|man|bro|dude|wait|also|so|and|uh|umm)\b[,.!\s]*",
         "", clean, flags=re.IGNORECASE
     ).strip()
-    if not stripped or stripped.lower() in ("u up", "u up?", "you up", "you up?", "up", "up?", "alive", "alive?", "there", "there?", "sup", "sup?"):
+
+    # Strip negative meta-commands/bans so they are never parroted in plan
+    stripped = re.sub(r"(?i)\b(?:stop|quit|don'?t)\s+(?:saying|repeating|using)\b.*$", "", stripped).strip()
+    if not stripped:
+        return "user preference"
+
+    if stripped.lower() in ("u up", "u up?", "you up", "you up?", "up", "up?", "alive", "alive?", "there", "there?", "sup", "sup?"):
         return "user greeting"
 
     # Check for capitalized proper names / entities
@@ -596,8 +676,13 @@ def extract_message_focus(message: str) -> str:
         )
     ]
     if words:
-        return " ".join(words[:4])
-    return "user message"
+        focus = " ".join(words[:4])
+    else:
+        focus = "user message"
+
+    if STOCK_REGEX.search(focus):
+        return "current update"
+    return focus
 
 
 def build_structured_plan(

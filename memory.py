@@ -465,6 +465,76 @@ def _estimate_tokens(text: str) -> int:
     return max(1, len(text) // 4)
 
 
+STOCK_REGEX = re.compile(
+    r"(?i)\b(still here|just here|still with you|i'?m here|not fixing|let me just be|not going anywhere|aah,? i see|aight|quiet|stillness|breath|soft echo|hold space)\b"
+)
+
+
+def _jaccard_similarity(s1: str, s2: str) -> float:
+    w1 = set(re.findall(r"\b\w+\b", (s1 or "").lower()))
+    w2 = set(re.findall(r"\b\w+\b", (s2 or "").lower()))
+    if not w1 or not w2:
+        return 0.0
+    return len(w1 & w2) / len(w1 | w2)
+
+
+def filter_clean_history(
+    turns: list[dict],
+    max_assistant_turns: int = 3,
+    max_user_turns: int = 10
+) -> list[dict]:
+    """
+    Filters out stock/corrupted assistant turns and near-duplicate turns from history,
+    capping sent assistant history to at most `max_assistant_turns` (default 3 clean turns)
+    so small models are never poisoned by repetitive historical loops, while retaining
+    up to `max_user_turns` (default 10 user turns) so conversational backstory is preserved.
+    """
+    if not turns:
+        return []
+
+    # 1. First deduplicate identical/near-identical consecutive assistant turns
+    turns = deduplicate_assistant_turns(turns)
+
+    # 2. Filter out stock phrases and near-duplicate assistant turns from the end backwards
+    kept_turns = []
+    seen_assistant_replies = []
+    assistant_count = 0
+    user_count = 0
+
+    for turn in reversed(turns):
+        role = turn.get("role")
+        content = turn.get("content", "")
+
+        if role == "assistant":
+            # Check stock phrase regex
+            if STOCK_REGEX.search(content):
+                continue
+
+            # Check cross-turn repetition with already kept assistant turns (> 0.50 Jaccard overlap)
+            is_dup = False
+            for seen in seen_assistant_replies:
+                if _jaccard_similarity(content, seen) > 0.50:
+                    is_dup = True
+                    break
+            if is_dup:
+                continue
+
+            if assistant_count >= max_assistant_turns:
+                continue
+
+            assistant_count += 1
+            seen_assistant_replies.append(content)
+            kept_turns.append(turn)
+        else:
+            if user_count >= max_user_turns:
+                continue
+            user_count += 1
+            kept_turns.append(turn)
+
+    kept_turns.reverse()
+    return kept_turns
+
+
 def deduplicate_assistant_turns(turns: list[dict]) -> list[dict]:
     """Filters out consecutive duplicate or near-duplicate assistant replies from history
     so repetition loops don't get fed into the prompt context."""
@@ -528,7 +598,7 @@ def get_recent_history(session_id: str, limit: int = 40, max_tokens: int = 2200,
 
     selected.reverse()  # chronological order
     turns = [{"role": role, "content": content, "timestamp": ts} for role, content, ts in selected]
-    return deduplicate_assistant_turns(turns)
+    return filter_clean_history(turns, max_assistant_turns=3)
 
 
 def get_full_session_history(session_id: str, limit: int = 200) -> list[dict]:

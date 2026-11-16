@@ -312,6 +312,7 @@ class ChatRequest(BaseModel):
     stream: Optional[bool] = False
     options: Optional[Dict[str, Any]] = None
     is_cot: Optional[bool] = False
+    prefill_opener: Optional[str] = None
 
 @app.on_event("startup")
 def startup_event():
@@ -693,6 +694,7 @@ async def chat(payload: ChatRequest):
             if hasattr(config, "no_repeat_ngram_size"):
                 try:
                     config.no_repeat_ngram_size = val
+                    print(f"[decode_guard] no_repeat_ngram_size={val} applied")
                 except Exception as e:
                     print(f"[decode_guard] could not set no_repeat_ngram_size: {e}")
             
@@ -707,6 +709,19 @@ async def chat(payload: ChatRequest):
     if top_k > 0:
         config.top_k = int(top_k)
     config.repetition_penalty = float(rep_penalty)
+
+    # Fresh RNG seed on every call unless explicitly pinned by caller
+    if opts and "rng_seed" in opts:
+        config.rng_seed = int(opts["rng_seed"])
+    else:
+        import random
+        config.rng_seed = random.randrange(2**31)
+
+    prefill = ""
+    if payload.prefill_opener:
+        prefill = payload.prefill_opener.strip()
+    elif opts and "prefill_opener" in opts:
+        prefill = str(opts["prefill_opener"]).strip()
 
     max_allowed_prompt = MAX_PROMPT_LEN - config.max_new_tokens - 64
 
@@ -727,6 +742,8 @@ async def chat(payload: ChatRequest):
 
     messages = list(payload.messages)
     prompt = _format_chatml(messages)
+    if prefill:
+        prompt = prompt + f"{prefill} "
     tok_est = estimate_tokens(prompt)
     if tok_est is None:
         tok_est = len(prompt) // 3
@@ -796,6 +813,11 @@ async def chat(payload: ChatRequest):
             reply = await loop.run_in_executor(None, run_inference, target_pipe, prompt, config)
             if not is_cot_request:
                 reply = _clean_reply_text(reply)
+            if prefill:
+                clean_text = reply.strip()
+                if clean_text.lower().startswith(prefill.lower()):
+                    clean_text = clean_text[len(prefill):].lstrip(" ,.!?")
+                reply = f"{prefill} {clean_text}".strip()
         except Exception as e:
             print(f"Inference generation error on {target_device}: {e}")
             raise HTTPException(status_code=500, detail=f"Inference error: {str(e)}")

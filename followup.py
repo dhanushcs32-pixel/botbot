@@ -272,6 +272,28 @@ async def _ask_model_for_followup(
             cleaned = truncated[:last_punct + 1].strip()
         else:
             cleaned = truncated.rsplit(" ", 1)[0].strip()
+
+    if not cleaned:
+        return None
+
+    # Anti-duplicate guard: never emit a follow-up that duplicates or heavily overlaps
+    # with the last assistant message
+    import re
+    w_new = set(re.findall(r"\b\w+\b", cleaned.lower()))
+    for turn in reversed(history):
+        if turn.get("role") == "assistant":
+            prev_content = turn.get("content", "")
+            if cleaned.strip().lower() == prev_content.strip().lower():
+                _log(f"[followup] rejected identical duplicate followup for session '{session_id}'")
+                return None
+            w_prev = set(re.findall(r"\b\w+\b", prev_content.lower()))
+            if w_new and w_prev:
+                jaccard = len(w_new & w_prev) / len(w_new | w_prev)
+                if jaccard >= 0.50:
+                    _log(f"[followup] rejected high-overlap ({jaccard:.2f}) followup for session '{session_id}'")
+                    return None
+            break
+
     return cleaned
 
 
