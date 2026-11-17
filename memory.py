@@ -466,7 +466,7 @@ def _estimate_tokens(text: str) -> int:
 
 
 STOCK_REGEX = re.compile(
-    r"(?i)\b(still here|just here|still with you|i'?m here|not fixing|let me just be|not going anywhere|aah,? i see|aight|quiet|stillness|breath|soft echo|hold space)\b"
+    r"(?i)\b(still here|just here|still with you|here with you|i'?m (?:still|just|always) here|i'?m here for you|not fixing|let me just be|not going anywhere|aah,? i see|aight|quiet breath|quiet presence|stillness|soft breath|soft echo|hold(?:ing)? space|sit with you|sitting with you)\b"
 )
 
 

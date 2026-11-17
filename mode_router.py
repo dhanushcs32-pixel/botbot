@@ -23,7 +23,7 @@ from laya_engine import classify_mode_and_retrieval, LAYA_ENABLED, is_laya_avail
 
 
 STOCK_REGEX = re.compile(
-    r"(?i)\b(still here|just here|still with you|i'?m here|not fixing|let me just be|not going anywhere|aah,? i see|aight|quiet|stillness|breath|soft echo|hold space)\b"
+    r"(?i)\b(still here|just here|still with you|here with you|i'?m (?:still|just|always) here|i'?m here for you|not fixing|let me just be|not going anywhere|aah,? i see|aight|quiet breath|quiet presence|stillness|soft breath|soft echo|hold(?:ing)? space|sit with you|sitting with you)\b"
 )
 
 # Curated opener pools by message type & profile (strictly excluding "aight")
@@ -33,7 +33,7 @@ OPENER_POOLS: Dict[str, List[str]] = {
     "goodbye": ["catch ya", "later", "take care", "peace", "cya"],
     "venting": ["man", "honestly", "that sounds rough", "oof", "i get that", "yeah"],
     "casual": ["yeah", "honestly", "fair", "haha", "bro", "lowkey", "ngl", "true"],
-    "supportive": ["yeah", "man", "honestly", "oof", "hey", "fair enough", "i get that"],
+    "supportive": ["yeah", "man", "honestly", "oof", "hey", "i get that"],
 }
 
 CASUAL_OPENERS = OPENER_POOLS["casual"]
@@ -94,6 +94,69 @@ def pick_opener(
         candidates = [op for op in pool if op.lower() != "aight"]
     import random
     return random.choice(candidates) if candidates else "yeah"
+
+
+def get_clean_fallback(
+    user_turn: str,
+    recent_bot_replies: Optional[List[str]] = None,
+    session_bans: Optional[set] = None
+) -> str:
+    """
+    Returns a clean, non-repetitive, grounded reaction when generation attempts
+    fail validation or decode guards. Strictly guarantees zero duplicates with recent replies.
+    """
+    bot_replies = recent_bot_replies or []
+    used_replies_lower = {r.strip().lower() for r in bot_replies if r}
+
+    user_lower = (user_turn or "").lower()
+
+    if session_bans and any(b in user_lower for b in session_bans):
+        candidates = [
+            "got it, my bad on that. what else is on your mind?",
+            "fair enough, noted. what are you up to today?",
+            "understood, dropping that completely. what's going on?",
+            "makes sense, my bad. what do you want to talk about?",
+        ]
+    elif re.search(r"(?i)\b(im alr|i'?m alright|feeling better|all good|no stress|chilled?)\b", user_lower):
+        candidates = [
+            "glad to hear that! how did the rest of it turn out?",
+            "huge relief honestly, glad things smoothed out. what's next?",
+            "nice, good to hear you're doing better. what's the plan now?",
+            "fair enough, glad everything worked out! what are you up to?",
+        ]
+    elif re.search(r"(?i)\b(panic|panic attack|pass out|can'?t breathe|hyperventilating|heart racing|scared|overwhelmed|anxious|freaking out)\b", user_lower):
+        candidates = [
+            "take a slow deep breath, you're capable of getting through this.",
+            "step by step, you've prepped for this. take a moment to center yourself.",
+            "pause for a second and drink some water. you've got this.",
+            "one step at a time, don't rush yourself right now.",
+        ]
+    elif "?" in user_turn:
+        candidates = [
+            "honestly not completely sure, what do you think?",
+            "good question, let's see how things play out.",
+            "fair question, depends on how the rest of the day goes.",
+        ]
+    else:
+        candidates = [
+            "fair enough, what's on your mind?",
+            "gotcha, let's keep things moving.",
+            "sounds good, what's next on your plate?",
+            "makes sense, how are you feeling about the rest of the day?",
+            "cool, let's see how the rest of it goes.",
+        ]
+
+    for cand in candidates:
+        if cand.strip().lower() not in used_replies_lower:
+            return cand
+
+    # If all candidates match prior turns, append a dynamic conversational token
+    for cand in candidates:
+        alt = f"{cand} keep me posted."
+        if alt.strip().lower() not in used_replies_lower:
+            return alt
+
+    return "fair enough, let's keep moving forward."
 
 
 # ----------------------------------------------------------------
@@ -475,6 +538,7 @@ Answer the specific part directly supported by the context, and honestly share t
 
 FLUID_PERSONA_INSTRUCTION = """You are texting your close friend Dhanush.
 - Speak like a close friend texting casually in normal lowercase text messages (1 short sentence, 8–20 words).
+- Use plain, everyday texting language — skip poetic metaphors.
 - React directly to the specific people, events, or details Dhanush mentioned in the present moment.
 - The person texting you is Dhanush ('you'); you are his friend texting back. Dhanush's background facts belong to him, not to you; never invent unverified past shared meetings or shared memories.
 - Match Dhanush's energy: warm and steady when he is stressed, casual and playful when bantering."""
@@ -492,6 +556,7 @@ You are checking in naturally with your friend based on what you were talking ab
 GENERAL_RULES = """
 Texting guidelines:
 - Be honest, grounded, and stay present in the conversation with your friend.
+- Use plain, everyday texting language — skip poetic metaphors.
 - When asked about unknown plans or facts, ask to be reminded or say you aren't sure.
 - Warmly greet when the user says hi or checks in.
 - Text strictly in clean, standard horizontal text messages (1–2 sentences).

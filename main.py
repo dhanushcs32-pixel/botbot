@@ -51,6 +51,7 @@ from mode_router import (
     extract_message_focus,
     STOCK_REGEX,
     pick_opener,
+    get_clean_fallback,
 )
 from memory import (
     save_turn, get_recent_history, get_recent_summaries, get_all_session_ids,
@@ -1867,13 +1868,10 @@ async def generate_reply(session_id: str, prompt_message: str, history_message: 
             still_valid, still_reason = validate_reply(bot_reply, recent_bot_replies, session_bans)
             if not still_valid:
                 print(f"[decode_guard] Fallback retry still failed ({still_reason}). Using clean grounded reaction.")
-                if session_bans and any(b in prompt_message.lower() for b in session_bans):
-                    bot_reply = "fair enough, my bad on that. what's on your mind?"
-                else:
-                    bot_reply = "fair enough, what's on your mind?"
+                bot_reply = get_clean_fallback(prompt_message, recent_bot_replies, session_bans)
         except Exception as e:
             print(f"[decode_guard] single-retry regeneration failed: {e}")
-            bot_reply = "fair enough, what's on your mind?"
+            bot_reply = get_clean_fallback(prompt_message, recent_bot_replies, session_bans)
 
     # Repetition recovery: Only trigger if the reply contains an actual hardware token stutter
     # (the exact same 1–4 word sequence repeated 4+ times consecutively, e.g. "i'm, i'm, i'm, i'm"),

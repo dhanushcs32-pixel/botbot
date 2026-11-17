@@ -29,7 +29,9 @@ DISTRESS_TRIGGERS = (
     "hate my life", "nobody cares", "leave me alone", "stop talking",
     "shut up", "you don't get it", "you dont get it", "you're just a bot",
     "youre just a bot", "crying rn", "breakdown", "overwhelmed", "hopeless",
-    "furious", "dont talk to me", "don't talk to me", "wanna die", "want to die"
+    "furious", "dont talk to me", "don't talk to me", "wanna die", "want to die",
+    "panic attack", "pass out", "can't breathe", "cant breathe", "hyperventilating",
+    "freaking out", "heart racing"
 )
 
 VENTING_LEXICON = {
@@ -37,7 +39,8 @@ VENTING_LEXICON = {
     "screwed", "hopeless", "depressed", "anxious", "panic", "broken", "terrible",
     "horrible", "awful", "done with", "cant take", "can't take", "ruined",
     "breakdown", "miserable", "fried", "stressed", "drained", "sad", "hurts",
-    "pain", "dying", "failed", "failing", "sucks", "crying rn", "hurting"
+    "pain", "dying", "failed", "failing", "sucks", "crying rn", "hurting",
+    "hyperventilating", "panicking", "freaking out"
 }
 
 JOKING_LEXICON = {
