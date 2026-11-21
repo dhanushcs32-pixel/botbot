@@ -60,7 +60,8 @@ import datetime as _dt
 from typing import Callable, Awaitable, Dict, Optional, Tuple
 
 from memory import get_recent_history, is_test_session, get_sessions_with_last_activity
-from mode_router import get_system_prompt
+from mode_router import get_system_prompt, extract_message_focus, STOCK_REGEX
+from tone_reader import analyze_tone
 from rag import get_style_profile
 
 import logging
@@ -244,18 +245,38 @@ async def _ask_model_for_followup(
                 return None
             break
 
-    style_profile = get_style_profile()
+    # Fix 5: Silence follow-ups completely after emotional, distressed, venting, or crisis exchanges
+    for turn in reversed(history[-4:]):
+        if turn.get("role") == "user":
+            tone = analyze_tone(turn.get("content", ""))
+            if tone.get("distress_flag") or tone.get("venting", 0) >= 0.35:
+                _log(f"[followup] skipping session '{session_id}': recent user turn was distressed/emotional ({tone})")
+                return None
+        elif turn.get("role") == "assistant":
+            c_lower = turn.get("content", "").lower()
+            if any(w in c_lower for w in ("here for you", "slow deep breath", "take your time", "staying with you")):
+                _log(f"[followup] skipping session '{session_id}': recent assistant turn was emotional/distress support")
+                return None
 
-    system_prompt = get_system_prompt(
-        FOLLOWUP_MODE,
-        personal_context="",
-        style_profile=style_profile,
-        session_summaries="",
-        reference_context="",
-        referenced_session_context="",
+    # Extract topic from the last user turn
+    last_user_turn = next((t.get("content", "") for t in reversed(history) if t.get("role") == "user"), "")
+    topic = extract_message_focus(last_user_turn)
+    if topic in ("user message", "general check-in", "user greeting", "user preference"):
+        topic = "his day"
+
+    followup_system_prompt = (
+        "You are texting your close friend Dhanush from his phone.\n"
+        f"Send one short casual check-in about {topic}.\n"
+        "Strict rules: 1 short sentence (6-15 words). Casual lowercase text. "
+        "Do not invent shared plans, do not claim to see him, and do not use poetic metaphors."
     )
 
-    messages = [{"role": "system", "content": system_prompt}] + history
+    clean_history = history[-4:]
+    messages = [
+        {"role": "system", "content": followup_system_prompt}
+    ] + clean_history + [
+        {"role": "user", "content": f"[Check in casually with Dhanush about {topic} in one short sentence.]"}
+    ]
 
     try:
         raw_reply = await call_model(messages, num_predict=35)
@@ -276,9 +297,18 @@ async def _ask_model_for_followup(
     if not cleaned:
         return None
 
+    # Validation: reject stock phrases, body/eating claims, or poetic filler
+    import re
+    if STOCK_REGEX.search(cleaned):
+        _log(f"[followup] rejected stock phrase in followup: {cleaned}")
+        return None
+
+    if re.search(r"(?i)\b(i saw you|let'?s (?:just )?eat|i was gonna eat|let'?s head|we'?re (?:already )?halfway|aizen)\b", cleaned):
+        _log(f"[followup] rejected invalid physical/invented claim in followup: {cleaned}")
+        return None
+
     # Anti-duplicate guard: never emit a follow-up that duplicates or heavily overlaps
     # with the last assistant message
-    import re
     w_new = set(re.findall(r"\b\w+\b", cleaned.lower()))
     for turn in reversed(history):
         if turn.get("role") == "assistant":

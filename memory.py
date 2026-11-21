@@ -19,7 +19,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 PERSONAL_DATA_DIR = Path(os.getenv("PERSONAL_DATA_DIR", Path(__file__).parent / "personal_data"))
-DB_PATH = Path(os.getenv("DB_PATH", PERSONAL_DATA_DIR / "memory.db"))
+ROOT_TEST_DB = Path(__file__).parent / "test.db"
+
+if "DB_PATH" in os.environ:
+    DB_PATH = Path(os.environ["DB_PATH"])
+elif os.environ.get("USE_TEST_DB", "0").lower() in ("1", "true", "yes"):
+    DB_PATH = ROOT_TEST_DB
+else:
+    DB_PATH = PERSONAL_DATA_DIR / "memory.db"
+
 LINKS_FILE_PATH = PERSONAL_DATA_DIR / "journals" / "Important links.txt"
 
 

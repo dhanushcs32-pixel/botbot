@@ -688,16 +688,21 @@ def extract_message_focus(message: str) -> str:
     if not clean:
         return "general check-in"
 
+    # Strip negative meta-commands/bans so they are never parroted in plan
+    # Fix 3: Broadened to include talking, speaking, mentioning, bringing up, about/abt
+    ban_pattern = r"(?i)\b(?:stop|quit|don'?t)\s+(?:talking|speaking|going\s+on|saying|repeating|using|mentioning|mention|bringing\s+up)\b.*$"
+    if re.search(ban_pattern, clean):
+        return "acknowledge and pivot"
+
+    stripped = re.sub(ban_pattern, "", clean).strip()
+
     # Strip common leading greetings/filler
     stripped = re.sub(
         r"^(?:hey|hi|hello|yo|man|bro|dude|wait|also|so|and|uh|umm)\b[,.!\s]*",
-        "", clean, flags=re.IGNORECASE
+        "", stripped, flags=re.IGNORECASE
     ).strip()
-
-    # Strip negative meta-commands/bans so they are never parroted in plan
-    stripped = re.sub(r"(?i)\b(?:stop|quit|don'?t)\s+(?:saying|repeating|using)\b.*$", "", stripped).strip()
     if not stripped:
-        return "user preference"
+        return "general check-in"
 
     if stripped.lower() in ("u up", "u up?", "you up", "you up?", "up", "up?", "alive", "alive?", "there", "there?", "sup", "sup?"):
         return "user greeting"
@@ -715,39 +720,50 @@ def extract_message_focus(message: str) -> str:
         for w in cap_words:
             m = re.search(rf"\b(?:\w+\s+){{0,2}}{re.escape(w)}(?:\s+\w+){{0,2}}\b", stripped)
             if m:
-                return m.group(0).lower().strip()
-        return cap_words[0].lower()
-
-    # Look for key event / feeling / topic phrases
-    patterns = [
-        r"(?:fight with|talked with|meeting with|arguing with)\s+[\w\s]{2,15}",
-        r"(?:can't sleep|cannot sleep|awake at|insomnia|thoughts hitting)",
-        r"(?:exam|presentation|interview|flight|trip|vacation|party|wedding)",
-        r"(?:lunch|dinner|breakfast|food|hungry|eating|coffee)",
-        r"(?:feeling|felt)\s+[\w\s]{2,15}",
-        r"(?:work|job|boss|office|manager|project)",
-        r"(?:drive|driving|walk|walking|music|song)",
-    ]
-    for pat in patterns:
-        m = re.search(pat, stripped, re.IGNORECASE)
-        if m:
-            return m.group(0).lower().strip()
-
-    # Fallback to the first 3-4 content words
-    words = [
-        w for w in re.findall(r"\b\w+\b", stripped.lower())
-        if len(w) > 2 and w not in (
-            "the", "and", "that", "this", "with", "have", "been", "what", "your", "from", "for", "are", "you"
-        )
-    ]
-    if words:
-        focus = " ".join(words[:4])
+                focus = m.group(0).lower().strip()
+                break
+        else:
+            focus = cap_words[0].lower()
     else:
-        focus = "user message"
+        # Look for key event / feeling / topic phrases
+        patterns = [
+            r"(?:fight with|talked with|meeting with|arguing with)\s+[\w\s]{2,15}",
+            r"(?:can't sleep|cannot sleep|awake at|insomnia|thoughts hitting)",
+            r"(?:exam|presentation|interview|flight|trip|vacation|party|wedding)",
+            r"(?:lunch|dinner|breakfast|food|hungry|eating|coffee)",
+            r"(?:feeling|felt)\s+[\w\s]{2,15}",
+            r"(?:work|job|boss|office|manager|project)",
+            r"(?:drive|driving|walk|walking|music|song)",
+        ]
+        focus = None
+        for pat in patterns:
+            m = re.search(pat, stripped, re.IGNORECASE)
+            if m:
+                focus = m.group(0).lower().strip()
+                break
+
+        if not focus:
+            # Fallback to the first 3-4 content words
+            words = [
+                w for w in re.findall(r"\b\w+\b", stripped.lower())
+                if len(w) > 2 and w not in (
+                    "the", "and", "that", "this", "with", "have", "been", "what", "your", "from", "for", "are", "you"
+                )
+            ]
+            if words:
+                focus = " ".join(words[:4])
+            else:
+                focus = "user message"
 
     if STOCK_REGEX.search(focus):
         return "current update"
     return focus
+
+
+GREETING_REGEX = re.compile(
+    r"^(?:hey|hi|hello|yo|sup|hiya|good morning|gm|good afternoon|good evening|what's up|whats up)\b",
+    re.IGNORECASE
+)
 
 
 def build_structured_plan(
@@ -757,7 +773,8 @@ def build_structured_plan(
     gap_sec: float = 0.0,
     is_crisis: bool = False,
     signals: dict | None = None,
-    tone_override: str | None = None
+    tone_override: str | None = None,
+    session_bans: Optional[set] = None
 ) -> str:
     """
     Builds a single compact, positively written plan line:
@@ -786,15 +803,28 @@ def build_structured_plan(
         length = "1 short sentence (8-20 words)"
 
     # 3. Time posture
+    is_greeting = bool(GREETING_REGEX.search((message or "").strip()))
     if time_bucket == "late night":
         time_posture = "late night soft"
+    elif gap_sec >= 3 * 3600 and is_greeting:
+        # Fix 6: greeting after a gap over 3 hours
+        time_posture = "greet back, ask how his day went"
+    elif gap_sec >= 3 * 3600:
+        time_posture = "reconnect after gap"
     elif gap_sec >= 86400:
         time_posture = "greet after gap"
+    elif is_greeting:
+        time_posture = "warm greeting"
     else:
         time_posture = "continue"
 
     # 4. Focus
     focus = extract_message_focus(message)
+    if session_bans:
+        for b in session_bans:
+            if b and b.lower() in focus.lower():
+                focus = "current update"
+                break
 
     return f"[plan: tone={tone} | length={length} | time={time_posture} | focus={focus}]"
 

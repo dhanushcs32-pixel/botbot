@@ -817,7 +817,11 @@ async def chat(payload: ChatRequest):
                 clean_text = reply.strip()
                 if clean_text.lower().startswith(prefill.lower()):
                     clean_text = clean_text[len(prefill):].lstrip(" ,.!?")
-                reply = f"{prefill} {clean_text}".strip()
+                # Fix 6: If clean_text already starts with another opener, prefer clean_text's opener over prefill
+                if re.match(r'^(?:nah|no|yeah|yep|honestly|fair|fair enough|oof|man|hey|bro|lowkey|ngl)\b', clean_text, re.I):
+                    reply = clean_text
+                else:
+                    reply = f"{prefill} {clean_text}".strip()
         except Exception as e:
             print(f"Inference generation error on {target_device}: {e}")
             raise HTTPException(status_code=500, detail=f"Inference error: {str(e)}")

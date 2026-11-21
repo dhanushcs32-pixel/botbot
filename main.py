@@ -103,11 +103,22 @@ SUFFICIENCY_LOG_PATH = Path(os.getenv("SUFFICIENCY_LOG_PATH", PERSONAL_DATA_DIR 
 
 sufficiency_logger = logging.getLogger("botbot.sufficiency")
 sufficiency_logger.setLevel(logging.INFO)
-_sufficiency_file_handler = RotatingFileHandler(
-    str(SUFFICIENCY_LOG_PATH), maxBytes=5 * 1024 * 1024, backupCount=5, encoding="utf-8"
-)
-_sufficiency_file_handler.setFormatter(logging.Formatter("%(message)s"))
-sufficiency_logger.addHandler(_sufficiency_file_handler)
+try:
+    _sufficiency_file_handler = RotatingFileHandler(
+        str(SUFFICIENCY_LOG_PATH), maxBytes=5 * 1024 * 1024, backupCount=5, encoding="utf-8"
+    )
+    _sufficiency_file_handler.setFormatter(logging.Formatter("%(message)s"))
+    sufficiency_logger.addHandler(_sufficiency_file_handler)
+except (PermissionError, OSError):
+    _fallback_log = Path(__file__).parent / "context_sufficiency_log.jsonl"
+    try:
+        _sufficiency_file_handler = RotatingFileHandler(
+            str(_fallback_log), maxBytes=5 * 1024 * 1024, backupCount=5, encoding="utf-8"
+        )
+        _sufficiency_file_handler.setFormatter(logging.Formatter("%(message)s"))
+        sufficiency_logger.addHandler(_sufficiency_file_handler)
+    except Exception:
+        sufficiency_logger.addHandler(logging.NullHandler())
 sufficiency_logger.propagate = False
 
 UNCERTAINTY_HEDGE_PHRASES = [
@@ -365,6 +376,18 @@ def scrub_reply(text: str, session_id: str = "", mode: str = "", is_crisis: bool
     text = EMOJI_PATTERN.sub('', text)
     text = re.sub(r'[ \t]{2,}', ' ', text)
 
+    # 8. Fix 6: Strip clashing double-openers (e.g. "true Nah, no fight..." -> "Nah, no fight...")
+    double_match = re.match(
+        r'^(?:true|honestly|fair enough|fair|yeah|yep|nah|no|man|oof|hey|bro|lowkey|ngl)\s*[,.:;]?\s+'
+        r'(nah|no|yeah|yep|honestly|fair enough|fair|man|oof|hey|bro|lowkey|ngl)\b',
+        text,
+        re.IGNORECASE
+    )
+    if double_match:
+        second_opener = double_match.group(1)
+        rest = text[double_match.end():]
+        text = f"{second_opener}{rest}".strip()
+
     return text.strip()
 
 
@@ -387,7 +410,7 @@ _SESSION_BANS: Dict[str, set] = {}
 _IDEMPOTENCY_CACHE: Dict[str, Tuple[str, str, float]] = {}
 
 BAN_USER_REGEX = re.compile(
-    r'(?i)\b(?:stop|quit|don\'t|dont)\s+(?:saying|repeating|using)\s+(?:the\s+(?:term|phrase|word)\s+)?["\']?([^"\'\n.!?]+)["\']?'
+    r'(?i)\b(?:stop|quit|don\'?t)\s+(?:talking|speaking|going\s+on|saying|repeating|using|mentioning|mention|bringing\s+up)\s+(?:about\s+|abt\s+|ab\s+|the\s+(?:term|word|phrase)\s+)?["\'“]?([\w\' ]{2,30}?)["\'”]?\s*(?:please)?[.!?]*(?:$|\n)'
 )
 
 
@@ -397,7 +420,7 @@ def extract_and_register_user_bans(session_id: str, message: str) -> set:
         _SESSION_BANS[session_id] = set()
     matches = BAN_USER_REGEX.findall(message or "")
     for m in matches:
-        phrase = m.strip().lower()
+        phrase = m.strip(" \"'“”.!?").lower()
         if len(phrase) >= 2:
             _SESSION_BANS[session_id].add(phrase)
             print(f"[user_ban] Registered session ban for '{session_id}': '{phrase}'")
@@ -1409,7 +1432,8 @@ def _prepare_prompt_sync(session_id: str, prompt_message: str, measure_tokens=No
             gap_sec=gap_sec,
             is_crisis=is_crisis,
             signals=signals,
-            tone_override=plan_tone
+            tone_override=plan_tone,
+            session_bans=_SESSION_BANS.get(session_id, set())
         )
 
     # 2. Phase 5: Fast Retrieval Gate + Legacy bypass checks
