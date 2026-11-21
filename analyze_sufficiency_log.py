@@ -44,8 +44,10 @@ positive. The point is narrowing "read every reply" down to "read the
 """
 
 import json
+import os
 import sys
 from collections import defaultdict
+from pathlib import Path
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")

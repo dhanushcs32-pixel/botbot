@@ -17,6 +17,7 @@ import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
 
 PERSONAL_DATA_DIR = Path(os.getenv("PERSONAL_DATA_DIR", Path(__file__).parent / "personal_data"))
 ROOT_TEST_DB = Path(__file__).parent / "test.db"
@@ -606,7 +607,7 @@ def get_recent_history(session_id: str, limit: int = 40, max_tokens: int = 2200,
 
     selected.reverse()  # chronological order
     turns = [{"role": role, "content": content, "timestamp": ts} for role, content, ts in selected]
-    return filter_clean_history(turns, max_assistant_turns=3)
+    return filter_clean_history(turns, max_assistant_turns=6)
 
 
 def get_full_session_history(session_id: str, limit: int = 200) -> list[dict]:

@@ -7,7 +7,7 @@ the 'botbot' model. No Ollama anywhere in this stack.
 from fastapi import FastAPI, UploadFile, File, Form, Header, HTTPException, Depends, WebSocket, WebSocketDisconnect, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 from collections import defaultdict, deque
 import asyncio
 import time
@@ -368,11 +368,14 @@ def scrub_reply(text: str, session_id: str = "", mode: str = "", is_crisis: bool
     )
 
     # 6. Collapse multi-line vertical stacking into clean horizontal sentences
+    text = collapse_vertical_stacking(text)
     lines = [ln.strip() for ln in text.splitlines() if ln.strip() and not re.fullmatch(r'[.\-_*?\s]+', ln.strip())]
     text = " ".join(lines)
 
     # 7. Strip roleplay asterisks and emojis via Python post-processing (Phase 4)
-    text = re.sub(r'\*[^*]+\*', '', text)
+    text = ASTERISK_ACTION_PATTERN.sub('', text)
+    text = RP_VERB_PREFIX_PATTERN.sub('', text)
+    text = strip_parenthetical_stage_directions(text)
     text = EMOJI_PATTERN.sub('', text)
     text = re.sub(r'[ \t]{2,}', ' ', text)
 
@@ -387,6 +390,9 @@ def scrub_reply(text: str, session_id: str = "", mode: str = "", is_crisis: bool
         second_opener = double_match.group(1)
         rest = text[double_match.end():]
         text = f"{second_opener}{rest}".strip()
+
+    # 9. Tiered semantic AI-tell / formal-signoff stripping
+    text, _ = strip_semantic_violations(text, session_id=session_id, mode=mode)
 
     return text.strip()
 
@@ -455,6 +461,8 @@ def has_repeated_opener(reply: str, recent_bot: List[str], max_first_word_repeat
     if not words:
         return False
     first_word = words[0]
+    if first_word in {"i", "you", "it", "the", "a", "that", "this", "we", "he", "she", "they"}:
+        return False
     count = 0
     for r in recent_bot[-5:]:
         rw = re.findall(r"\b\w+\b", (r or "").lower())
@@ -1347,9 +1355,12 @@ def _prepare_prompt_sync(session_id: str, prompt_message: str, measure_tokens=No
                          history_override=None, is_guest: bool = False, num_predict: int = 250,
                          now_override: Optional[datetime] = None, last_user_ts_override: Optional[Any] = None):
     # Fetch recent history early so Laya routing has conversational context if needed
-    history = (history_override if history_override is not None
-               else get_recent_history(session_id))
-    history = filter_clean_history(history, max_assistant_turns=3)
+    raw_history = (history_override if history_override is not None
+                   else get_recent_history(session_id))
+    recent_bot_replies_full = [
+        h.get("content", "") for h in raw_history if h.get("role") == "assistant" and h.get("content")
+    ][-8:]
+    history = filter_clean_history(raw_history, max_assistant_turns=6)
 
     # Phase 6: App noise clean & Multi-fragment merger
     cleaned_input = clean_user_input(prompt_message)
@@ -1417,8 +1428,13 @@ def _prepare_prompt_sync(session_id: str, prompt_message: str, measure_tokens=No
         }
     else:
         laya_routing = detect_mode_detailed(prompt_message, recent_turns=history)
-        mode = chosen_profile if ENABLE_LIGHT_ORCHESTRATOR else laya_routing["mode"]
         is_crisis = laya_routing.get("is_crisis", False)
+        if is_crisis:
+            mode = "supportive"
+        elif laya_routing.get("mode") == "guidance" and chosen_profile in ("casual", "short"):
+            mode = "guidance"
+        else:
+            mode = chosen_profile if ENABLE_LIGHT_ORCHESTRATOR else laya_routing["mode"]
 
     policy = get_retrieval_policy(mode)
 
@@ -1446,18 +1462,20 @@ def _prepare_prompt_sync(session_id: str, prompt_message: str, measure_tokens=No
 
     personal_context = ""
     reference_context = ""
-    if context_lookup_attempted and not is_guest:
-        personal_context = search_personal_data(
-            prompt_message,
-            top_k=policy["personal_top_k"],
-            max_result_chars=policy["personal_max_chars"]
-        )
+    if not is_guest:
+        if context_lookup_attempted:
+            personal_context = search_personal_data(
+                prompt_message,
+                top_k=policy["personal_top_k"],
+                max_result_chars=policy["personal_max_chars"]
+            )
         if policy["reference"]:
             is_explicit_ref = any(
                 kw in prompt_message.lower()
                 for kw in ("book", "document", "technique", "therapy", "cbt", "act", "reference", "manual", "chapter", "quote", "according to")
             )
-            if is_explicit_ref or (mode not in ("conversational", "supportive")):
+            is_substantial = len(prompt_message.split()) >= 4 or is_crisis or distress_flag
+            if is_explicit_ref or (mode in ("supportive", "guidance") and is_substantial):
                 reference_context = search_reference_data(prompt_message, top_k=policy["reference_top_k"])
 
     session_summaries_text = ""
@@ -1789,6 +1807,7 @@ def _prepare_prompt_sync(session_id: str, prompt_message: str, measure_tokens=No
     return {
         "mode": mode,
         "messages": messages,
+        "recent_bot_replies": recent_bot_replies_full,
         "time_note": time_note_str,
         "few_shot_examples": few_shot_examples,
         "few_shot_block": few_shot_block,
@@ -1856,7 +1875,9 @@ async def generate_reply(session_id: str, prompt_message: str, history_message: 
 
     # Fix 1: Let the model write its own opener by default (no pre-fill on first attempt).
     # Opener pre-fill is reserved as a fallback only if regeneration is required.
-    recent_bot_replies = [h.get("content", "") for h in prep["messages"] if h.get("role") == "assistant"]
+    recent_bot_replies = prep.get("recent_bot_replies") or [
+        h.get("content", "") for h in prep["messages"] if h.get("role") == "assistant"
+    ]
     profile.pop("prefill_opener", None)
 
     raw_reply = await _call_npu_once(prep["messages"], options=profile)
@@ -1891,8 +1912,15 @@ async def generate_reply(session_id: str, prompt_message: str, history_message: 
             raw_reply = resampled_raw
             still_valid, still_reason = validate_reply(bot_reply, recent_bot_replies, session_bans)
             if not still_valid:
-                print(f"[decode_guard] Fallback retry still failed ({still_reason}). Using clean grounded reaction.")
-                bot_reply = get_clean_fallback(prompt_message, recent_bot_replies, session_bans)
+                hard_failure = not (
+                    still_reason.startswith("fatigued_opener:")
+                    or still_reason == "fatigued_ngram"
+                )
+                if hard_failure:
+                    print(f"[decode_guard] Fallback retry still failed ({still_reason}). Using clean grounded reaction.")
+                    bot_reply = get_clean_fallback(prompt_message, recent_bot_replies, session_bans)
+                else:
+                    print(f"[decode_guard] Keeping retry reply despite soft guard ({still_reason}).")
         except Exception as e:
             print(f"[decode_guard] single-retry regeneration failed: {e}")
             bot_reply = get_clean_fallback(prompt_message, recent_bot_replies, session_bans)
@@ -2012,7 +2040,7 @@ async def chat(payload: ChatRequest, key_info: dict = Depends(verify_api_key)):
 
     if payload.attachments:
         for att in payload.attachments:
-            data_b64 = att.get("data", "")
+            data_b64 = att.get("base64") or att.get("data") or ""
             if len(data_b64) > (MAX_UPLOAD_BYTES * 4 // 3):
                 raise HTTPException(status_code=413, detail=f"Attachment '{att.get('name', 'file')}' exceeds 10MB limit")
         extracted_parts = await asyncio.gather(*[
@@ -2468,7 +2496,7 @@ async def websocket_chat(websocket: WebSocket, session_id: str = Query("default"
                 if attachments:
                     oversized = False
                     for att in attachments:
-                        data_b64 = att.get("data", "")
+                        data_b64 = att.get("base64") or att.get("data") or ""
                         if len(data_b64) > (MAX_UPLOAD_BYTES * 4 // 3):
                             oversized = True
                             break

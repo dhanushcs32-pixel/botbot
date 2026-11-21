@@ -675,8 +675,8 @@ async def chat(payload: ChatRequest):
     top_k = 20
     rep_penalty = 1.05
 
+    opts = payload.options or {}
     if payload.options:
-        opts = payload.options
         if "num_predict" in opts:
             config.max_new_tokens = int(opts["num_predict"])
             
@@ -755,6 +755,8 @@ async def chat(payload: ChatRequest):
         while tok_est > max_allowed_prompt and len(messages) > 2:
             messages.pop(1)
             prompt = _format_chatml(messages)
+            if prefill:
+                prompt = prompt + f"{prefill} "
             tok_est = estimate_tokens(prompt)
             if tok_est is None:
                 tok_est = len(prompt) // 3
@@ -765,6 +767,8 @@ async def chat(payload: ChatRequest):
         if len(messages[-1].get("content", "")) > excess_chars:
             messages[-1]["content"] = messages[-1]["content"][:-excess_chars] + " [truncated]"
             prompt = _format_chatml(messages)
+            if prefill:
+                prompt = prompt + f"{prefill} "
 
     # For Qwen3-4B-Instruct-2507, <think> is not in the model vocabulary or chat template.
     # Non-existent <think> injection is disabled to prevent tokenizer fragmentation.

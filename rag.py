@@ -472,10 +472,9 @@ _style_cache = {"mtime": None, "content": ""}
 
 def get_style_profile() -> str:
     """Reads the user's personality template to shape the bot's behavior."""
-    base_dir = Path(__file__).parent
-    style_path = base_dir / "personal_data" / "my_style.txt"
+    style_path = PERSONAL_DATA_DIR / "my_style.txt"
     if not style_path.exists():
-        style_path = base_dir / "personal_data" / "my_style_template.txt"
+        style_path = MY_STYLE_PATH
     
     if not style_path.exists():
         print(f"[warning] Style profile not found at {style_path}")
@@ -994,8 +993,8 @@ def search_reference_data(query: str, top_k: int = 3) -> str:
     tagged = [f"[{build_reference_excerpt_label(meta)}]\n{doc}" for doc, meta in zip(clean_docs[:3], clean_metas[:3])]
     combined = "\n---\n".join(tagged)
     words = combined.split()
-    if len(words) > 120:
-        combined = " ".join(words[:120]) + "..."
+    if len(words) > 350:
+        combined = " ".join(words[:350]) + "..."
     return combined
 
 
@@ -1540,6 +1539,11 @@ def search_personal_data(query: str, top_k: int = 6, max_result_chars: int = MAX
     if not documents:
         return ""
 
+    sim_by_doc = {
+        d: max(0.0, 1.0 - dist)
+        for d, dist in zip(documents, distances)
+    } if distances else {}
+
     if distances:
         best_distance = min(distances)
         margin = max(best_distance * 0.5, 0.15)
@@ -1580,8 +1584,7 @@ def search_personal_data(query: str, top_k: int = 6, max_result_chars: int = MAX
     # Phase 5: Score, filter, and cap personal memories
     candidates = []
     for i, (doc, meta) in enumerate(zip(documents, metadatas)):
-        dist = distances[i] if distances and i < len(distances) else 0.5
-        sim_score = max(0.0, 1.0 - dist)
+        sim_score = sim_by_doc.get(doc, max(0.35, 0.80 - 0.05 * i))
         candidates.append({"doc": doc, "meta": meta, "sim_score": sim_score})
 
     filtered_cands = score_and_filter_memories(candidates, query=query, max_items=3, max_words=120)
@@ -1591,8 +1594,9 @@ def search_personal_data(query: str, top_k: int = 6, max_result_chars: int = MAX
     from time_utils import format_memory_dates_for_retrieval
     item_texts = []
     for cand in filtered_cands:
+        label = build_excerpt_label(cand.get("meta"))
         doc_text = format_memory_dates_for_retrieval(cand["doc"].strip())
-        item_texts.append(doc_text)
+        item_texts.append(f"[{label}]\n{doc_text}")
 
     return format_background_facts(item_texts)
 

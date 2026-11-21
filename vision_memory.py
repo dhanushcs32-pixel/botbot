@@ -24,13 +24,21 @@ from PIL import Image, ImageOps
 # Base directories
 BASE_DIR = Path(__file__).resolve().parent
 PERSONAL_DATA_DIR = Path(os.getenv("PERSONAL_DATA_DIR", BASE_DIR / "personal_data"))
-DB_PATH = Path(os.getenv("DB_PATH", PERSONAL_DATA_DIR / "memory.db"))
+if "DB_PATH" in os.environ:
+    DB_PATH = Path(os.environ["DB_PATH"])
+elif os.environ.get("USE_TEST_DB", "0").lower() in ("1", "true", "yes"):
+    DB_PATH = BASE_DIR / "test.db"
+else:
+    DB_PATH = PERSONAL_DATA_DIR / "memory.db"
 SAVED_IMAGES_DIR = PERSONAL_DATA_DIR / "saved_images"
 FACES_DIR = PERSONAL_DATA_DIR / "faces"
 
 # Ensure directories exist
-SAVED_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
-FACES_DIR.mkdir(parents=True, exist_ok=True)
+try:
+    SAVED_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+    FACES_DIR.mkdir(parents=True, exist_ok=True)
+except (PermissionError, OSError):
+    pass
 
 # Common non-name words to exclude from natural-language tagging
 EXCLUDED_WORDS = {
@@ -84,7 +92,10 @@ def _init_db(db_path: Path = DB_PATH) -> None:
 
 
 # Run DB initialization
-_init_db(DB_PATH)
+try:
+    _init_db(DB_PATH)
+except (PermissionError, OSError, sqlite3.OperationalError) as e:
+    print(f"[vision] Deferred DB init ({e})")
 
 
 def get_mirage():
@@ -112,6 +123,14 @@ def _run_blip_fallback(pil_image: Image.Image) -> str:
     or returns completely empty data on an unsupported or corrupted image.
     """
     global _blip_processor, _blip_model
+    try:
+        import psutil
+        avail_mb = psutil.virtual_memory().available / (1024 * 1024)
+        if avail_mb < 2000:
+            print(f"[vision] Skipping BLIP fallback: only {avail_mb:.0f} MB RAM available (need >= 2000 MB)")
+            return ""
+    except ImportError:
+        pass
     print("[vision] Mirage unsupported image — falling back to lazy-loaded BLIP")
     if _blip_model is None:
         from transformers import BlipProcessor, BlipForConditionalGeneration

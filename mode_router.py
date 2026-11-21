@@ -384,8 +384,8 @@ RETRIEVAL_POLICY = {
     "supportive": {
         "personal_top_k": 8,
         "personal_max_chars": 8000,
-        "reference": False,
-        "reference_top_k": 0,
+        "reference": True,
+        "reference_top_k": 3,
         "summaries_limit": 8,
     },
     "guidance": {
@@ -540,7 +540,7 @@ FLUID_PERSONA_INSTRUCTION = """You are texting your close friend Dhanush.
 - Speak like a close friend texting casually in normal lowercase text messages (1 short sentence, 8–20 words).
 - Use plain, everyday texting language — skip poetic metaphors.
 - React directly to the specific people, events, or details Dhanush mentioned in the present moment.
-- The person texting you is Dhanush ('you'); you are his friend texting back. Dhanush's background facts belong to him, not to you; never invent unverified past shared meetings or shared memories.
+- The person texting you is Dhanush ('you'); you are his online text companion texting remotely on his phone. You are never physically present with him, never see him or others in person, and never share physical locations; Dhanush's background facts belong to him, not to you.
 - Match Dhanush's energy: warm and steady when he is stressed, casual and playful when bantering."""
 
 
@@ -651,6 +651,19 @@ def get_system_prompt(mode: str, personal_context: str = "", style_profile: str 
             parts.append(
                 f"\n[Background reference context (for context only — do not repeat wording):\n{reference_context}\n]"
             )
+
+    has_any_context = bool(
+        personal_context or reference_context or session_summaries
+        or referenced_session_context or current_session_summary
+    )
+    if sufficiency_state == "insufficient_context_abstain":
+        parts.append(CONTEXT_INSUFFICIENT_ABSTAIN_INSTRUCTION)
+    elif sufficiency_state == "partial_context_hedge_needed":
+        parts.append(CONTEXT_PARTIAL_HEDGE_INSTRUCTION)
+    elif sufficiency_state == "sufficient_to_answer" and has_any_context:
+        parts.append(CONTEXT_SUFFICIENCY_INSTRUCTION)
+    elif sufficiency_state == "no_context" and not has_any_context:
+        parts.append(NO_CONTEXT_INSTRUCTION)
 
     persona_inst = MODE_INSTRUCTIONS.get(mode, FLUID_PERSONA_INSTRUCTION)
     if user_name and user_name != "Dhanush" and "Dhanush" in persona_inst:
@@ -806,13 +819,13 @@ def build_structured_plan(
     is_greeting = bool(GREETING_REGEX.search((message or "").strip()))
     if time_bucket == "late night":
         time_posture = "late night soft"
+    elif gap_sec >= 86400:
+        time_posture = "greet after gap"
     elif gap_sec >= 3 * 3600 and is_greeting:
         # Fix 6: greeting after a gap over 3 hours
         time_posture = "greet back, ask how his day went"
     elif gap_sec >= 3 * 3600:
         time_posture = "reconnect after gap"
-    elif gap_sec >= 86400:
-        time_posture = "greet after gap"
     elif is_greeting:
         time_posture = "warm greeting"
     else:
