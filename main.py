@@ -67,6 +67,7 @@ from time_utils import (
 )
 
 ENABLE_TIME_NOTE = os.environ.get("ENABLE_TIME_NOTE", "1").lower() in ("1", "true", "yes")
+USE_FEW_SHOT_IN_PROMPT = os.environ.get("USE_FEW_SHOT_IN_PROMPT", "0").lower() in ("1", "true", "yes")
 from rag import (
     search_personal_data, get_style_profile, keyword_search, search_reference_data,
     is_trivial_message, should_bypass_personal_retrieval, get_known_people,
@@ -79,6 +80,14 @@ from media import process_uploaded_file, decode_app_attachment
 from secret_key import API_KEYS
 from followup import check_and_send_followups
 from tone_reader import orchestrate_turn, ENABLE_LIGHT_ORCHESTRATOR
+from orchestrator import (
+    ENABLE_TWO_PASS_ORCHESTRATOR,
+    should_run_orchestrator,
+    build_strategist_messages,
+    parse_strategy_json,
+    format_strategy_brief,
+    build_repair_messages,
+)
 
 # --- Persistent debug logging --------------------------------------------
 debug_logger = logging.getLogger("botbot.debug")
@@ -509,6 +518,7 @@ def bad_reply(
     # 4. Reject stock phrases
     if STOCK_REGEX.search(reply):
         return True, "stock_phrase"
+
 
     # 5. Cross-turn duplicate / high-overlap check
     if recent_bot_replies:
@@ -959,6 +969,32 @@ def detect_mentioned_session(message: str, known_sessions: list[str], current_se
     return None
 
 
+ROLLUP_IDLE_DELAY_SECONDS = float(os.environ.get("ROLLUP_IDLE_DELAY_SECONDS", "180.0"))
+_rollup_timers: Dict[str, asyncio.Task] = {}
+
+
+def _cancel_pending_rollup(session_id: str) -> None:
+    existing = _rollup_timers.pop(session_id, None)
+    if existing and not existing.done():
+        existing.cancel()
+
+
+def _schedule_debounced_rollup(session_id: str) -> None:
+    _cancel_pending_rollup(session_id)
+
+    async def _delayed():
+        try:
+            await asyncio.sleep(ROLLUP_IDLE_DELAY_SECONDS)
+            await _background_rollup(session_id)
+        except asyncio.CancelledError:
+            return
+        finally:
+            if _rollup_timers.get(session_id) is asyncio.current_task():
+                _rollup_timers.pop(session_id, None)
+
+    _rollup_timers[session_id] = create_background_task(_delayed())
+
+
 async def _background_rollup(session_id: str):
     try:
         await maybe_rollup_session(session_id, summarize_turns_batch, npu_lock)
@@ -1351,12 +1387,52 @@ def extract_input_signals(
     }
 
 
+def _prepare_orchestrator_inputs_sync(session_id: str, prompt_message: str, is_guest: bool = False) -> Dict[str, Any]:
+    """Lightweight CPU prep for Pass 1 strategist (history, time note, signals, known_people names)."""
+    raw_history = get_recent_history(session_id)
+    history = filter_clean_history(raw_history, max_assistant_turns=6)
+    cleaned_input = clean_user_input(prompt_message)
+    merged_message, history, fragment_count = merge_user_fragments(
+        cleaned_input, history, threshold_seconds=120.0
+    )
+    last_user_ts = get_last_user_timestamp(session_id)
+    cur_dt = get_current_time()
+    t_bucket = get_time_bucket(cur_dt.hour)
+    parsed_last = parse_timestamp_safe(last_user_ts) if last_user_ts else None
+    gap_sec = (cur_dt.astimezone(timezone.utc) - parsed_last).total_seconds() if parsed_last else 0.0
+    signals = extract_input_signals(
+        message=merged_message, history=history, gap_seconds=gap_sec,
+        time_bucket=t_bucket, fragment_count=fragment_count
+    )
+    time_note_str = time_note(last_user_ts) if ENABLE_TIME_NOTE else ""
+    from tone_reader import analyze_tone
+    raw_tone = analyze_tone(merged_message, signals=signals)
+    from mode_router import detect_crisis
+    is_crisis = detect_crisis(merged_message)
+    known_people = set()
+    if not is_guest:
+        try:
+            known_people = get_known_people()
+        except Exception:
+            known_people = set()
+    return {
+        "merged_message": merged_message,
+        "history": history,
+        "signals": signals,
+        "time_note": time_note_str,
+        "distress_flag": bool(raw_tone.get("distress_flag", False)),
+        "is_crisis": is_crisis,
+        "known_people": known_people,
+    }
+
+
 def _prepare_prompt_sync(session_id: str, prompt_message: str, measure_tokens=None,
                          history_override=None, is_guest: bool = False, num_predict: int = 250,
-                         now_override: Optional[datetime] = None, last_user_ts_override: Optional[Any] = None):
+                         now_override: Optional[datetime] = None, last_user_ts_override: Optional[Any] = None,
+                         strategy_brief: Optional[Dict[str, Any]] = None):
     # Fetch recent history early so Laya routing has conversational context if needed
     raw_history = (history_override if history_override is not None
-                   else get_recent_history(session_id))
+                   else get_recent_history(session_id, now_dt=now_override))
     recent_bot_replies_full = [
         h.get("content", "") for h in raw_history if h.get("role") == "assistant" and h.get("content")
     ][-8:]
@@ -1386,6 +1462,9 @@ def _prepare_prompt_sync(session_id: str, prompt_message: str, measure_tokens=No
     else:
         gap_sec = 0.0
 
+    # Fresh session window when memory.py trimmed stale >6h turns
+    is_fresh_session_window = (history_override is None and len(history) == 0)
+
     # Phase 6: Input signals
     signals = extract_input_signals(
         message=prompt_message,
@@ -1409,7 +1488,7 @@ def _prepare_prompt_sync(session_id: str, prompt_message: str, measure_tokens=No
     # Phase 4 & 7: Dynamic Few-Shot Retrieval (Anti-Echo, Diversity Filtered, Tone Conditioned)
     few_shot_examples = []
     few_shot_block = ""
-    if ENABLE_DYNAMIC_FEW_SHOT:
+    if ENABLE_DYNAMIC_FEW_SHOT and USE_FEW_SHOT_IN_PROMPT:
         few_shot_examples = retrieve_few_shot_examples(
             prompt_message, recent_history=history, k=4, tone_condition=tone_condition
         )
@@ -1436,11 +1515,19 @@ def _prepare_prompt_sync(session_id: str, prompt_message: str, measure_tokens=No
         else:
             mode = chosen_profile if ENABLE_LIGHT_ORCHESTRATOR else laya_routing["mode"]
 
+    if strategy_brief:
+        if is_crisis or distress_flag:
+            mode = "supportive"
+        elif strategy_brief.get("mode") in ("supportive", "guidance", "conversational"):
+            mode = strategy_brief["mode"]
+
     policy = get_retrieval_policy(mode)
 
-    # Phase 4 & 7: Structured Positive Plan
+    # Phase 4 & 7 / Step 2: Dynamic Strategy Brief or fallback Structured Plan
     structured_plan = ""
-    if ENABLE_STRUCTURED_PLAN:
+    if strategy_brief and strategy_brief.get("parse_ok"):
+        structured_plan = format_strategy_brief(strategy_brief, session_bans=_SESSION_BANS.get(session_id, set()))
+    elif ENABLE_STRUCTURED_PLAN:
         structured_plan = build_structured_plan(
             mode=mode,
             message=prompt_message,
@@ -1452,31 +1539,55 @@ def _prepare_prompt_sync(session_id: str, prompt_message: str, measure_tokens=No
             session_bans=_SESSION_BANS.get(session_id, set())
         )
 
-    # 2. Phase 5: Fast Retrieval Gate + Legacy bypass checks
-    bypass_retrieval = (
-        is_guest or
-        (not signals["needs_retrieval"]) or
-        should_bypass_personal_retrieval(prompt_message, laya_routing=laya_routing)
-    )
-    context_lookup_attempted = not bypass_retrieval
-
+    # 2. Surgical On-Demand Retrieval (driven by Pass 1 brief when available)
     personal_context = ""
     reference_context = ""
-    if not is_guest:
+    if strategy_brief and strategy_brief.get("parse_ok") and not is_guest:
+        ret_cfg = strategy_brief.get("retrieval") or {}
+        target_person = (ret_cfg.get("target_person") or "").strip()
+        personal_q = (ret_cfg.get("personal_query") or "").strip()
+        if target_person and target_person.lower() not in personal_q.lower():
+            personal_q = f"{target_person} {personal_q}".strip()
+        explicit_personal = False
+        try:
+            from rag import detect_mentioned_person, parse_date_reference
+            kp = get_known_people()
+            if detect_mentioned_person(prompt_message, kp) is not None or parse_date_reference(prompt_message) is not None:
+                explicit_personal = True
+        except Exception:
+            pass
+        context_lookup_attempted = bool(ret_cfg.get("need_personal_chats") or explicit_personal)
         if context_lookup_attempted:
             personal_context = search_personal_data(
-                prompt_message,
+                personal_q or prompt_message,
                 top_k=policy["personal_top_k"],
                 max_result_chars=policy["personal_max_chars"]
             )
-        if policy["reference"]:
-            is_explicit_ref = any(
-                kw in prompt_message.lower()
-                for kw in ("book", "document", "technique", "therapy", "cbt", "act", "reference", "manual", "chapter", "quote", "according to")
-            )
-            is_substantial = len(prompt_message.split()) >= 4 or is_crisis or distress_flag
-            if is_explicit_ref or (mode in ("supportive", "guidance") and is_substantial):
-                reference_context = search_reference_data(prompt_message, top_k=policy["reference_top_k"])
+        if ret_cfg.get("need_therapy_ref") or is_crisis:
+            ref_q = (ret_cfg.get("therapy_query") or prompt_message).strip()
+            reference_context = search_reference_data(ref_q, top_k=max(3, policy.get("reference_top_k", 3)))
+    else:
+        bypass_retrieval = (
+            is_guest or
+            (not signals["needs_retrieval"]) or
+            should_bypass_personal_retrieval(prompt_message, laya_routing=laya_routing)
+        )
+        context_lookup_attempted = not bypass_retrieval
+        if not is_guest:
+            if context_lookup_attempted:
+                personal_context = search_personal_data(
+                    prompt_message,
+                    top_k=policy["personal_top_k"],
+                    max_result_chars=policy["personal_max_chars"]
+                )
+            if policy["reference"]:
+                is_explicit_ref = any(
+                    kw in prompt_message.lower()
+                    for kw in ("book", "document", "technique", "therapy", "cbt", "act", "reference", "manual", "chapter", "quote", "according to")
+                )
+                is_substantial = len(prompt_message.split()) >= 4 or is_crisis or distress_flag
+                if is_explicit_ref or (mode in ("supportive", "guidance") and is_substantial):
+                    reference_context = search_reference_data(prompt_message, top_k=policy["reference_top_k"])
 
     session_summaries_text = ""
     referenced_session_context = ""
@@ -1488,12 +1599,19 @@ def _prepare_prompt_sync(session_id: str, prompt_message: str, measure_tokens=No
                 "remember", "talked about", "earlier", "last time", "yesterday", "we said", "we talked", "recall"
             )
             summaries_limit = policy["summaries_limit"]
+            summary_query = prompt_message
+            if strategy_brief and strategy_brief.get("parse_ok"):
+                ret_cfg = strategy_brief.get("retrieval") or {}
+                if ret_cfg.get("need_past_sessions"):
+                    summaries_limit = max(summaries_limit, 3)
+                    if ret_cfg.get("session_query"):
+                        summary_query = ret_cfg["session_query"]
             if summaries_limit == 0 and any(kw in prompt_message.lower() for kw in MEMORY_RECALL_KEYWORDS):
                 summaries_limit = 3
 
             is_bot_feedback = any(p in prompt_message.lower() for p in ("u just started", "you just started", "going crazy", "werent there", "weren't there", "not helping"))
-            summaries = [] if is_bot_feedback else get_recent_summaries(
-                exclude_session_id=session_id, limit=summaries_limit, query=prompt_message
+            summaries = [] if (is_bot_feedback or summaries_limit <= 0) else get_recent_summaries(
+                exclude_session_id=session_id, limit=summaries_limit, query=summary_query
             )
             session_summaries_text = "\n".join(f"- {s}" for s in summaries) if summaries else ""
 
@@ -1515,7 +1633,7 @@ def _prepare_prompt_sync(session_id: str, prompt_message: str, measure_tokens=No
     # must not be shaped by it (or see its contents echoed back).
     style_profile = "" if is_guest else get_style_profile()
 
-    current_session_summary = get_current_session_summary(session_id) or ""
+    current_session_summary = "" if is_fresh_session_window else (get_current_session_summary(session_id) or "")
 
     # 3. Assess context sufficiency via Laya typed decisions BEFORE attaching static links.
     # The judge must see EVERYTHING the model is allowed to answer from
@@ -1812,6 +1930,7 @@ def _prepare_prompt_sync(session_id: str, prompt_message: str, measure_tokens=No
         "few_shot_examples": few_shot_examples,
         "few_shot_block": few_shot_block,
         "structured_plan": structured_plan,
+        "strategy_brief": strategy_brief,
         "last_user_ts": last_user_ts,
         "signals": signals,
         "raw_tone_scores": raw_tone_scores,
@@ -1844,6 +1963,8 @@ async def generate_reply(session_id: str, prompt_message: str, history_message: 
     if history_message is None:
         history_message = prompt_message
 
+    _cancel_pending_rollup(session_id)
+
     # Idempotency check: prevent duplicate sends within 10s window on identical prompt
     now_ts = time.time()
     cached = _IDEMPOTENCY_CACHE.get(session_id)
@@ -1861,15 +1982,74 @@ async def generate_reply(session_id: str, prompt_message: str, history_message: 
     last_ts = get_last_user_timestamp(session_id)
     g_sec = (cur_dt.astimezone(timezone.utc) - parse_timestamp_safe(last_ts)).total_seconds() if last_ts else 0.0
 
+    # Step 2 — Pass 1: Dynamic NPU Strategist (skipped on trivial greetings/signoffs)
+    strategy_brief = None
+    if ENABLE_TWO_PASS_ORCHESTRATOR:
+        orch_in = await asyncio.to_thread(
+            _prepare_orchestrator_inputs_sync, session_id, prompt_message, is_guest
+        )
+        if should_run_orchestrator(
+            orch_in["merged_message"],
+            signals=orch_in["signals"],
+            distress_flag=orch_in["distress_flag"],
+            is_crisis=orch_in["is_crisis"],
+            known_people=orch_in["known_people"],
+        ):
+            strat_msgs = build_strategist_messages(
+                user_message=orch_in["merged_message"],
+                recent_history=orch_in["history"],
+                time_note_str=orch_in["time_note"],
+                known_people=orch_in["known_people"],
+                is_crisis=orch_in["is_crisis"],
+                distress_flag=orch_in["distress_flag"],
+            )
+            try:
+                raw_strat = await _call_npu_once(
+                    strat_msgs,
+                    num_predict=180,
+                    options={
+                        "num_predict": 180,
+                        "temperature": 0.15,
+                        "top_p": 0.85,
+                        "repeat_penalty": 1.05,
+                        "repetition_penalty": 1.05,
+                    },
+                )
+                strategy_brief = parse_strategy_json(
+                    raw_strat,
+                    fallback_mode="supportive" if (orch_in["is_crisis"] or orch_in["distress_flag"]) else "conversational",
+                    is_crisis=orch_in["is_crisis"],
+                    distress_flag=orch_in["distress_flag"],
+                )
+                debug_log(
+                    f"[orchestrator] pass1 ok={strategy_brief['parse_ok']} mode={strategy_brief['mode']} "
+                    f"stance={strategy_brief['stance']} depth={strategy_brief['depth']} "
+                    f"ret={strategy_brief['retrieval']}"
+                )
+                if not strategy_brief["parse_ok"]:
+                    debug_log(f"[orchestrator] pass1 raw_preview={raw_strat[:240]!r}")
+            except Exception as e:
+                debug_log(f"[orchestrator] pass1 failed ({e}); continuing with standard path")
+
     prep = await asyncio.to_thread(
         _prepare_prompt_sync, session_id, prompt_message,
-        _measure_prompt_tokens_sync, None, is_guest)
+        _measure_prompt_tokens_sync, None, is_guest, 250, None, None, strategy_brief)
 
     mode = prep["mode"]
     is_crisis = prep.get("is_crisis", False)
+    distress_flag = prep.get("distress_flag", False)
+    msg_words = len(prompt_message.split())
+    if strategy_brief and strategy_brief.get("depth") in ("brief", "medium", "deep"):
+        depth = strategy_brief["depth"]
+    elif is_crisis or distress_flag or mode in ("supportive", "guidance") or msg_words >= 18:
+        depth = "deep"
+    elif msg_words <= 3 or mode == "short":
+        depth = "brief"
+    else:
+        depth = "medium"
 
     # Named sampling profile based on mode, user turn length, and positive time cues (Phase 2 & 3)
-    profile = get_sampling_profile(mode, prompt_message, time_bucket=t_bucket, gap_sec=g_sec)
+    profile = get_sampling_profile(mode, prompt_message, time_bucket=t_bucket, gap_sec=g_sec, depth=depth)
     if mode in ("guidance", "coding") and profile.get("num_predict", 160) < 320:
         profile["num_predict"] = 320
 
@@ -1885,44 +2065,49 @@ async def generate_reply(session_id: str, prompt_message: str, history_message: 
         scrub_reply, raw_reply, session_id=session_id, mode=mode, is_crisis=is_crisis, prompt_message=prompt_message
     )
 
-    # Post-generation validation & single-retry regeneration (Phase 2, Step 2 & Fix 1/3)
+    # Post-generation validation & Dynamic NPU Repair Pass (Step 2)
     is_valid, invalid_reason = validate_reply(bot_reply, recent_bot_replies, session_bans)
     if not is_valid:
         global regeneration_count
         regeneration_count += 1
-        print(f"[decode_guard] Validation failed ({invalid_reason}) on session '{session_id}'. Regenerating once with fallback profile & opener...")
-        fallback_profile = dict(profile)
-        fallback_profile["temperature"] = round(min(1.0, fallback_profile.get("temperature", 0.55) + 0.15), 2)
-        fallback_profile["repeat_penalty"] = 1.12
-        fallback_profile["repetition_penalty"] = 1.12
-
-        # Pick fallback opener by message type (Fix 1)
-        from mode_router import detect_message_type
-        msg_type = detect_message_type(prompt_message)
-        fallback_opener = pick_opener(recent_bot_replies, profile=mode, message_type=msg_type)
-        fallback_profile["prefill_opener"] = fallback_opener
-
+        debug_log(f"[decode_guard] Validation failed ({invalid_reason}) on session '{session_id}' draft={bot_reply[:120]!r}. Running grounded NPU repair pass...")
+        repair_profile = dict(profile)
+        repair_profile.pop("prefill_opener", None)
+        repair_profile["temperature"] = 0.35
+        repair_profile["top_p"] = 0.85
+        repair_profile["repeat_penalty"] = 1.12
+        repair_profile["repetition_penalty"] = 1.12
         import random
-        fallback_profile["rng_seed"] = random.randrange(2**31)
+        repair_profile["rng_seed"] = random.randrange(2**31)
+        hist_for_repair = [m for m in prep["messages"][1:-1] if m.get("role") in ("user", "assistant")]
+        repair_msgs = build_repair_messages(
+            user_message=prompt_message,
+            failed_draft=bot_reply,
+            reason=invalid_reason,
+            strategy_brief=strategy_brief,
+            recent_history=hist_for_repair,
+        )
         try:
-            resampled_raw = await _call_npu_once(prep["messages"], options=fallback_profile)
-            bot_reply = await asyncio.to_thread(
-                scrub_reply, resampled_raw, session_id=session_id, mode=mode, is_crisis=is_crisis, prompt_message=prompt_message
+            repaired_raw = await _call_npu_once(repair_msgs, options=repair_profile)
+            repaired_reply = await asyncio.to_thread(
+                scrub_reply, repaired_raw, session_id=session_id, mode=mode, is_crisis=is_crisis, prompt_message=prompt_message
             )
-            raw_reply = resampled_raw
+            if repaired_reply:
+                bot_reply = repaired_reply
+                raw_reply = repaired_raw
             still_valid, still_reason = validate_reply(bot_reply, recent_bot_replies, session_bans)
             if not still_valid:
-                hard_failure = not (
-                    still_reason.startswith("fatigued_opener:")
-                    or still_reason == "fatigued_ngram"
-                )
+                hard_failure = still_reason in (
+                    "empty_reply", "empty_or_too_short", "loop_or_stutter",
+                    "physical_claim", "stock_phrase", "attractor_phrase", "timestamp_leak"
+                ) or still_reason.startswith("banned_phrase:")
                 if hard_failure:
-                    print(f"[decode_guard] Fallback retry still failed ({still_reason}). Using clean grounded reaction.")
+                    debug_log(f"[decode_guard] Dynamic repair still hit hard guard ({still_reason}). Falling back safely.")
                     bot_reply = get_clean_fallback(prompt_message, recent_bot_replies, session_bans)
                 else:
-                    print(f"[decode_guard] Keeping retry reply despite soft guard ({still_reason}).")
+                    debug_log(f"[decode_guard] Keeping dynamically repaired reply despite soft guard ({still_reason}).")
         except Exception as e:
-            print(f"[decode_guard] single-retry regeneration failed: {e}")
+            debug_log(f"[decode_guard] dynamic repair failed: {e}")
             bot_reply = get_clean_fallback(prompt_message, recent_bot_replies, session_bans)
 
     # Repetition recovery: Only trigger if the reply contains an actual hardware token stutter
@@ -2015,6 +2200,7 @@ async def generate_reply(session_id: str, prompt_message: str, history_message: 
             "laya_rag_filtered_count": prep.get("laya_rag_filtered_count", 0),
             "laya_sufficiency_decision": prep.get("sufficiency_state", "no_context"),
             "laya_sufficiency_confidence": prep.get("laya_sufficiency", {}).get("confidence", 0.0),
+            "strategy_brief": prep.get("strategy_brief"),
             "laya_latency_ms": round(
                 prep.get("laya_routing", {}).get("latency_ms", 0.0)
                 + prep.get("laya_sufficiency", {}).get("latency_ms", 0.0),
@@ -2025,7 +2211,7 @@ async def generate_reply(session_id: str, prompt_message: str, history_message: 
         print(f"[sufficiency_log] error, skipping: {e}")
 
     await asyncio.to_thread(save_turn, session_id, history_message, bot_reply, mode)
-    create_background_task(_background_rollup(session_id))
+    _schedule_debounced_rollup(session_id)
 
     _IDEMPOTENCY_CACHE[session_id] = (prompt_message, bot_reply, time.time())
     return bot_reply, mode

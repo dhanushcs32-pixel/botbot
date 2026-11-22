@@ -571,7 +571,37 @@ def deduplicate_assistant_turns(turns: list[dict]) -> list[dict]:
     return filtered
 
 
-def get_recent_history(session_id: str, limit: int = 40, max_tokens: int = 2200, min_turns: int = 24) -> list[dict]:
+def _trim_history_at_session_gap(
+    turns: list[dict],
+    max_gap_hours: float = 6.0,
+    now_dt: Optional[datetime] = None,
+) -> list[dict]:
+    """
+    Enforces a persistent temporal session boundary so stale turns from earlier
+    sessions (>= max_gap_hours ago) cannot resurrect on Turn 2 and poison context.
+    """
+    if not turns or not max_gap_hours or max_gap_hours <= 0:
+        return turns
+    from time_utils import parse_timestamp_safe
+    cutoff_sec = float(max_gap_hours) * 3600.0
+    ref_now = now_dt.astimezone(timezone.utc) if now_dt else datetime.now(timezone.utc)
+
+    last_ts = parse_timestamp_safe(turns[-1].get("timestamp"))
+    if last_ts is not None and (ref_now - last_ts).total_seconds() >= cutoff_sec:
+        return []
+
+    keep_from = 0
+    for idx in range(len(turns) - 1, 0, -1):
+        curr_ts = parse_timestamp_safe(turns[idx].get("timestamp"))
+        prev_ts = parse_timestamp_safe(turns[idx - 1].get("timestamp"))
+        if curr_ts is not None and prev_ts is not None:
+            if (curr_ts - prev_ts).total_seconds() >= cutoff_sec:
+                keep_from = idx
+                break
+    return turns[keep_from:]
+
+
+def get_recent_history(session_id: str, limit: int = 40, max_tokens: int = 2200, min_turns: int = 24, max_gap_hours: float = 6.0, now_dt: Optional[datetime] = None) -> list[dict]:
     """
     Returns recent turns formatted for direct use in the OpenVINO NPU messages array.
     Preserves recent prompt history (at least min_turns, up to limit) directly from
@@ -607,6 +637,7 @@ def get_recent_history(session_id: str, limit: int = 40, max_tokens: int = 2200,
 
     selected.reverse()  # chronological order
     turns = [{"role": role, "content": content, "timestamp": ts} for role, content, ts in selected]
+    turns = _trim_history_at_session_gap(turns, max_gap_hours=max_gap_hours, now_dt=now_dt)
     return filter_clean_history(turns, max_assistant_turns=6)
 
 

@@ -86,8 +86,7 @@ ADAPTER_ALPHA = LORA_ALPHA
 CACHE_DIR = "./.npu_cache"
 os.makedirs(CACHE_DIR, exist_ok=True)
 
-# Dynamic selection: 4B if present, else 7B
-MODEL_DIR = "./qwen-4b-int4-ov" if os.path.isdir("./qwen-4b-int4-ov") else "./qwen2.5-7b-instruct-int4-ov"
+MODEL_DIR = "./qwen-4b-int4-ov"
 
 lora_active = False
 _cached_adapter = None
@@ -143,6 +142,11 @@ def _load_adapter_config(model_dir: str):
 
     LORA_ALPHA = float(os.getenv("LORA_ALPHA", "0.0"))
     ADAPTER_ALPHA = LORA_ALPHA
+
+    if LORA_ALPHA <= 0.0:
+        print(f"[LoRA] LORA_ALPHA={LORA_ALPHA} <= 0.0 — skipping adapter attachment completely (pure base model).")
+        lora_active = False
+        return None
 
     hidden_size = _get_model_hidden_size(model_dir)
     if not os.path.isfile(ADAPTER_PATH):
@@ -319,19 +323,11 @@ def startup_event():
     global pipe, loaded_model_path, effective_max_prompt_len, adapter_config
     
     selected_path = MODEL_DIR
-    selected_name = "Qwen 4B INT4" if "4b" in selected_path.lower() else "Qwen 2.5 7B"
+    selected_name = "Qwen 4B INT4"
     
     if not os.path.isdir(selected_path):
-        # Fallback check if preferred model directory is missing
-        if os.path.isdir("./qwen2.5-7b-instruct-int4-ov"):
-            selected_path = "./qwen2.5-7b-instruct-int4-ov"
-            selected_name = "Qwen 2.5 7B"
-        elif os.path.isdir("./qwen-4b-int4-ov"):
-            selected_path = "./qwen-4b-int4-ov"
-            selected_name = "Qwen 4B INT4"
-        else:
-            print(f"ERROR: Neither 4B nor 7B model directory found.")
-            return
+        print(f"ERROR: 4B model directory '{selected_path}' not found.")
+        return
 
     # Ensure adapter_config matches selected_path
     adapter_config = _load_adapter_config(selected_path)

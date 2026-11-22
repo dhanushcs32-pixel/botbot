@@ -1205,13 +1205,21 @@ REACTIVE_PHRASES = {
     "makes sense", "fair enough", "no worries", "all good", "you too", "u too"
 }
 
+SIGNOFF_REGEX = re.compile(
+    r"(?i)\b(?:talk to (?:u|you) later|ttyl|catch (?:u|you|ya) later|see (?:u|you|ya) later|"
+    r"gotta go|gtg|brb|be right back|heading to (?:bed|sleep)|going to sleep|im gone|i'?m gone|msg (?:u|you) later)\b"
+)
+
 
 def should_retrieve(message: str, signals: dict | None = None) -> bool:
     """
-    Fast Retrieval Gate (Phase 5):
-    Determines whether the incoming message warrants personal/reference RAG retrieval.
-    Returns False (skip retrieval) for short reactive turns (<= 3 words with no named entities/queries),
-    simple greetings, or pure acknowledgments.
+    Strict On-Demand Personal Retrieval Gate:
+    Personal chat archives are ONLY searched when:
+      1. A known person from personal_data is explicitly named, OR
+      2. An explicit calendar date reference is present, OR
+      3. An explicit personal-memory / archive recall phrase is present.
+    Bare '?', generic interrogatives ('what', 'why'), signoffs, and confused
+    meta-questions ('what? what meeting', 'what are you talking abt') NEVER trigger personal RAG.
     """
     if not ENABLE_RETRIEVAL_GATE:
         return True
@@ -1220,24 +1228,31 @@ def should_retrieve(message: str, signals: dict | None = None) -> bool:
     if not msg_clean:
         return False
 
-    # Check for question marks
-    if "?" in msg_clean:
-        return True
-
-    words = re.findall(r"\b\w+\b", msg_clean.lower())
+    msg_lower = msg_clean.lower()
+    words = re.findall(r"\b\w+\b", msg_lower)
     if not words:
         return False
 
     norm_text = " ".join(words)
 
-    # Simple greetings or acknowledgments
-    if norm_text in REACTIVE_OR_GREETING_WORDS or msg_clean.lower() in REACTIVE_OR_GREETING_WORDS:
+    if norm_text in REACTIVE_OR_GREETING_WORDS or msg_lower in REACTIVE_OR_GREETING_WORDS:
         return False
 
     if norm_text in REACTIVE_PHRASES:
         return False
 
-    # Check known people or entities
+    if SIGNOFF_REGEX.search(msg_clean):
+        return False
+
+    # Never search personal chats on confused meta-questions about the bot's own last message
+    CONFUSED_META_REGEX = re.compile(
+        r"(?i)(?:what are (?:u|you) talking|idk (?:what|wht) (?:u|you)(?:'re| are) talking|"
+        r"wdym|what do (?:u|you) mean|what\?\s+what\b|are (?:u|you) hallucinating)"
+    )
+    if CONFUSED_META_REGEX.search(msg_clean):
+        return False
+
+    # 1. Explicit known person mentioned
     try:
         known_people = get_known_people()
     except Exception:
@@ -1246,44 +1261,22 @@ def should_retrieve(message: str, signals: dict | None = None) -> bool:
     if detect_mentioned_person(msg_clean, known_people) is not None:
         return True
 
+    # 2. Explicit date reference
     if parse_date_reference(msg_clean) is not None:
         return True
 
-    # Check interrogatives or memory triggers
-    INTERROGATIVES = {"who", "what", "where", "when", "why", "how", "which", "whose", "remember", "recall"}
-    if any(w in INTERROGATIVES for w in words):
-        return True
-
-    # If <= 3 words and no entities/question, check if it's reactive/trivial words
-    if len(words) <= 3:
-        if all(w in REACTIVE_OR_GREETING_WORDS or len(w) <= 2 for w in words):
-            return False
-        COMMON_REACTIVE_WORDS = REACTIVE_OR_GREETING_WORDS | {
-            "dude", "bro", "man", "mate", "bruh", "omg", "ikr", "idk", "idc", "smh", "tbh",
-            "fr", "frfr", "dead", "welp", "damn", "dang", "aww", "wow", "ooh", "oh", "ah",
-            "really", "totally", "definitely", "maybe", "probably", "actually", "so", "and",
-            "well", "like", "just", "now", "then", "there", "here", "too"
-        }
-        if all(w in COMMON_REACTIVE_WORDS for w in words):
-            return False
-
-    # Check for explicit memory or substantive query indicators
-    MEMORY_TRIGGERS = (
-        "remember", "talked about", "earlier", "last time", "yesterday", "we said",
-        "who is", "what is", "where is", "when did", "how was", "tell me about",
-        "trip", "college", "project", "exam", "doctor", "meeting", "flight"
+    # 3. Explicit personal-memory / archive recall cues (never generic nouns like 'meeting' alone)
+    EXPLICIT_MEMORY_TRIGGERS = (
+        "remember", "recall", "remind me", "talked about", "discussed earlier",
+        "last time", "we said", "did i tell", "did i mention", "did i say",
+        "who is ", "where did i ", "what time is my ", "tell me about my ",
+        "in my chats", "my chats", "my notes", "my journal", "my diary",
+        "trip to ", "doctor appointment", "project deadline", "flight"
     )
-    if any(trig in msg_clean.lower() for trig in MEMORY_TRIGGERS):
-        return True
-
-    # If message is longer (>= 4 words)
-    if len(words) >= 4:
-        if signals and signals.get("is_venting") and not any(trig in msg_clean.lower() for trig in MEMORY_TRIGGERS):
-            return False
+    if any(trig in msg_lower for trig in EXPLICIT_MEMORY_TRIGGERS):
         return True
 
     return False
-
 
 def should_bypass_personal_retrieval(query: str, laya_routing: dict | None = None, known_people: set[str] | None = None) -> bool:
     """
@@ -1314,6 +1307,7 @@ def should_bypass_personal_retrieval(query: str, laya_routing: dict | None = Non
     # Casual check-ins and meta-conversation about the chat itself
     casual_or_meta_phrases = [
         "how r u", "how are you", "how you doing", "hows it going", "how's it going",
+        "what's up", "whats up", "wyd", "wbu", "hbu",
         "u just started", "you just started", "going crazy", "werent there", "weren't there",
         "needed help", "trying to share", "share my difficulties",
     ]

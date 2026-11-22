@@ -23,7 +23,15 @@ from laya_engine import classify_mode_and_retrieval, LAYA_ENABLED, is_laya_avail
 
 
 STOCK_REGEX = re.compile(
-    r"(?i)\b(still here|just here|still with you|here with you|i'?m (?:still|just|always) here|i'?m here for you|not fixing|let me just be|not going anywhere|aah,? i see|aight|quiet breath|quiet presence|stillness|soft breath|soft echo|hold(?:ing)? space|sit with you|sitting with you)\b"
+    r"(?i)(?:"
+    r"\b(?:still here|just here|still with you|here with you|"
+    r"i'?m (?:still|just|always|right) here|i'?m here for you|"
+    r"not fixing|let me just be|not going anywhere|aah,? i see|aight|"
+    r"quiet breath|quiet presence|stillness|soft breath|soft echo|"
+    r"hold(?:ing)? space|sit with you|sitting with you|"
+    r"(?:keep )?breath(?:e|ing) with me|sit in the dark|sit with (?:it|that))\b"
+    r"|(?:^|[.!?,]\s*)i'?m here(?=[.!?,]|$|\s+(?:no judgment|for you|with you|just|bro|man|nope))"
+    r")"
 )
 
 # Curated opener pools by message type & profile (strictly excluding "aight")
@@ -110,7 +118,19 @@ def get_clean_fallback(
 
     user_lower = (user_turn or "").lower()
 
-    if session_bans and any(b in user_lower for b in session_bans):
+    if re.match(r"^(?:hi+|hey+|hello+|yo+|sup|gm|good morning|good evening)\b[!.? ]*$", user_lower.strip()):
+        candidates = [
+            "hey, what's up?",
+            "yo, how's your day going?",
+            "hey, how are things?",
+        ]
+    elif GOODBYE_REGEX.search(user_lower):
+        candidates = [
+            "alright, catch you later.",
+            "cool, talk to you later.",
+            "sounds good, hit me up whenever.",
+        ]
+    elif session_bans and any(b in user_lower for b in session_bans):
         candidates = [
             "got it, my bad on that. what else is on your mind?",
             "fair enough, noted. what are you up to today?",
@@ -386,14 +406,14 @@ RETRIEVAL_POLICY = {
         "personal_max_chars": 8000,
         "reference": True,
         "reference_top_k": 3,
-        "summaries_limit": 8,
+        "summaries_limit": 0,
     },
     "guidance": {
         "personal_top_k": 8,
         "personal_max_chars": 8000,
         "reference": True,
         "reference_top_k": 4,
-        "summaries_limit": 8,
+        "summaries_limit": 0,
     },
 }
 
@@ -458,7 +478,14 @@ SAMPLING_PROFILES = {
 }
 
 
-def get_sampling_profile(mode: str, message: str = "", time_bucket: str = "", gap_sec: float = 0.0) -> dict:
+DEPTH_TOKEN_BUDGETS = {
+    "brief": 90,
+    "medium": 260,
+    "deep": 440,
+}
+
+
+def get_sampling_profile(mode: str, message: str = "", time_bucket: str = "", gap_sec: float = 0.0, depth: Optional[str] = None) -> dict:
     """
     Returns named sampling profile parameters based on behavioral mode, user turn length,
     and positive time cues (e.g. late night softer/shorter profile).
@@ -484,9 +511,24 @@ def get_sampling_profile(mode: str, message: str = "", time_bucket: str = "", ga
     else:
         profile = dict(SAMPLING_PROFILES["casual"])
 
+    if depth and depth in DEPTH_TOKEN_BUDGETS:
+        profile["num_predict"] = DEPTH_TOKEN_BUDGETS[depth]
+    elif "guid" in mode_lower:
+        profile["num_predict"] = DEPTH_TOKEN_BUDGETS["deep"]
+
+    # Lower decode temperature on brief/casual turns to suppress creative-prior confabulation
+    if depth == "brief":
+        profile["temperature"] = round(min(profile.get("temperature", 0.45), 0.42), 2)
+    elif not ("support" in mode_lower or "crisis" in mode_lower or "guid" in mode_lower):
+        profile["temperature"] = round(min(profile.get("temperature", 0.50), 0.48), 2)
+
     # Positive time-behavior profile cues:
-    # Late night hours: prefer softer, slightly shorter responses
-    if time_bucket == "late night":
+    # Late night hours: soften casual/brief turns only; never choke supportive or guidance depth.
+    is_deep_mode = (
+        "support" in mode_lower or "crisis" in mode_lower or "guid" in mode_lower
+        or depth in ("medium", "deep")
+    )
+    if time_bucket == "late night" and not is_deep_mode:
         profile["num_predict"] = min(profile.get("num_predict", 90), 65)
         profile["temperature"] = round(max(0.40, min(profile.get("temperature", 0.60), 0.48)), 2)
 
@@ -536,17 +578,33 @@ Answer the specific part directly supported by the context, and honestly share t
 """
 
 
-FLUID_PERSONA_INSTRUCTION = """You are texting your close friend Dhanush.
-- Speak like a close friend texting casually in normal lowercase text messages (1 short sentence, 8–20 words).
-- Use plain, everyday texting language — skip poetic metaphors.
-- React directly to the specific people, events, or details Dhanush mentioned in the present moment.
-- The person texting you is Dhanush ('you'); you are his online text companion texting remotely on his phone. You are never physically present with him, never see him or others in person, and never share physical locations; Dhanush's background facts belong to him, not to you.
-- Match Dhanush's energy: warm and steady when he is stressed, casual and playful when bantering."""
+GROUNDING_BOUNDARIES = """Identity & factual grounding:
+- You are an offline AI friend running on Dhanush's device — not a human with a physical body, daily errands, commute, neighborhood, or in-person sightings.
+- Never invent fictional daily stories, shopping trips, outings, meetings, or made-up people to fill space.
+- If asked how you are doing or what you are up to, keep it simple, honest, and grounded in the chat, then turn it back to him.
+- Only reference past events, people, or plans explicitly stated in the current conversation or provided context blocks."""
+
+FLUID_PERSONA_INSTRUCTION = f"""You are texting your close friend Dhanush.
+- Speak like a close friend texting naturally in casual, plain everyday language — skip poetic metaphors and therapy clichés.
+- React directly to what Dhanush actually said in the present moment.
+- Match your length naturally to the moment: quick 1-liner for greetings or light banter, fuller response when he opens up or asks something real.
+{GROUNDING_BOUNDARIES}"""
+
+SUPPORTIVE_MODE_INSTRUCTION = f"""You are texting your close friend Dhanush during a tough or stressful moment.
+- Address the specific situation he actually described — skip generic breathing scripts, canned presence slogans, or vague poetic metaphors.
+- Be genuinely grounded and honest: validate what sucks, help him separate facts from catastrophizing, ask a sharp clarifying question if details are missing, or offer concrete next steps when he is spiraling.
+- Take the space the moment needs — whether 2-3 focused sentences or a couple short paragraphs — while sounding like a real friend texting, not a clinical chatbot.
+{GROUNDING_BOUNDARIES}"""
+
+GUIDANCE_MODE_INSTRUCTION = f"""You are texting your close friend Dhanush who is working through a decision, dilemma, or problem.
+- Think clearly and directly about the actual situation he raised — offer honest perspective, gentle pushback if he is spiraling or overlooking something important, and concrete options or clarifying questions.
+- Write with real substance (a few sentences to short paragraphs as needed) in plain, natural friend texting language.
+{GROUNDING_BOUNDARIES}"""
 
 
 MODE_INSTRUCTIONS = {
-    "supportive": FLUID_PERSONA_INSTRUCTION,
-    "guidance": FLUID_PERSONA_INSTRUCTION,
+    "supportive": SUPPORTIVE_MODE_INSTRUCTION,
+    "guidance": GUIDANCE_MODE_INSTRUCTION,
     "conversational": FLUID_PERSONA_INSTRUCTION,
     "followup": """
 You are checking in naturally with your friend based on what you were talking about last. Keep it short, one or two sentences, referencing something specific from your recent conversation.
@@ -559,7 +617,7 @@ Texting guidelines:
 - Use plain, everyday texting language — skip poetic metaphors.
 - When asked about unknown plans or facts, ask to be reminded or say you aren't sure.
 - Warmly greet when the user says hi or checks in.
-- Text strictly in clean, standard horizontal text messages (1–2 sentences).
+- Match reply depth to the conversation: brief for casual check-ins, thorough and thoughtful for heavy or complex topics.
 """
 
 
@@ -649,7 +707,7 @@ def get_system_prompt(mode: str, personal_context: str = "", style_profile: str 
             parts.append(f"\n{reference_context}\n")
         else:
             parts.append(
-                f"\n[Background reference context (for context only — do not repeat wording):\n{reference_context}\n]"
+                f"\n[Background therapy reference — internal clinical lens only; translate any useful principle into plain, grounded friend talk and never quote or lecture like a textbook:\n{reference_context}\n]"
             )
 
     has_any_context = bool(
