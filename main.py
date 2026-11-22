@@ -416,6 +416,21 @@ VALIDATE_LOOP_REPEATED_CLAUSE_REGEX = re.compile(
     r"(\b[\w\']+(?:\s+[\w\']+){0,3}\b)(?:[,.]\s*\1){2,}", re.IGNORECASE
 )
 VALIDATE_TIMESTAMP_LEAK_REGEX = re.compile(r"(?i)(\[now:|you last spoke:|\[gap:|\[plan:)")
+def _normalize_typography(text: str) -> str:
+    """Normalizes typographic punctuation so guards catch Unicode apostrophes/dashes."""
+    if not text:
+        return ""
+    return (
+        text.replace("\u2019", "'")
+            .replace("\u2018", "'")
+            .replace("\u201c", '"')
+            .replace("\u201d", '"')
+            .replace("\u2014", "-")
+            .replace("\u2013", "-")
+            .replace("\u2026", "...")
+    )
+
+
 VALIDATE_NON_PUNCT_REGEX = re.compile(r"[a-zA-Z0-9]")
 
 regeneration_count = 0
@@ -515,8 +530,8 @@ def bad_reply(
         if has_fatigue(reply, banned_ng, n=3):
             return True, "fatigued_ngram"
 
-    # 4. Reject stock phrases
-    if STOCK_REGEX.search(reply):
+    # 4. Reject stock phrases (normalize Unicode apostrophes/quotes first)
+    if STOCK_REGEX.search(_normalize_typography(reply)):
         return True, "stock_phrase"
 
 
@@ -538,8 +553,22 @@ def bad_reply(
     return False, "ok"
 
 
-def validate_reply(
-    text: str,
+def validate_reply(text, *args, **kwargs):
+    """Normalizes typographic punctuation and ensures hard guards beat soft fatigue checks."""
+    _norm_reply = _normalize_typography(text or "")
+    if not _norm_reply.strip():
+        return False, "empty_reply"
+    ok, reason = _validate_reply_core(_norm_reply, *args, **kwargs)
+    is_soft = (not ok) and (
+        reason == "fatigued_ngram" or reason.startswith("fatigued_opener:")
+    )
+    if ok or is_soft:
+        if STOCK_REGEX.search(_norm_reply):
+            return False, "stock_phrase"
+    return ok, reason
+
+
+def _validate_reply_core(text: str,
     recent_bot_replies: Optional[List[str]] = None,
     session_bans: Optional[set] = None
 ) -> tuple[bool, str]:
@@ -971,6 +1000,7 @@ def detect_mentioned_session(message: str, known_sessions: list[str], current_se
 
 ROLLUP_IDLE_DELAY_SECONDS = float(os.environ.get("ROLLUP_IDLE_DELAY_SECONDS", "180.0"))
 _rollup_timers: Dict[str, asyncio.Task] = {}
+_active_generating_sessions: set[str] = set()
 
 
 def _cancel_pending_rollup(session_id: str) -> None:
@@ -981,6 +1011,7 @@ def _cancel_pending_rollup(session_id: str) -> None:
 
 def _schedule_debounced_rollup(session_id: str) -> None:
     _cancel_pending_rollup(session_id)
+    _active_generating_sessions.add(session_id)
 
     async def _delayed():
         try:
@@ -2065,16 +2096,20 @@ async def generate_reply(session_id: str, prompt_message: str, history_message: 
         scrub_reply, raw_reply, session_id=session_id, mode=mode, is_crisis=is_crisis, prompt_message=prompt_message
     )
 
-    # Post-generation validation & Dynamic NPU Repair Pass (Step 2)
+    # Post-generation mechanical guard only (let the model breathe; never overwrite real replies with canned fallbacks)
     is_valid, invalid_reason = validate_reply(bot_reply, recent_bot_replies, session_bans)
-    if not is_valid:
+    is_mechanical_failure = (not is_valid) and (
+        invalid_reason in ("empty_reply", "empty_or_too_short", "loop_or_stutter", "timestamp_leak")
+        or invalid_reason.startswith("banned_phrase:")
+    )
+    if is_mechanical_failure:
         global regeneration_count
         regeneration_count += 1
-        debug_log(f"[decode_guard] Validation failed ({invalid_reason}) on session '{session_id}' draft={bot_reply[:120]!r}. Running grounded NPU repair pass...")
+        debug_log(f"[decode_guard] Mechanical failure ({invalid_reason}) on session '{session_id}' draft={bot_reply[:120]!r}. Running dynamic NPU repair...")
         repair_profile = dict(profile)
         repair_profile.pop("prefill_opener", None)
-        repair_profile["temperature"] = 0.35
-        repair_profile["top_p"] = 0.85
+        repair_profile["temperature"] = 0.45
+        repair_profile["top_p"] = 0.90
         repair_profile["repeat_penalty"] = 1.12
         repair_profile["repetition_penalty"] = 1.12
         import random
@@ -2092,23 +2127,15 @@ async def generate_reply(session_id: str, prompt_message: str, history_message: 
             repaired_reply = await asyncio.to_thread(
                 scrub_reply, repaired_raw, session_id=session_id, mode=mode, is_crisis=is_crisis, prompt_message=prompt_message
             )
-            if repaired_reply:
+            if repaired_reply and repaired_reply.strip():
                 bot_reply = repaired_reply
                 raw_reply = repaired_raw
-            still_valid, still_reason = validate_reply(bot_reply, recent_bot_replies, session_bans)
-            if not still_valid:
-                hard_failure = still_reason in (
-                    "empty_reply", "empty_or_too_short", "loop_or_stutter",
-                    "physical_claim", "stock_phrase", "attractor_phrase", "timestamp_leak"
-                ) or still_reason.startswith("banned_phrase:")
-                if hard_failure:
-                    debug_log(f"[decode_guard] Dynamic repair still hit hard guard ({still_reason}). Falling back safely.")
-                    bot_reply = get_clean_fallback(prompt_message, recent_bot_replies, session_bans)
-                else:
-                    debug_log(f"[decode_guard] Keeping dynamically repaired reply despite soft guard ({still_reason}).")
         except Exception as e:
             debug_log(f"[decode_guard] dynamic repair failed: {e}")
-            bot_reply = get_clean_fallback(prompt_message, recent_bot_replies, session_bans)
+
+    # Only fall back if the model genuinely returned nothing (e.g., NPU error)
+    if not (bot_reply or "").strip():
+        bot_reply = "hey, my brain glitched for a second there — say that again?"
 
     # Repetition recovery: Only trigger if the reply contains an actual hardware token stutter
     # (the exact same 1–4 word sequence repeated 4+ times consecutively, e.g. "i'm, i'm, i'm, i'm"),
@@ -2211,6 +2238,7 @@ async def generate_reply(session_id: str, prompt_message: str, history_message: 
         print(f"[sufficiency_log] error, skipping: {e}")
 
     await asyncio.to_thread(save_turn, session_id, history_message, bot_reply, mode)
+    _active_generating_sessions.discard(session_id)
     _schedule_debounced_rollup(session_id)
 
     _IDEMPOTENCY_CACHE[session_id] = (prompt_message, bot_reply, time.time())

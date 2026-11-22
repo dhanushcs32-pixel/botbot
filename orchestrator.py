@@ -73,6 +73,7 @@ Output ONLY one short, flat JSON object (no markdown, no extra text). Keep every
 RULES:
 - The companion is an offline AI friend with NO physical body, errands, commute, or real-world outings. Never suggest inventing daily stories, people, or meetings.
 - Never recommend confrontational, rude, or accusatory replies, and never recommend generic therapy clichés.
+- If Dhanush expresses confusion about or pushes back on an earlier reply, choose "direct_answer" or "ground_and_clarify" and direct the companion to drop the confusing thread plainly, own the slip casually, and ask what he actually wants to talk about — never double down on metaphors or vague comfort.
 - Retrieval is STRICTLY ON-DEMAND (leave query fields "" unless truly needed):
   * "therapy_q": short psychology search terms ONLY if coping/grounding/reframing concepts from a therapy book will concretely help; else "".
   * "person" & "chat_q": set ONLY if Dhanush explicitly asks about or refers to a past conversation/note with someone; else "".
@@ -243,6 +244,13 @@ def parse_strategy_json(
     need_personal = bool(raw_ret.get("need_personal_chats", False) or chat_q or person)
     need_sessions = bool(raw_ret.get("need_past_sessions", False) or session_q)
 
+    # If Pass 1 explicitly requested therapy/coping context, never leave the turn as brief casual chat
+    if need_therapy:
+        if mode == "conversational":
+            mode = "supportive"
+        if depth == "brief":
+            depth = "deep"
+
     retrieval = {
         "need_therapy_ref": need_therapy,
         "therapy_query": therapy_q,
@@ -335,10 +343,22 @@ def build_repair_messages(
     if strategy_brief and strategy_brief.get("reply_angle"):
         brief_note = f"\nDirection: {strategy_brief['reply_angle']}"
 
+    # When breaking out of cliché, fatigue, or repetition collapse, exclude prior
+    # assistant turns from repair context so the model cannot imitate its own loop.
+    is_attractor_repair = (
+        reason in ("stock_phrase", "attractor_phrase", "fatigued_ngram", "loop_or_stutter", "exact_duplicate_reply")
+        or reason.startswith("fatigued_opener:")
+        or reason.startswith("high_consecutive_overlap:")
+    )
     hist_snippet = ""
     if recent_history:
         lines = []
-        for t in recent_history[-4:]:
+        source_turns = (
+            [t for t in recent_history if t.get("role") == "user"][-3:]
+            if is_attractor_repair
+            else recent_history[-4:]
+        )
+        for t in source_turns:
             role = "Dhanush" if t.get("role") == "user" else "You"
             c = (t.get("content") or "").strip().replace("\n", " ")[:180]
             if c:

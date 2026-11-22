@@ -10,8 +10,7 @@ import {
   Copy, 
   Check, 
   Network,
-  Settings,
-  HelpCircle
+  Settings
 } from "lucide-react";
 import { Clipboard } from '@capacitor/clipboard';
 
@@ -33,9 +32,12 @@ export default function AIEngineInspector({
   const [connectionStatus, setConnectionStatus] = useState<"idle" | "testing" | "success" | "failed">("idle");
 
   const handleCopyPayload = async () => {
-    await Clipboard.write({
-      string: JSON.stringify(payloadData, null, 2)
-    });
+    const text = JSON.stringify(payloadData, null, 2);
+    try {
+      await Clipboard.write({ string: text });
+    } catch {
+      try { await navigator.clipboard?.writeText(text); } catch { return; }
+    }
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
   };
@@ -175,7 +177,7 @@ export default function AIEngineInspector({
                 Do not bind your server to `127.0.0.1` (localhost) — that limits connections to the laptop itself. Start uvicorn with host `0.0.0.0` so other devices can find it:
               </p>
               <pre className="bg-black/50 p-2.5 rounded font-mono text-[10px] text-white overflow-x-auto">
-                uvicorn main:app --host 0.0.0.0 --port 8000 --cors-headers
+                uvicorn main:app --host 0.0.0.0 --port 8000
               </pre>
 
               <h4 className="font-bold text-sky-400 font-mono text-xs uppercase tracking-wide pt-1">
@@ -254,7 +256,7 @@ export default function AIEngineInspector({
           <span className="inline-block w-2 h-2 rounded-full bg-emerald-400 mr-1.5 animate-pulse"></span>
           CORS Diagnostic Engine Active
         </span>
-        <span>UTC-07:00</span>
+        <span>{Intl.DateTimeFormat().resolvedOptions().timeZone}</span>
       </div>
     </div>
   );

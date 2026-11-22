@@ -571,6 +571,30 @@ def deduplicate_assistant_turns(turns: list[dict]) -> list[dict]:
     return filtered
 
 
+def _drop_contaminated_assistant_turns(turns: list[dict]) -> list[dict]:
+    """
+    Removes prior assistant turns that match STOCK_REGEX (after normalizing
+    typographic apostrophes) so old degenerate replies cannot poison in-context
+    generation on subsequent turns.
+    """
+    if not turns:
+        return turns
+    try:
+        from mode_router import STOCK_REGEX
+    except Exception:
+        return turns
+
+    cleaned = []
+    for t in turns:
+        if t.get("role") == "assistant":
+            raw_c = (t.get("content") or "")
+            norm_c = raw_c.replace("\u2019", "'").replace("\u2018", "'")
+            if STOCK_REGEX.search(norm_c):
+                continue
+        cleaned.append(t)
+    return cleaned
+
+
 def _trim_history_at_session_gap(
     turns: list[dict],
     max_gap_hours: float = 6.0,
@@ -638,6 +662,7 @@ def get_recent_history(session_id: str, limit: int = 40, max_tokens: int = 2200,
     selected.reverse()  # chronological order
     turns = [{"role": role, "content": content, "timestamp": ts} for role, content, ts in selected]
     turns = _trim_history_at_session_gap(turns, max_gap_hours=max_gap_hours, now_dt=now_dt)
+    turns = _drop_contaminated_assistant_turns(turns)
     return filter_clean_history(turns, max_assistant_turns=6)
 
 

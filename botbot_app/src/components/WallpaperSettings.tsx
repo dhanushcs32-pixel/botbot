@@ -4,14 +4,13 @@
  */
 
 import React, { useState } from "react";
-import { 
-  Image, 
-  Palette, 
-  Upload, 
-  Link, 
-  Check, 
+import {
+  Image,
+  Palette,
+  Upload,
+  Link,
+  Check,
   Trash2,
-  Sliders,
   Sparkles
 } from "lucide-react";
 import { WallpaperConfig } from "../types";
@@ -35,6 +34,32 @@ const PRESET_COLORS = [
   { name: "Midnight Rose", value: "#1f1118", class: "bg-[#1f1118] border-rose-950 text-white" },
 ];
 
+function compressWallpaper(file: File, maxDim = 1280, quality = 0.78): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error("Could not read image"));
+    reader.onload = () => {
+      const img = new window.Image();
+      img.onerror = () => reject(new Error("Could not decode image"));
+      img.onload = () => {
+        const scale = Math.min(1, maxDim / Math.max(img.width || 1, img.height || 1));
+        const canvas = document.createElement("canvas");
+        canvas.width = Math.max(1, Math.round(img.width * scale));
+        canvas.height = Math.max(1, Math.round(img.height * scale));
+        const ctx = canvas.getContext("2d");
+        if (!ctx) {
+          resolve(reader.result as string);
+          return;
+        }
+        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+        resolve(canvas.toDataURL("image/jpeg", quality));
+      };
+      img.src = reader.result as string;
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
 export default function WallpaperSettings({
   currentWallpaper,
   onWallpaperChange,
@@ -42,32 +67,45 @@ export default function WallpaperSettings({
   onTogglePatterns
 }: WallpaperSettingsProps) {
   const [imageUrl, setImageUrl] = useState("");
+  const [uploadError, setUploadError] = useState<string | null>(null);
   const fileInputRef = React.useRef<HTMLInputElement>(null);
 
   const handleSelectSolid = (color: string) => {
+    setUploadError(null);
     onWallpaperChange({ type: "solid", value: color });
   };
 
   const handleUrlSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!imageUrl.trim()) return;
-    onWallpaperChange({ type: "custom", value: imageUrl.trim() });
+    const trimmed = imageUrl.trim();
+    if (!trimmed) return;
+    if (!/^https?:\/\//i.test(trimmed)) {
+      setUploadError("Wallpaper URL must start with http:// or https://");
+      return;
+    }
+    setUploadError(null);
+    onWallpaperChange({ type: "custom", value: trimmed });
   };
 
-  const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
+    e.target.value = "";
     if (!file) return;
-
-    const reader = new FileReader();
-    reader.onload = (event) => {
-      if (event.target?.result && typeof event.target.result === "string") {
-        onWallpaperChange({ type: "custom", value: event.target.result });
-      }
-    };
-    reader.readAsDataURL(file);
+    if (!file.type.startsWith("image/")) {
+      setUploadError("Please select an image file.");
+      return;
+    }
+    try {
+      setUploadError(null);
+      const compressed = await compressWallpaper(file);
+      onWallpaperChange({ type: "custom", value: compressed });
+    } catch {
+      setUploadError("Failed to process image. Try a smaller photo.");
+    }
   };
 
   const handleReset = () => {
+    setUploadError(null);
     onWallpaperChange({ type: "preset", value: "#efeae2" });
     setImageUrl("");
   };
@@ -88,17 +126,16 @@ export default function WallpaperSettings({
         </button>
       </div>
 
-      {/* Preset solid colors selection */}
       <div className="space-y-2">
         <label className="text-xs font-semibold text-slate-600 block">
           Solid Background Colors:
         </label>
         <div className="grid grid-cols-3 gap-2">
           {PRESET_COLORS.map((color) => {
-            const isSelected = 
-              (currentWallpaper.type === "solid" || currentWallpaper.type === "preset") && 
+            const isSelected =
+              (currentWallpaper.type === "solid" || currentWallpaper.type === "preset") &&
               currentWallpaper.value.toLowerCase() === color.value.toLowerCase();
-            
+
             return (
               <button
                 key={color.value}
@@ -122,7 +159,6 @@ export default function WallpaperSettings({
         </div>
       </div>
 
-      {/* Doodle Pattern Overlay Switcher */}
       <div className="bg-slate-50 p-3 rounded-xl border border-slate-100 flex items-center justify-between">
         <div className="space-y-0.5">
           <span className="text-xs font-bold text-slate-700 flex items-center">
@@ -136,8 +172,8 @@ export default function WallpaperSettings({
         <button
           onClick={onTogglePatterns}
           className={`px-3 py-1 rounded-full text-xs font-bold transition-all cursor-pointer ${
-            showPatterns 
-              ? "bg-[#00a884] text-white shadow-sm" 
+            showPatterns
+              ? "bg-[#00a884] text-white shadow-sm"
               : "bg-slate-200 text-slate-600"
           }`}
         >
@@ -145,14 +181,12 @@ export default function WallpaperSettings({
         </button>
       </div>
 
-      {/* Custom wallpaper uploader */}
       <div className="space-y-3.5 border-t border-slate-100 pt-4">
         <label className="text-xs font-semibold text-slate-600 block flex items-center">
           <Image className="w-3.5 h-3.5 mr-1 text-[#128c7e]" />
           Custom Wallpaper Image:
         </label>
 
-        {/* Upload via file */}
         <div className="flex space-x-2">
           <input
             type="file"
@@ -162,15 +196,15 @@ export default function WallpaperSettings({
             className="hidden"
           />
           <button
+            type="button"
             onClick={() => fileInputRef.current?.click()}
             className="flex-1 py-2 px-3 bg-slate-100 hover:bg-slate-200 text-slate-700 font-semibold text-xs rounded-lg border border-slate-200 flex items-center justify-center space-x-1.5 transition cursor-pointer"
           >
             <Upload className="w-4 h-4 text-slate-500" />
-            <span>Upload From Laptop</span>
+            <span>Upload Image</span>
           </button>
         </div>
 
-        {/* Custom URL Input */}
         <form onSubmit={handleUrlSubmit} className="flex space-x-1.5">
           <div className="flex-1 flex items-center bg-slate-50 rounded-lg border border-slate-200/80 px-2.5 py-1">
             <Link className="w-3.5 h-3.5 text-slate-400 mr-1.5 shrink-0" />
@@ -189,15 +223,18 @@ export default function WallpaperSettings({
             Apply
           </button>
         </form>
+
+        {uploadError && (
+          <p className="text-[11px] text-rose-600 font-medium">{uploadError}</p>
+        )}
       </div>
 
-      {/* Live Active Wallpaper Preview */}
       <div className="border border-slate-200 rounded-xl overflow-hidden shadow-inner bg-slate-50">
         <div className="text-[10px] font-bold text-slate-400 bg-slate-100 py-1 px-3 border-b border-slate-200">
           LIVE PREVIEW (MINI)
         </div>
         <div className="p-4 flex justify-center">
-          <div 
+          <div
             className="w-32 h-20 rounded-lg border border-slate-300 relative shadow-md overflow-hidden flex items-center justify-center transition-all"
             style={{
               backgroundColor: currentWallpaper.type === "solid" || currentWallpaper.type === "preset" ? currentWallpaper.value : undefined,
@@ -206,14 +243,11 @@ export default function WallpaperSettings({
               backgroundPosition: "center",
             }}
           >
-            {/* Pattern */}
             {showPatterns && (currentWallpaper.type === "solid" || currentWallpaper.type === "preset") && (
               <div className="absolute inset-0 opacity-12 bg-[radial-gradient(#000000_10%,transparent_11%)] bg-[length:10px_10px]" />
             )}
-            
-            {/* Mock message bubble */}
             <div className="bg-[#d9fdd3] text-[#111b21] px-2 py-1 rounded-md text-[8px] font-sans shadow-sm absolute bottom-2 right-2">
-              Looks awesome! 🍀
+              Looks awesome!
             </div>
             <div className="bg-white text-[#111b21] px-2 py-1 rounded-md text-[8px] font-sans shadow-sm absolute top-2 left-2">
               AI Bot active...

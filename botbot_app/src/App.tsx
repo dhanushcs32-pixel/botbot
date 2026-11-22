@@ -31,6 +31,7 @@ import { formatBytes, extractTextFromPDF } from "./lib/fileParser";
 import { ChatMessage, WallpaperConfig, Attachment } from "./types";
 import AIEngineInspector from "./components/AIEngineInspector";
 import WallpaperSettings from "./components/WallpaperSettings";
+import { Capacitor } from '@capacitor/core';
 import { LocalNotifications } from '@capacitor/local-notifications';
 import { App as CapApp } from '@capacitor/app';
 import { Clipboard } from '@capacitor/clipboard';
@@ -72,8 +73,12 @@ const DB_NAME = "botbot_chat_db";
 const STORE_NAME = "offline_queue";
 const DB_VERSION = 1;
 
+const NOTIFICATION_CHANNEL_ID = "botbot_messages";
+let cachedQueueDBPromise: Promise<IDBDatabase> | null = null;
+
 function openQueueDB(): Promise<IDBDatabase> {
-  return new Promise((resolve, reject) => {
+  if (cachedQueueDBPromise) return cachedQueueDBPromise;
+  cachedQueueDBPromise = new Promise((resolve, reject) => {
     const request = indexedDB.open(DB_NAME, DB_VERSION);
     request.onupgradeneeded = () => {
       const db = request.result;
@@ -84,9 +89,21 @@ function openQueueDB(): Promise<IDBDatabase> {
         store.createIndex("status", "status", { unique: false });
       }
     };
-    request.onsuccess = () => resolve(request.result);
-    request.onerror = () => reject(request.error);
+    request.onsuccess = () => {
+      const db = request.result;
+      db.onclose = () => { cachedQueueDBPromise = null; };
+      db.onversionchange = () => {
+        db.close();
+        cachedQueueDBPromise = null;
+      };
+      resolve(db);
+    };
+    request.onerror = () => {
+      cachedQueueDBPromise = null;
+      reject(request.error);
+    };
   });
+  return cachedQueueDBPromise;
 }
 
 async function enqueueDBMessage(msg: QueuedMessage): Promise<void> {
@@ -96,6 +113,7 @@ async function enqueueDBMessage(msg: QueuedMessage): Promise<void> {
     tx.objectStore(STORE_NAME).put(msg);
     tx.oncomplete = () => resolve();
     tx.onerror = () => reject(tx.error);
+    tx.onabort = () => reject(tx.error || new Error("IndexedDB transaction aborted"));
   });
 }
 
@@ -113,6 +131,7 @@ async function getPendingDBMessages(sessionId: string): Promise<QueuedMessage[]>
       resolve(messages);
     };
     request.onerror = () => reject(request.error);
+    tx.onabort = () => reject(tx.error || new Error("IndexedDB read aborted"));
   });
 }
 
@@ -123,12 +142,13 @@ async function updateDBMessageStatus(id: string, status: "pending" | "sent" | "a
     const store = tx.objectStore(STORE_NAME);
     const getReq = store.get(id);
     getReq.onsuccess = () => {
-      if (getReq.result) {
+      if (getReq.result && getReq.result.status !== "acked") {
         store.put({ ...getReq.result, status });
       }
     };
     tx.oncomplete = () => resolve();
     tx.onerror = () => reject(tx.error);
+    tx.onabort = () => reject(tx.error || new Error("IndexedDB update aborted"));
   });
 }
 
@@ -139,6 +159,35 @@ async function removeAckedDBMessage(id: string): Promise<void> {
     tx.objectStore(STORE_NAME).delete(id);
     tx.oncomplete = () => resolve();
     tx.onerror = () => reject(tx.error);
+    tx.onabort = () => reject(tx.error || new Error("IndexedDB delete aborted"));
+  });
+}
+
+function compressImageToDataUrl(file: File, maxDim: number, quality = 0.8): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error("Failed to read image file"));
+    reader.onload = () => {
+      const img = new window.Image();
+      img.onerror = () => reject(new Error("Failed to decode image"));
+      img.onload = () => {
+        const scale = Math.min(1, maxDim / Math.max(img.width || 1, img.height || 1));
+        const w = Math.max(1, Math.round(img.width * scale));
+        const h = Math.max(1, Math.round(img.height * scale));
+        const canvas = document.createElement("canvas");
+        canvas.width = w;
+        canvas.height = h;
+        const ctx = canvas.getContext("2d");
+        if (!ctx) {
+          resolve(reader.result as string);
+          return;
+        }
+        ctx.drawImage(img, 0, 0, w, h);
+        resolve(canvas.toDataURL("image/jpeg", quality));
+      };
+      img.src = reader.result as string;
+    };
+    reader.readAsDataURL(file);
   });
 }
 
@@ -185,8 +234,66 @@ function sanitizeMessagesForStorage(msgs: ChatMessage[]): any[] {
   });
 }
 
-function saveMessagesToStorage(msgs: ChatMessage[]) {
-  safeSetItem("whatsapp_single_bot_messages", JSON.stringify(sanitizeMessagesForStorage(msgs)));
+function getMessagesStorageKey(sid: string): string {
+  return `whatsapp_single_bot_messages_${sid}`;
+}
+
+function loadMessagesForSession(sid: string): ChatMessage[] {
+  const perSession = safeGetItem(getMessagesStorageKey(sid));
+  const raw = perSession ?? safeGetItem("whatsapp_single_bot_messages");
+  if (!raw) return INITIAL_MESSAGES;
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : INITIAL_MESSAGES;
+  } catch {
+    return INITIAL_MESSAGES;
+  }
+}
+
+function saveMessagesToStorage(sid: string, msgs: ChatMessage[]) {
+  if (!sid) return;
+  safeSetItem(getMessagesStorageKey(sid), JSON.stringify(sanitizeMessagesForStorage(msgs)));
+}
+
+function getCoTStorageKey(sid: string): string {
+  return `whatsapp_cot_entries_${sid}`;
+}
+
+function loadCoTEntriesForSession(sid: string): CoTEntry[] {
+  const raw = safeGetItem(getCoTStorageKey(sid)) ?? safeGetItem("whatsapp_cot_entries");
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.slice(-30).map((entry: CoTEntry) =>
+      entry && entry.status === "loading"
+        ? {
+            ...entry,
+            status: "error" as const,
+            errorDetail: "The app closed before this CoT response arrived — the request is no longer running.",
+          }
+        : entry
+    );
+  } catch {
+    return [];
+  }
+}
+
+function normalizeTimestamp(raw: unknown): number {
+  if (typeof raw === "number" && Number.isFinite(raw) && raw > 0) {
+    return raw < 1e12 ? Math.round(raw * 1000) : Math.round(raw);
+  }
+  if (typeof raw === "string" && raw.trim()) {
+    const asNum = Number(raw);
+    if (Number.isFinite(asNum) && asNum > 0) {
+      return asNum < 1e12 ? Math.round(asNum * 1000) : Math.round(asNum);
+    }
+    const parsed = Date.parse(raw);
+    if (Number.isFinite(parsed) && parsed > 0) {
+      return parsed;
+    }
+  }
+  return Date.now();
 }
 
 export default function App() {
@@ -200,15 +307,17 @@ export default function App() {
     }
   });
 
-  const [messages, setMessages] = useState<ChatMessage[]>(() => {
-    const saved = safeGetItem("whatsapp_single_bot_messages");
-    if (!saved) return INITIAL_MESSAGES;
-    try {
-      return JSON.parse(saved);
-    } catch {
-      return INITIAL_MESSAGES;
-    }
+  const [sessionId, setSessionId] = useState<string>(() => {
+    const saved = safeGetItem("whatsapp_fastapi_session_id");
+    if (saved) return saved;
+    const newId = "session-" + Math.random().toString(36).substring(2, 11);
+    safeSetItem("whatsapp_fastapi_session_id", newId);
+    return newId;
   });
+
+  const loadedSessionRef = useRef<string>(sessionId);
+
+  const [messages, setMessages] = useState<ChatMessage[]>(() => loadMessagesForSession(sessionId));
 
   const [fastApiBaseUrl, setFastApiBaseUrl] = useState<string>(() => {
     return safeGetItem("whatsapp_fastapi_base_url") || (import.meta as any).env?.VITE_FASTAPI_BASE_URL || "";
@@ -216,14 +325,6 @@ export default function App() {
 
   const [fastApiKey, setFastApiKey] = useState<string>(() => {
     return safeGetItem("whatsapp_fastapi_key") || (import.meta as any).env?.VITE_API_KEY || "";
-  });
-
-  const [sessionId, setSessionId] = useState<string>(() => {
-    const saved = safeGetItem("whatsapp_fastapi_session_id");
-    if (saved) return saved;
-    const newId = "session-" + Math.random().toString(36).substring(2, 11);
-    safeSetItem("whatsapp_fastapi_session_id", newId);
-    return newId;
   });
 
   const [previousSessions, setPreviousSessions] = useState<string[]>(() => {
@@ -250,10 +351,19 @@ export default function App() {
   const switchSession = (id: string) => {
     const trimmed = id.trim();
     if (!trimmed || trimmed === sessionId) return;
+    cotAbortRef.current?.abort();
+    cotAbortRef.current = null;
+    setIsCoTLoading(false);
+    const loaded = loadMessagesForSession(trimmed);
+    const loadedCoT = loadCoTEntriesForSession(trimmed);
+    loadedSessionRef.current = trimmed;
+    seenBotIdsRef.current = new Set(loaded.filter((m) => m.sender === "bot").map((m) => m.id));
     setSessionId(trimmed);
     safeSetItem("whatsapp_fastapi_session_id", trimmed);
-    setMessages([]);
-    setCoTEntries([]);
+    setMessages(loaded);
+    setCoTEntries(loadedCoT);
+    setReplyingTo(null);
+    setSelectedMessageId(null);
     setIsTyping(false);
     addLog(`Switched to session: ${trimmed}`, "info");
     socketRef.current?.close();
@@ -305,32 +415,7 @@ export default function App() {
       return false;
     }
   });
-  const [cotEntries, setCoTEntries] = useState<CoTEntry[]>(() => {
-    const saved = safeGetItem("whatsapp_cot_entries");
-    if (!saved) return [];
-    let parsed: any;
-    try {
-      parsed = JSON.parse(saved);
-    } catch {
-      return [];
-    }
-    if (!Array.isArray(parsed)) return [];
-    // An entry persisted while a CoT request was in flight restores as
-    // "loading" with no live fetch behind it (the request died with the
-    // previous app process) — resolve it to a visible error instead of a
-    // "CoT generating..." bubble that could never clear.
-    return parsed
-      .slice(-30)
-      .map((entry: CoTEntry) =>
-        entry && entry.status === "loading"
-          ? {
-            ...entry,
-            status: "error" as const,
-            errorDetail: "The app closed before this CoT response arrived — the request is no longer running.",
-          }
-          : entry
-      );
-  });
+  const [cotEntries, setCoTEntries] = useState<CoTEntry[]>(() => loadCoTEntriesForSession(sessionId));
   const [isCoTLoading, setIsCoTLoading] = useState(false);
 
   const [logs, setLogs] = useState<Array<{ time: string; type: "info" | "api" | "error"; text: string }>>([]);
@@ -353,6 +438,39 @@ export default function App() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const sessionInputRef = useRef<HTMLInputElement>(null);
   const toastTimeoutRef = useRef<any>(null);
+  const isAppActiveRef = useRef<boolean>(true);
+  const cotAbortRef = useRef<AbortController | null>(null);
+  const typingTimeoutRef = useRef<any>(null);
+  const createdBlobUrlsRef = useRef<Set<string>>(new Set());
+  const uiStateRef = useRef({
+    showSettings: false,
+    isMobileSidebarOpen: false,
+    hasViewingDoc: false,
+    showChatWallpaperDrawer: false,
+    showSearchBar: false,
+    hasSelectedMsg: false,
+  });
+
+  useEffect(() => {
+    uiStateRef.current = {
+      showSettings,
+      isMobileSidebarOpen,
+      hasViewingDoc: Boolean(viewingDocument),
+      showChatWallpaperDrawer,
+      showSearchBar,
+      hasSelectedMsg: Boolean(selectedMessageId),
+    };
+  }, [showSettings, isMobileSidebarOpen, viewingDocument, showChatWallpaperDrawer, showSearchBar, selectedMessageId]);
+
+  useEffect(() => {
+    return () => {
+      if (toastTimeoutRef.current) clearTimeout(toastTimeoutRef.current);
+      if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
+      cotAbortRef.current?.abort();
+      createdBlobUrlsRef.current.forEach((u) => URL.revokeObjectURL(u));
+      createdBlobUrlsRef.current.clear();
+    };
+  }, []);
 
   const showToast = useCallback((msg: string) => {
     if (toastTimeoutRef.current) clearTimeout(toastTimeoutRef.current);
@@ -402,61 +520,102 @@ export default function App() {
     }
   }, [showToast]);
 
-  const triggerNotification = useCallback(async (title: string, body: string) => {
-    let dispatched = false;
-    if (typeof window !== "undefined" && "Notification" in window) {
-      if (Notification.permission === "granted") {
-        try {
-          new Notification(title, {
-            body,
-            icon: "/pwa-192x192.png"
-          });
-          dispatched = true;
-        } catch (e) {
-          console.debug("Web Notification failed", e);
-        }
-      }
-    }
+  const ensureNotificationChannel = useCallback(async () => {
+    if (!Capacitor.isNativePlatform()) return;
     try {
-      await LocalNotifications.schedule({
-        notifications: [{
-          title,
-          body,
-          id: Math.floor(Math.random() * 1000000),
-          schedule: { at: new Date(Date.now() + 100) },
-          sound: 'default'
-        }]
+      await LocalNotifications.createChannel({
+        id: NOTIFICATION_CHANNEL_ID,
+        name: "BotBot Messages",
+        description: "Incoming replies from BotBot",
+        importance: 4,
+        visibility: 1,
+        vibration: true,
+        sound: "default",
       });
-      dispatched = true;
-    } catch (notifyErr) {
-      console.debug("LocalNotifications schedule failed", notifyErr);
+    } catch (e) {
+      console.warn("[notifications] createChannel failed:", e);
     }
-    return dispatched;
   }, []);
 
+  const triggerNotification = useCallback(async (title: string, body: string, force = false): Promise<boolean> => {
+    const isNative = Capacitor.isNativePlatform();
+    const inForeground = isNative
+      ? (isAppActiveRef.current && typeof document !== "undefined" && !document.hidden)
+      : (typeof document !== "undefined" && document.visibilityState === "visible" && document.hasFocus());
+
+    if (!force && inForeground) {
+      return false;
+    }
+
+    const preview = body.length > 180 ? body.slice(0, 177) + "..." : body;
+
+    if (isNative) {
+      try {
+        const perm = await LocalNotifications.checkPermissions();
+        if (perm.display !== "granted") {
+          return false;
+        }
+        await ensureNotificationChannel();
+        const notifId = 1000 + Math.floor(Math.random() * 900000);
+        await LocalNotifications.schedule({
+          notifications: [{
+            id: notifId,
+            title,
+            body: preview,
+            channelId: NOTIFICATION_CHANNEL_ID,
+            autoCancel: true,
+            sound: "default",
+          }],
+        });
+        return true;
+      } catch (notifyErr: any) {
+        console.warn("[notifications] LocalNotifications schedule failed:", notifyErr);
+        return false;
+      }
+    }
+
+    if (typeof window !== "undefined" && "Notification" in window && Notification.permission === "granted") {
+      try {
+        new Notification(title, {
+          body: preview,
+          icon: "/pwa-192x192.png",
+        });
+        return true;
+      } catch (e) {
+        console.warn("[notifications] Web Notification failed:", e);
+      }
+    }
+    return false;
+  }, [ensureNotificationChannel]);
+
   const requestNotificationPermissions = useCallback(async (): Promise<boolean> => {
-    let granted = false;
+    if (Capacitor.isNativePlatform()) {
+      try {
+        let status = await LocalNotifications.checkPermissions();
+        if (status.display !== "granted") {
+          status = await LocalNotifications.requestPermissions();
+        }
+        if (status.display === "granted") {
+          await ensureNotificationChannel();
+          return true;
+        }
+        return false;
+      } catch (e) {
+        console.warn("[notifications] Capacitor permission check failed:", e);
+        return false;
+      }
+    }
+
     if (typeof window !== "undefined" && "Notification" in window) {
       try {
         const perm = await Notification.requestPermission();
-        if (perm === "granted") granted = true;
+        return perm === "granted";
       } catch (e) {
-        console.warn("Notification.requestPermission error", e);
+        console.warn("[notifications] Web permission request failed:", e);
       }
     }
-    try {
-      const status = await LocalNotifications.checkPermissions();
-      if (status.display !== 'granted') {
-        const req = await LocalNotifications.requestPermissions();
-        if (req.display === 'granted') granted = true;
-      } else {
-        granted = true;
-      }
-    } catch (e) {
-      console.debug("Capacitor LocalNotifications permission check failed", e);
-    }
-    return granted;
-  }, []);
+    return false;
+  }, [ensureNotificationChannel]);
 
   const captureLongScreenshot = useCallback(async () => {
     if (!chatFlowRef.current) return;
@@ -487,9 +646,18 @@ export default function App() {
   const reconnectTimeoutRef = useRef<any>(null);
   const reconnectAttemptsRef = useRef<number>(0);
   const isFlushingRef = useRef<boolean>(false);
-  const pendingAcksRef = useRef<Map<string, () => void>>(new Map());
+  const pendingAcksRef = useRef<Map<string, { resolve: () => void; reject: (err: Error) => void }>>(new Map());
   const lastAttemptRef = useRef<Map<string, number>>(new Map());
   const lastPongRef = useRef<number>(0);
+
+  const flushRetryTimeoutRef = useRef<any>(null);
+  const botNameRef = useRef<string>(botConfig.name);
+  const resumeConnectionRef = useRef<() => void>(() => {});
+  const seenBotIdsRef = useRef<Set<string>>(new Set(messages.filter((m) => m.sender === "bot").map((m) => m.id)));
+
+  useEffect(() => {
+    botNameRef.current = botConfig.name;
+  }, [botConfig.name]);
 
   const addLog = (text: string, type: "info" | "api" | "error" = "info") => {
     const time = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false });
@@ -498,16 +666,34 @@ export default function App() {
 
   const RETRY_COOLDOWN_MS = 10000; // longer than the 8s ack timeout below
 
+  const startTypingSafetyTimer = useCallback(() => {
+    if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
+    setIsTyping(true);
+    typingTimeoutRef.current = setTimeout(() => {
+      setIsTyping(false);
+    }, 120000);
+  }, []);
+
+  const stopTypingIndicator = useCallback(() => {
+    if (typingTimeoutRef.current) {
+      clearTimeout(typingTimeoutRef.current);
+      typingTimeoutRef.current = null;
+    }
+    setIsTyping(false);
+  }, []);
+
   const flushQueue = useCallback(async () => {
     if (!socketRef.current || socketRef.current.readyState !== WebSocket.OPEN || isFlushingRef.current) {
       return;
     }
 
     isFlushingRef.current = true;
+    let nextRetryInMs: number | null = null;
     try {
       let pending = await getPendingDBMessages(sessionId);
       while (pending.length > 0 && socketRef.current && socketRef.current.readyState === WebSocket.OPEN) {
         let sentAny = false;
+        nextRetryInMs = null;
         for (const item of pending) {
           if (!socketRef.current || socketRef.current.readyState !== WebSocket.OPEN) break;
 
@@ -524,28 +710,39 @@ export default function App() {
           };
           const payloadStr = JSON.stringify(payload);
 
-          // Permanent failure guard: drop payloads > 10MB to prevent infinite crash loops
           if (payloadStr.length > 10 * 1024 * 1024) {
             await removeAckedDBMessage(item.id);
-            setMessages((prev) => {
-              const updated = prev.map((m) =>
+            setMessages((prev) =>
+              prev.map((m) =>
                 m.id === item.id
                   ? { ...m, status: "error" as const, text: (m.text || "") + " [Failed: attachment payload exceeds 10MB limit]" }
                   : m
-              );
-              saveMessagesToStorage(updated);
-              return updated;
-            });
+              )
+            );
             addLog(`Message ${item.id} dropped: attachment payload exceeds 10MB limit.`, "error");
             continue;
           }
 
           const lastAttempt = lastAttemptRef.current.get(item.id) ?? 0;
-          if (Date.now() - lastAttempt < RETRY_COOLDOWN_MS) {
+          const elapsed = Date.now() - lastAttempt;
+          if (elapsed < RETRY_COOLDOWN_MS) {
+            const waitMs = RETRY_COOLDOWN_MS - elapsed;
+            nextRetryInMs = nextRetryInMs === null ? waitMs : Math.min(nextRetryInMs, waitMs);
             continue;
           }
           lastAttemptRef.current.set(item.id, Date.now());
           sentAny = true;
+
+          setActivePayload({
+            ...payload,
+            attachments: payload.attachments?.map((a: any) => ({ name: a.name, type: a.type, size: a.size })),
+          });
+
+          try {
+            await updateDBMessageStatus(item.id, "sent");
+          } catch (dbErr: any) {
+            addLog(`IndexedDB status update warning: ${dbErr?.message || dbErr}`, "error");
+          }
 
           await new Promise<void>((resolve, reject) => {
             const timeout = setTimeout(() => {
@@ -553,21 +750,30 @@ export default function App() {
               reject(new Error("Ack timeout (8s)"));
             }, 8000);
 
-            pendingAcksRef.current.set(item.id, () => {
-              clearTimeout(timeout);
-              lastAttemptRef.current.delete(item.id);
-              resolve();
+            pendingAcksRef.current.set(item.id, {
+              resolve: () => {
+                clearTimeout(timeout);
+                lastAttemptRef.current.delete(item.id);
+                resolve();
+              },
+              reject: (err: Error) => {
+                clearTimeout(timeout);
+                reject(err);
+              },
             });
 
-            socketRef.current?.send(payloadStr);
-            updateDBMessageStatus(item.id, "sent");
-            setMessages((prev) => {
-              const updated = prev.map((m) => m.id === item.id ? { ...m, status: "delivered" as const } : m);
-              saveMessagesToStorage(updated);
-              return updated;
-            });
+            startTypingSafetyTimer();
+            try {
+              socketRef.current?.send(payloadStr);
+              setMessages((prev) =>
+                prev.map((m) => (m.id === item.id ? { ...m, status: "delivered" as const } : m))
+              );
+            } catch (sendErr: any) {
+              clearTimeout(timeout);
+              pendingAcksRef.current.delete(item.id);
+              reject(sendErr instanceof Error ? sendErr : new Error(String(sendErr)));
+            }
           }).catch((err) => {
-            setIsTyping(false);
             addLog(`Delivery retry queued for msg ${item.id}: ${err.message}`, "info");
           });
         }
@@ -576,13 +782,22 @@ export default function App() {
       }
     } finally {
       isFlushingRef.current = false;
+      if (nextRetryInMs !== null && socketRef.current && socketRef.current.readyState === WebSocket.OPEN) {
+        if (flushRetryTimeoutRef.current) clearTimeout(flushRetryTimeoutRef.current);
+        flushRetryTimeoutRef.current = setTimeout(() => {
+          flushRetryTimeoutRef.current = null;
+          flushQueue();
+        }, nextRetryInMs + 100);
+      }
     }
-  }, [sessionId]);
+  }, [sessionId, startTypingSafetyTimer]);
 
   useEffect(() => {
     if (!fastApiBaseUrl) return;
 
     let heartbeatInterval: any;
+    let probeTimeout: any;
+    let connectDebounceTimeout: any;
     let cancelled = false;
 
     const scheduleReconnect = () => {
@@ -625,8 +840,8 @@ export default function App() {
         const { ticket } = await ticketRes.json();
         if (cancelled) return;
 
-        const wsUrl = base.replace(/^https:\/\//i, "wss://").replace(/^http:\/\//i, "ws://") + `/ws/chat?ticket=${ticket}&session_id=${sessionId}`;
-        addLog(`Connecting: ${wsUrl}`, "info");
+        const wsUrl = base.replace(/^https:\/\//i, "wss://").replace(/^http:\/\//i, "ws://") + `/ws/chat?ticket=${encodeURIComponent(ticket)}&session_id=${encodeURIComponent(sessionId)}`;
+        addLog(`Connecting to ${base}/ws/chat (session=${sessionId})`, "info");
 
         const socket = new WebSocket(wsUrl);
         socketRef.current = socket;
@@ -641,100 +856,108 @@ export default function App() {
           reconnectAttemptsRef.current = 0;
 
           lastPongRef.current = Date.now();
+          if (heartbeatInterval) clearInterval(heartbeatInterval);
 
           heartbeatInterval = setInterval(() => {
             if (socket.readyState !== WebSocket.OPEN) return;
 
-            const sinceLastPong = Date.now() - lastPongRef.current;
-            if (sinceLastPong > 35000) {
-              // Two missed pongs (15s interval, generous margin) on a socket
-              // that still reports OPEN — it's half-open. Force a real
-              // reconnect rather than waiting on this dead handle.
-              addLog("No pong in 35s, socket appears half-open. Forcing reconnect.", "error");
+            const sinceLastActivity = Date.now() - lastPongRef.current;
+            if (sinceLastActivity > 75000) {
+              addLog("No server activity in 75s, socket appears half-open. Forcing reconnect.", "error");
               socket.close();
               return;
             }
 
-            socket.send(JSON.stringify({ type: "ping" }));
-          }, 15000);
+            try {
+              socket.send(JSON.stringify({ type: "ping" }));
+            } catch {
+              socket.close();
+            }
+          }, 20000);
 
           flushQueue();
         };
 
         socket.onmessage = async (event) => {
+          if (cancelled) return;
           let data: any;
           try {
             data = JSON.parse(event.data);
-          } catch (parseErr) {
-            addLog(`Received non-JSON WebSocket message, ignoring.`, "error");
+          } catch {
+            addLog("Received non-JSON WebSocket message, ignoring.", "error");
             return;
+          }
+
+          lastPongRef.current = Date.now();
+          if (probeTimeout) {
+            clearTimeout(probeTimeout);
+            probeTimeout = null;
           }
 
           if (data.type === "pong") {
-            lastPongRef.current = Date.now();
             return;
           }
 
-          // 1. Server ACK for user message
           if (data.type === "ack" && data.id) {
             await removeAckedDBMessage(data.id);
-            setMessages((prev) => {
-              const updated = prev.map((m) => m.id === data.id ? { ...m, status: "read" as const } : m);
-              saveMessagesToStorage(updated);
-              return updated;
-            });
-            const resolveAck = pendingAcksRef.current.get(data.id);
-            if (resolveAck) {
-              resolveAck();
+            setMessages((prev) =>
+              prev.map((m) => (m.id === data.id ? { ...m, status: "read" as const } : m))
+            );
+            const pendingAck = pendingAcksRef.current.get(data.id);
+            if (pendingAck) {
               pendingAcksRef.current.delete(data.id);
+              pendingAck.resolve();
             }
             return;
           }
 
-          // 1b. Server confirmation the message is durably saved — arrives
-          // later than "ack" (after generate_reply/save_turn completes).
-          // Purely additive: doesn't touch the ack-driven retry/flush path,
-          // doesn't gate anything time-sensitive. Safe no-op if unused.
           if (data.type === "stored" && data.id) {
             addLog(`Message ${data.id} durably stored on server.`, "info");
             return;
           }
 
-          // 2. Incoming bot message
           const replyText = data.reply ?? data.text ?? data.message;
           if (!replyText) return;
 
           const botReplyId = data.id || "msg-ws-" + Math.random().toString(36).substring(2, 11);
 
-          // Acknowledge receipt back to server
           if (socket.readyState === WebSocket.OPEN) {
             socket.send(JSON.stringify({ type: "ack", id: botReplyId }));
           }
 
-          const botMsg: ChatMessage = {
-            id: botReplyId,
-            sender: "bot",
-            text: replyText,
-            timestamp: data.created_at || Date.now(),
-            status: "read"
-          };
+          const isDuplicate = seenBotIdsRef.current.has(botReplyId);
+          seenBotIdsRef.current.add(botReplyId);
 
-          setIsTyping(false);
+          const normalizedTs = normalizeTimestamp(data.created_at);
+          stopTypingIndicator();
           setMessages((prev) => {
             if (prev.some((m) => m.id === botReplyId)) return prev;
-            const updated = [...prev, botMsg];
-            saveMessagesToStorage(updated);
-            return updated;
+            const lastTs = prev.length > 0 ? prev[prev.length - 1].timestamp : 0;
+            const safeTs = lastTs > 0 && normalizedTs < lastTs ? lastTs + 1 : normalizedTs;
+            const botMsg: ChatMessage = {
+              id: botReplyId,
+              sender: "bot",
+              text: replyText,
+              timestamp: safeTs,
+              status: "read",
+            };
+            return [...prev, botMsg];
           });
 
-          // Trigger notification (Web Notification or Capacitor LocalNotifications)
-          triggerNotification(botConfig.name, botMsg.text);
+          if (!isDuplicate) {
+            triggerNotification(botNameRef.current, replyText);
+          }
         };
 
         socket.onclose = () => {
           setIsConnected(false);
-          setIsTyping(false);
+          pendingAcksRef.current.forEach((entry) => entry.reject(new Error("Socket closed before ACK")));
+          pendingAcksRef.current.clear();
           clearInterval(heartbeatInterval);
+          if (probeTimeout) {
+            clearTimeout(probeTimeout);
+            probeTimeout = null;
+          }
           if (socketRef.current === socket) {
             socketRef.current = null;
           }
@@ -744,13 +967,10 @@ export default function App() {
         };
 
         socket.onerror = () => {
-          setIsTyping(false);
-          addLog(`Socket connection dropped.`, "error");
+          addLog("Socket connection dropped.", "error");
           socket.close();
         };
       } catch (err: any) {
-        // Includes the ticket endpoint returning non-200 (e.g. 503 while the
-        // backend is down) — no reply can arrive on this connection.
         setIsTyping(false);
         addLog(`Connection attempt failed: ${err.message}`, "error");
         setIsConnected(false);
@@ -760,74 +980,140 @@ export default function App() {
       }
     };
 
-    connectWebSocket();
+    const resumeConnection = () => {
+      if (cancelled) return;
+      reconnectAttemptsRef.current = 0;
+      const sock = socketRef.current;
+      if (sock && sock.readyState === WebSocket.OPEN) {
+        lastPongRef.current = Date.now();
+        try {
+          sock.send(JSON.stringify({ type: "ping" }));
+        } catch {
+          sock.close();
+          return;
+        }
+        if (probeTimeout) clearTimeout(probeTimeout);
+        const probeSentAt = Date.now();
+        probeTimeout = setTimeout(() => {
+          if (cancelled) return;
+          if (lastPongRef.current < probeSentAt && socketRef.current === sock) {
+            addLog("Resume probe timed out (5s); reconnecting immediately.", "error");
+            sock.close();
+          }
+        }, 5000);
+        flushQueue();
+      } else if (!sock || sock.readyState === WebSocket.CLOSED) {
+        if (reconnectTimeoutRef.current) {
+          clearTimeout(reconnectTimeoutRef.current);
+          reconnectTimeoutRef.current = null;
+        }
+        connectWebSocket();
+      }
+    };
+
+    resumeConnectionRef.current = resumeConnection;
+
+    const handleVisibility = () => {
+      if (document.visibilityState === "visible") {
+        resumeConnection();
+      }
+    };
+    window.addEventListener("online", resumeConnection);
+    document.addEventListener("visibilitychange", handleVisibility);
+
+    connectDebounceTimeout = setTimeout(() => {
+      connectWebSocket();
+    }, 250);
 
     return () => {
       cancelled = true;
+      clearTimeout(connectDebounceTimeout);
       clearInterval(heartbeatInterval);
+      if (probeTimeout) clearTimeout(probeTimeout);
       if (reconnectTimeoutRef.current) clearTimeout(reconnectTimeoutRef.current);
+      if (flushRetryTimeoutRef.current) clearTimeout(flushRetryTimeoutRef.current);
+      window.removeEventListener("online", resumeConnection);
+      document.removeEventListener("visibilitychange", handleVisibility);
       socketRef.current?.close();
       socketRef.current = null;
     };
-  }, [fastApiBaseUrl, sessionId, flushQueue]);
+  }, [fastApiBaseUrl, fastApiKey, sessionId, flushQueue, stopTypingIndicator]);
 
   useEffect(() => {
-    let removeListener: (() => void) | undefined;
+    let removeStateListener: (() => void) | undefined;
+    let removeBackListener: (() => void) | undefined;
     let isMounted = true;
 
-    CapApp.addListener('appStateChange', ({ isActive }) => {
+    CapApp.addListener("appStateChange", ({ isActive }) => {
+      isAppActiveRef.current = isActive;
       if (!isActive) {
-        addLog("App backgrounded. Sleeping UI to save battery.", "info");
+        addLog("App backgrounded.", "info");
       } else {
-        addLog("App resumed. Waking up UI.", "info");
-        flushQueue();
+        addLog("App resumed. Probing connection & flushing queue.", "info");
+        resumeConnectionRef.current();
       }
     }).then((handle) => {
-      if (!isMounted) {
-        handle.remove();
-        return;
-      }
-      removeListener = () => handle.remove();
-    });
+      if (!isMounted) { handle.remove(); return; }
+      removeStateListener = () => handle.remove();
+    }).catch(() => {});
 
-    const backListener = CapApp.addListener('backButton', () => {
-      if (showSettings) {
+    CapApp.addListener("backButton", () => {
+      const ui = uiStateRef.current;
+      if (ui.hasViewingDoc) {
+        setViewingDocument(null);
+      } else if (ui.showChatWallpaperDrawer) {
+        setShowChatWallpaperDrawer(false);
+      } else if (ui.hasSelectedMsg) {
+        setSelectedMessageId(null);
+      } else if (ui.showSearchBar) {
+        setShowSearchBar(false);
+        setSearchQuery("");
+      } else if (ui.showSettings) {
         setShowSettings(false);
-      } else if (!isMobileSidebarOpen) {
+      } else if (!ui.isMobileSidebarOpen) {
         setIsMobileSidebarOpen(true);
       } else {
         CapApp.exitApp();
       }
-    });
+    }).then((handle) => {
+      if (!isMounted) { handle.remove(); return; }
+      removeBackListener = () => handle.remove();
+    }).catch(() => {});
 
     return () => {
       isMounted = false;
-      removeListener?.();
-      backListener.then(h => h.remove());
+      removeStateListener?.();
+      removeBackListener?.();
     };
-  }, [showSettings, isMobileSidebarOpen, flushQueue]);
+  }, []);
 
   useEffect(() => {
-    const requestPermissions = async () => {
+    const setupNotifications = async () => {
+      if (!Capacitor.isNativePlatform()) return;
       try {
-        const status = await LocalNotifications.checkPermissions();
-        if (status.display !== 'granted') {
-          await LocalNotifications.requestPermissions();
+        let status = await LocalNotifications.checkPermissions();
+        if (status.display !== "granted") {
+          status = await LocalNotifications.requestPermissions();
+        }
+        if (status.display === "granted") {
+          await ensureNotificationChannel();
         }
       } catch {
-        // Ignored when running outside Capacitor mobile shell
+        // Ignored outside native shell
       }
     };
-    requestPermissions();
-  }, []);
+    setupNotifications();
+  }, [ensureNotificationChannel]);
 
   useEffect(() => {
     safeSetItem("whatsapp_single_bot_config", JSON.stringify(botConfig));
   }, [botConfig]);
 
   useEffect(() => {
-    saveMessagesToStorage(messages);
-  }, [messages]);
+    if (loadedSessionRef.current === sessionId) {
+      saveMessagesToStorage(sessionId, messages);
+    }
+  }, [messages, sessionId]);
 
   useEffect(() => {
     safeSetItem("whatsapp_fastapi_base_url", fastApiBaseUrl);
@@ -850,8 +1136,10 @@ export default function App() {
   }, [cotMode]);
 
   useEffect(() => {
-    safeSetItem("whatsapp_cot_entries", JSON.stringify(cotEntries.slice(-30)));
-  }, [cotEntries]);
+    if (loadedSessionRef.current === sessionId) {
+      safeSetItem(getCoTStorageKey(sessionId), JSON.stringify(cotEntries.slice(-30)));
+    }
+  }, [cotEntries, sessionId]);
 
   useEffect(() => {
     safeSetItem("whatsapp_ai_username", userName);
@@ -889,36 +1177,54 @@ export default function App() {
     );
   };
 
-  const handleAvatarUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleAvatarUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
+    e.target.value = "";
     if (!file) return;
     if (!file.type.startsWith("image/")) {
       addLog("Failed to change avatar: selected file is not an image.", "error");
+      showToast("Please select an image file");
       return;
     }
 
-    const reader = new FileReader();
-    reader.onload = (event) => {
-      if (event.target?.result && typeof event.target.result === "string") {
-        setBotConfig((prev) => ({ ...prev, avatar: event.target!.result as string }));
-        addLog("Successfully updated bot profile picture!", "info");
-      }
-    };
-    reader.readAsDataURL(file);
+    try {
+      const compressed = await compressImageToDataUrl(file, 256, 0.82);
+      setBotConfig((prev) => ({ ...prev, avatar: compressed }));
+      addLog("Updated bot profile picture (compressed for storage).", "info");
+      showToast("Profile picture updated!");
+    } catch (err: any) {
+      addLog(`Failed to process avatar: ${err?.message || err}`, "error");
+      showToast("Failed to process image");
+    }
   };
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = e.target.files;
     if (!files) return;
 
+    const MAX_RAW_BYTES = 7 * 1024 * 1024;
     Array.from(files).forEach((file: File) => {
+      if (file.size > MAX_RAW_BYTES) {
+        addLog(`Skipped "${file.name}": exceeds 7MB attachment limit.`, "error");
+        showToast(`"${file.name}" is too large (max 7MB)`);
+        return;
+      }
+
       const isImage = file.type.startsWith("image/");
       const isPdf = file.type === "application/pdf" || file.name.endsWith(".pdf");
       const isDocx = file.name.endsWith(".docx");
       const type = isImage ? "image" : isPdf ? "pdf" : isDocx ? "docx" : "text";
 
       const url = URL.createObjectURL(file);
+      createdBlobUrlsRef.current.add(url);
+
       const reader = new FileReader();
+      reader.onerror = () => {
+        URL.revokeObjectURL(url);
+        createdBlobUrlsRef.current.delete(url);
+        addLog(`Failed to read attachment "${file.name}".`, "error");
+        showToast(`Could not read "${file.name}"`);
+      };
       reader.onload = async (event) => {
         const result = event.target?.result as string;
 
@@ -939,18 +1245,17 @@ export default function App() {
         const newAttachment: Attachment = {
           id: "att-" + Math.random().toString(36).substring(2, 11),
           name: file.name,
-          type: type,
+          type,
           size: formatBytes(file.size),
-          url: url,
+          url,
           base64: result,
-          textContents: textContents
+          textContents,
         };
 
         setAttachedFiles((prev) => [...prev, newAttachment]);
         addLog(`Attached ${type} file: "${file.name}"`, "info");
       };
 
-      // Always read as Data URL so base64 is uniformly populated for all attachment types
       reader.readAsDataURL(file);
     });
 
@@ -958,6 +1263,12 @@ export default function App() {
   };
 
   const testLocalConnection = async (): Promise<boolean> => {
+    if (!fastApiBaseUrl.trim() || !/^https?:\/\//i.test(fastApiBaseUrl.trim())) {
+      const msg = "Enter a valid http:// or https:// Laptop Base URL first.";
+      setConnectionTestResult({ success: false, message: msg });
+      addLog(msg, "error");
+      return false;
+    }
     setIsTestingConnection(true);
     setConnectionTestResult(null);
     const targetUrl = getNormalizedUrl(fastApiBaseUrl, "/");
@@ -1020,13 +1331,11 @@ export default function App() {
       } : undefined
     };
 
-    setMessages((prev) => {
-      const updated = [...prev, userMessage];
-      saveMessagesToStorage(updated);
-      return updated;
-    });
+    setMessages((prev) => [...prev, userMessage]);
 
-    setIsTyping(true);
+    const dbAttachments = currentAttachedFiles.length > 0
+      ? currentAttachedFiles.map(({ url, ...rest }) => rest)
+      : undefined;
 
     const queuedItem: QueuedMessage = {
       id: userMessageId,
@@ -1034,27 +1343,40 @@ export default function App() {
       text: currentText,
       created_at: userMessage.timestamp,
       status: "pending",
-      attachments: currentAttachedFiles,
+      attachments: dbAttachments,
       replyTo: userMessage.replyTo
     };
-    await enqueueDBMessage(queuedItem);
+
+    try {
+      await enqueueDBMessage(queuedItem);
+    } catch (dbErr: any) {
+      addLog(`Offline queue save failed: ${dbErr?.message || dbErr}`, "error");
+      showToast("Could not buffer message locally");
+      setMessages((prev) => prev.map((m) => (m.id === userMessageId ? { ...m, status: "error" as const } : m)));
+      stopTypingIndicator();
+      return;
+    }
 
     if (socketRef.current && socketRef.current.readyState === WebSocket.OPEN) {
+      startTypingSafetyTimer();
       flushQueue();
     } else {
-      // Message is only queued locally — nothing can generate a reply yet,
-      // so don't leave the typing indicator running for an unsent message.
-      setIsTyping(false);
+      stopTypingIndicator();
       addLog("Offline: message buffered in storage.", "info");
     }
   };
 
   const handleNewChat = () => {
+    cotAbortRef.current?.abort();
+    cotAbortRef.current = null;
+    setIsCoTLoading(false);
     const newId = "session-" + Math.random().toString(36).substring(2, 11);
+    loadedSessionRef.current = newId;
+    seenBotIdsRef.current = new Set();
     setSessionId(newId);
     safeSetItem("whatsapp_fastapi_session_id", newId);
     setMessages([]);
-    saveMessagesToStorage([]);
+    saveMessagesToStorage(newId, []);
     setCoTEntries([]);
     setIsTyping(false);
     addLog(`Started new chat session: ${newId}`, "info");
@@ -1092,11 +1414,20 @@ export default function App() {
       status: "loading",
     }]);
     setInputText("");
+    setReplyingTo(null);
     setIsCoTLoading(true);
+
+    cotAbortRef.current?.abort();
+    const controller = new AbortController();
+    cotAbortRef.current = controller;
+    const activeSid = sessionId;
 
     let timeoutId: any;
     const timeoutPromise = new Promise<never>((_, reject) => {
-      timeoutId = setTimeout(() => reject(new Error("cot_timeout")), COT_TIMEOUT_MS);
+      timeoutId = setTimeout(() => {
+        controller.abort();
+        reject(new Error("cot_timeout"));
+      }, COT_TIMEOUT_MS);
     });
 
     try {
@@ -1106,15 +1437,17 @@ export default function App() {
       const res: Response = await Promise.race([
         fetch(`${base}/chat/cot`, {
           method: "POST",
+          signal: controller.signal,
           headers: {
             "Content-Type": "application/json",
             "X-API-Key": fastApiKey,
             "X-CoT-Activate": "diagnostic-replay",
           },
-          body: JSON.stringify({ message: text, session_id: sessionId }),
+          body: JSON.stringify({ message: text, session_id: activeSid }),
         }),
         timeoutPromise,
       ]);
+      if (loadedSessionRef.current !== activeSid) return;
 
       if (res.status === 403) throw new Error("403 — this endpoint requires the primary API key (guest keys are rejected server-side).");
       if (res.status === 401) throw new Error("401 — API key rejected as invalid by the server.");
@@ -1148,6 +1481,9 @@ export default function App() {
         });
       }
     } catch (err: any) {
+      if (err?.name === "AbortError" || loadedSessionRef.current !== activeSid) {
+        return;
+      }
       if (err?.message === "cot_timeout") {
         updateCoTEntry(entryId, {
           status: "error",
@@ -1173,17 +1509,27 @@ export default function App() {
   // Chronological transcript: normal messages and CoT exchanges interleaved
   // by time. Previously CoT entries rendered as one block after ALL messages,
   // which buried the bot's latest real replies under older CoT prompts.
+  const filteredCoTEntries = cotEntries.filter((entry) => {
+    if (!searchQuery.trim()) return true;
+    const q = searchQuery.toLowerCase();
+    return (
+      entry.prompt.toLowerCase().includes(q) ||
+      (entry.reply || "").toLowerCase().includes(q) ||
+      (entry.reasoning?.content || "").toLowerCase().includes(q)
+    );
+  });
+
   const transcriptItems = useMemo(() => {
     const items: Array<{ kind: "msg"; msg: ChatMessage } | { kind: "cot"; entry: CoTEntry }> = [
       ...filteredMessages.map((msg) => ({ kind: "msg" as const, msg })),
-      ...cotEntries.map((entry) => ({ kind: "cot" as const, entry })),
+      ...filteredCoTEntries.map((entry) => ({ kind: "cot" as const, entry })),
     ];
     return items.sort((a, b) => {
       const ta = a.kind === "msg" ? a.msg.timestamp : a.entry.timestamp;
       const tb = b.kind === "msg" ? b.msg.timestamp : b.entry.timestamp;
       return ta - tb;
     });
-  }, [filteredMessages, cotEntries]);
+  }, [filteredMessages, filteredCoTEntries]);
 
   const formatMessageTime = (time: number) => {
     return new Date(time).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
@@ -1236,7 +1582,7 @@ export default function App() {
     return (
       <div className={`flex flex-col relative group w-full ${isMe ? "items-end" : "items-start"}`}>
         {isSelected && (
-          <div className={`absolute top-1/2 -translate-y-1/2 flex items-center space-x-1 z-20 ${isMe ? "right-[77%] mr-2" : "left-[77%] ml-2"}`}>
+          <div className={`flex items-center space-x-1 mb-1 z-20 ${isMe ? "self-end" : "self-start"}`}>
             <button
               type="button"
               onClick={(e) => {
@@ -1245,7 +1591,7 @@ export default function App() {
                 setSelectedMessageId(null);
               }}
               title="Reply"
-              className="p-1.5 bg-white border border-slate-200 text-slate-500 rounded-full shadow-md hover:bg-slate-50 cursor-pointer"
+              className="p-1.5 bg-white border border-slate-200 text-slate-600 rounded-full shadow-md hover:bg-slate-50 cursor-pointer"
             >
               <CornerUpLeft className="w-3.5 h-3.5" />
             </button>
@@ -1257,7 +1603,7 @@ export default function App() {
                 setSelectedMessageId(null);
               }}
               title="Copy Message"
-              className="p-1.5 bg-white border border-slate-200 text-slate-500 rounded-full shadow-md hover:bg-slate-50 cursor-pointer"
+              className="p-1.5 bg-white border border-slate-200 text-slate-600 rounded-full shadow-md hover:bg-slate-50 cursor-pointer"
             >
               <Copy className="w-3.5 h-3.5" />
             </button>
@@ -1274,17 +1620,27 @@ export default function App() {
         >
           <div className={`absolute top-0 w-2 h-2 ${isMe ? "right-[-4px] border-t-[8px] border-t-[#d9fdd3] border-r-[4px] border-r-transparent" : "left-[-4px] border-t-[8px] border-t-white border-l-[4px] border-l-transparent"}`} />
           {msg.replyTo && (<div className="bg-black/5 border-l-4 border-emerald-600 rounded-lg p-2 mb-1.5 text-xs text-slate-600"><div className="font-bold text-emerald-700 text-[10px] uppercase">{msg.replyTo.sender === "user" ? "You" : botConfig.name}</div><div className="truncate">{msg.replyTo.text}</div></div>)}
-          {msg.attachments?.map(att => (
-            <div key={att.id} className="rounded-lg overflow-hidden border border-black/5 mb-1.5 cursor-pointer" onClick={(e) => { e.stopPropagation(); setViewingDocument(att); }}>
-              {att.type === "image" ? <img src={att.url || att.base64} className="max-h-64 w-full object-cover" /> : <div className="flex items-center space-x-2 p-2 bg-black/5"><FileText className="w-5 h-5 text-emerald-600" /><span className="text-xs font-bold truncate">{att.name}</span></div>}
-            </div>
-          ))}
+          {msg.attachments?.map(att => {
+            const imgSrc = att.url || att.base64;
+            return (
+              <div key={att.id} className="rounded-lg overflow-hidden border border-black/5 mb-1.5 cursor-pointer" onClick={(e) => { e.stopPropagation(); setViewingDocument(att); }}>
+                {att.type === "image" && imgSrc ? (
+                  <img src={imgSrc} alt={att.name} className="max-h-64 w-full object-cover" />
+                ) : (
+                  <div className="flex items-center space-x-2 p-2 bg-black/5">
+                    <FileText className="w-5 h-5 text-emerald-600 shrink-0" />
+                    <span className="text-xs font-bold truncate">{att.name}{att.type === "image" ? " (image preview not cached)" : ""}</span>
+                  </div>
+                )}
+              </div>
+            );
+          })}
           <div className="break-words leading-relaxed whitespace-pre-wrap select-text">{msg.text}</div>
           <div className="flex items-center justify-end space-x-1 mt-0.5 text-[10.5px] text-slate-400 select-none">
             <span>{formatMessageTime(msg.timestamp)}</span>
             {isMe && (
-              <span className={msg.status === "read" ? "text-sky-500" : msg.status === "delivered" ? "text-slate-400" : "text-amber-500"}>
-                <CheckCheck className="w-4 h-4" />
+              <span className={msg.status === "error" ? "text-rose-500" : msg.status === "read" ? "text-sky-500" : msg.status === "delivered" ? "text-slate-400" : "text-amber-500"}>
+                {msg.status === "sent" ? <Check className="w-4 h-4" /> : <CheckCheck className="w-4 h-4" />}
               </span>
             )}
           </div>
@@ -1422,6 +1778,11 @@ export default function App() {
                         <Activity className={`w-3.5 h-3.5 ${isTestingConnection ? "animate-spin" : ""}`} />
                         <span>{isTestingConnection ? "Pinging Laptop..." : "Test Connection"}</span>
                       </button>
+                      {connectionTestResult && (
+                        <div className={`text-[10.5px] px-2.5 py-1.5 rounded-lg border ${connectionTestResult.success ? "bg-emerald-50 border-emerald-200 text-emerald-700" : "bg-rose-50 border-rose-200 text-rose-700"}`}>
+                          {connectionTestResult.message}
+                        </div>
+                      )}
                     </div>
                   </div>
 
@@ -1463,8 +1824,12 @@ export default function App() {
                       <button
                         type="button"
                         onClick={async () => {
-                          await triggerNotification(botConfig.name, "Test notification: BotBot alerts are working!");
-                          showToast("Test notification dispatched!");
+                          const ok = await triggerNotification(botConfig.name, "Test notification: BotBot alerts are working!", true);
+                          if (ok) {
+                            showToast("Test notification sent!");
+                          } else {
+                            showToast("Blocked — tap Enable Notifications first");
+                          }
                         }}
                         className="flex-1 bg-[#128c7e] hover:bg-[#075e54] text-white py-1.5 px-3 rounded-lg font-bold text-[10px] transition shadow-xs flex items-center justify-center space-x-1 cursor-pointer"
                       >
@@ -1505,7 +1870,7 @@ export default function App() {
                       <div className="flex flex-wrap gap-1.5">{previousSessions.map(id => (<button key={id} onClick={() => switchSession(id)} className={`px-2 py-1 rounded text-[10px] font-mono border ${id === sessionId ? "bg-blue-50 border-blue-200 text-blue-600 font-bold" : "bg-slate-50 border-slate-100 text-slate-500"}`}>{id.replace("session-", "")}</button>))}</div>
                     )}
                     <div className="flex space-x-2 mt-2">
-                      <input ref={sessionInputRef} type="text" defaultValue={sessionId} onKeyDown={(e) => { if (e.key === "Enter") switchSession((e.target as HTMLInputElement).value); }} className="flex-1 bg-slate-50 border border-slate-200 px-2.5 py-1.5 rounded-lg text-xs font-mono" placeholder="Session name..." />
+                      <input key={sessionId} ref={sessionInputRef} type="text" defaultValue={sessionId} onKeyDown={(e) => { if (e.key === "Enter") switchSession((e.target as HTMLInputElement).value); }} className="flex-1 bg-slate-50 border border-slate-200 px-2.5 py-1.5 rounded-lg text-xs font-mono" placeholder="Session name..." />
                       <button onClick={() => switchSession(sessionInputRef.current?.value ?? "")} className="px-3 py-1.5 bg-blue-600 text-white rounded-lg text-[10px] font-bold uppercase">Switch</button>
                     </div>
                   </div>
@@ -1519,8 +1884,20 @@ export default function App() {
               <>
                 <div className="bg-[#f0f2f5] px-4 py-3 flex items-center justify-between border-b border-slate-200 shrink-0">
                   <div className="flex items-center space-x-2.5">
-                    <div className="w-10 h-10 rounded-full bg-[#128c7e] text-white flex items-center justify-center font-bold text-lg shadow-sm shrink-0">{userName[0].toUpperCase()}</div>
-                    <h2 onClick={() => setIsEditingName(true)} className="text-xs font-bold text-slate-800 cursor-pointer">{userName}</h2>
+                    <div className="w-10 h-10 rounded-full bg-[#128c7e] text-white flex items-center justify-center font-bold text-lg shadow-sm shrink-0">{(userName.trim()[0] || "U").toUpperCase()}</div>
+                    {isEditingName ? (
+                      <input
+                        autoFocus
+                        type="text"
+                        value={userName}
+                        onChange={(e) => setUserName(e.target.value)}
+                        onBlur={() => setIsEditingName(false)}
+                        onKeyDown={(e) => { if (e.key === "Enter" || e.key === "Escape") setIsEditingName(false); }}
+                        className="text-xs font-bold text-slate-800 bg-white border border-emerald-400 rounded px-1.5 py-0.5 focus:outline-none w-36"
+                      />
+                    ) : (
+                      <h2 onClick={() => setIsEditingName(true)} className="text-xs font-bold text-slate-800 cursor-pointer">{userName}</h2>
+                    )}
                   </div>
                   <div className="flex items-center space-x-1">
                     <button onClick={() => setShowSearchBar((s) => !s)} className={`p-1.5 rounded-full transition cursor-pointer ${showSearchBar ? "bg-emerald-100 text-emerald-700" : "hover:bg-slate-200/70 text-slate-700"}`}><Search className="w-5 h-5" /></button>
@@ -1551,7 +1928,7 @@ export default function App() {
                     {renderAvatar(botConfig.avatar, "w-12 h-12")}
                     <div className="flex-1 min-w-0">
                       <div className="flex items-center justify-between"><h4 className="font-bold text-sm text-slate-800 truncate">{botConfig.name}</h4><span className="text-[10px] text-slate-400 font-medium">{messages.length > 0 ? formatMessageTime(messages[messages.length - 1].timestamp) : "Now"}</span></div>
-                      <p className="text-[11.5px] text-slate-500 truncate flex items-center">{messages.length > 0 && messages[messages.length - 1].sender === "user" && <CheckCheck className="w-3.5 h-3.5 mr-1 text-sky-500" />}{messages.length > 0 ? messages[messages.length - 1].text : "No messages yet"}</p>
+                      <p className="text-[11.5px] text-slate-500 truncate flex items-center">{messages.length > 0 && messages[messages.length - 1].sender === "user" && <CheckCheck className="w-3.5 h-3.5 mr-1 text-sky-500" />}{messages.length > 0 ? (messages[messages.length - 1].text || (messages[messages.length - 1].attachments?.length ? "[Attachment]" : "")) : "No messages yet"}</p>
                     </div>
                   </div>
                 </div>
@@ -1634,7 +2011,7 @@ export default function App() {
             </div>
 
             {/* INPUT BAR */}
-            <div className="sticky bottom-0 z-40 w-full bg-[#f0f2f5] border-t border-slate-200 flex flex-col pb-4 md:pb-3">
+            <div className="sticky bottom-0 z-40 w-full bg-[#f0f2f5] border-t border-slate-200 flex flex-col md:pb-3" style={{ paddingBottom: "max(0.75rem, env(safe-area-inset-bottom))" }}>
               {replyingTo && (
                 <div className="mx-3 mt-2 mb-1 bg-white p-2 px-3 rounded-lg border-l-4 border-emerald-600 flex justify-between shadow-sm">
                   <div className="min-w-0 flex-1">
@@ -1652,7 +2029,7 @@ export default function App() {
                       <div className="w-12 h-12 rounded border bg-slate-50 flex items-center justify-center overflow-hidden">
                         {f.type === "image" ? <img src={f.url} className="object-cover w-full h-full" /> : <FileText className="w-6 h-6 text-emerald-600" />}
                       </div>
-                      <button onClick={() => setAttachedFiles(prev => prev.filter(af => af.id !== f.id))} className="absolute -top-1 -right-1 bg-rose-500 text-white rounded-full p-0.5 shadow-sm"><X className="w-3 h-3" /></button>
+                      <button onClick={() => { if (f.url) { URL.revokeObjectURL(f.url); createdBlobUrlsRef.current.delete(f.url); } setAttachedFiles(prev => prev.filter(af => af.id !== f.id)); }} className="absolute -top-1 -right-1 bg-rose-500 text-white rounded-full p-0.5 shadow-sm"><X className="w-3 h-3" /></button>
                     </div>
                   ))}
                 </div>
@@ -1710,8 +2087,10 @@ export default function App() {
               </button>
             </div>
             <div className="p-4">
-              {viewingDocument.type === "image" ? (
-                <img src={viewingDocument.url || viewingDocument.base64} className="w-full h-auto rounded-lg" />
+              {viewingDocument.type === "image" && (viewingDocument.url || viewingDocument.base64) ? (
+                <img src={viewingDocument.url || viewingDocument.base64} alt={viewingDocument.name} className="w-full h-auto rounded-lg" />
+              ) : viewingDocument.type === "image" ? (
+                <div className="text-xs text-slate-500 text-center py-8">Full image data is not cached locally after reload.</div>
               ) : (
                 <pre className="text-xs whitespace-pre-wrap text-slate-700 font-mono">
                   {viewingDocument.textContents || "No preview available for this file."}
